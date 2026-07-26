@@ -1,0 +1,16 @@
+*/src/build/
+*/src/dist/
+*/src/__pycache__/
+*/**/__pycache__/
+*/**/*.pyc
+*/.venv/
+.venv/
+*.pdf
+!*/wiki/docs/*.pdf
+*/src/Params_*.af
+*/src/svn_push.sh
+*/src/intercept_serial.c
+*/src/capture_socat.sh
+.vscode/
+.idea/
+.DS_Store
