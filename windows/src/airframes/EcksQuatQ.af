@@ -1,7 +1,9 @@
-# EcksQuatQ — quaternion Q retune of EcksTuned (attitude gains only; all other tuning preserved)
-# Attitude gains derived from test_quat_sim.py sweep on corrected emulation (inertia-augmented,
-# realistic aero angular drag). Roll/Pitch Q at FC max for crisp <=30deg corrections; Yaw Q=3
-# (yaw under-actuated via motor-drag differential — higher Q oscillates).
+# EcksQuatQ — quaternion Q retune of EcksTuned (2208 1000kv, 11x3.7", 4S, 220mm, 910g AUW)
+PHYS_AUW_G = 910
+PHYS_ARM_MM = 110
+PHYS_PROP_INCH = 11.0
+PHYS_MOTOR_W = 100
+PHYS_MOTOR_COUNT = 4
 
 ROLL_RATE_KP = 0.3
 ALT_POS_KI = 0.002
@@ -58,7 +60,6 @@ BALANCE = 0.5
 RX_AUX4_CH = 0
 NAV_POS_KI = 0.012
 GPS_PROTOCOL = NO_GPS
-TILT_THROTTLE_FF = 0
 MAX_YAW_RATE = 1.0472
 FW_ROLL_PITCH_FF = 0
 FW_PITCH_THROTTLE_FF = 0

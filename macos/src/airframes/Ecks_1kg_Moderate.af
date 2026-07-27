@@ -1,4 +1,9 @@
-# Ecks_1kg_Moderate — stable cruising tune for Racerstar BR2205 2300kv + Cyclone 5x3x3, 1kg AUW, ~60% hover
+# Ecks_1kg_Moderate — Racerstar BR2205 2300kv + Cyclone 5x3x3, 1kg AUW, ~60% hover
+PHYS_AUW_G = 1000
+PHYS_ARM_MM = 110
+PHYS_PROP_INCH = 5.0
+PHYS_MOTOR_W = 200
+PHYS_MOTOR_COUNT = 4
 
 ROLL_RATE_KP = 0.20
 ALT_POS_KI = 0.003
@@ -61,7 +66,6 @@ BALANCE = 0.5
 RX_AUX4_CH = 0
 NAV_POS_KI = 0.012
 GPS_PROTOCOL = NO_GPS
-TILT_THROTTLE_FF = 0
 MAX_YAW_RATE = 0.8
 FW_ROLL_PITCH_FF = 0
 FW_PITCH_THROTTLE_FF = 0

@@ -26,6 +26,7 @@ from protocol_enums import (
     ArmingMode,
     TelemetryType,
 
+    RX_TYPE_NAMES,
     RF_TYPE_NAMES,
     AS_SENSOR_TYPE_NAMES,
     IMU_FILTER_NAMES,
@@ -93,6 +94,147 @@ class TickBar(QWidget):
 class ParameterWindow(QMainWindow):
     """Parameter editor window - refactored with enums"""
     
+    # Safety-critical params — require confirmation to change
+    # Physics-computed FW FF params + MC params where wrong values cause crashes
+    _PROTECTED_PARAMS = {
+        # FW FF: physics-computed defaults
+        int(ParamIndex.FW_ROLL_PITCH_FF),
+        int(ParamIndex.FW_PITCH_THROTTLE_FF),
+        int(ParamIndex.FW_AILERON_DIFFERENTIAL),
+        int(ParamIndex.FW_AILERON_RUDDER_MIX),
+        # MC catastrophic: wrong values = crash or damage
+        int(ParamIndex.AF_TYPE),
+        int(ParamIndex.ESC_TYPE),
+        int(ParamIndex.PERCENT_IDLE_THR),
+        int(ParamIndex.CONFIG1_BITS),
+        int(ParamIndex.VOLT_SCALE),
+        int(ParamIndex.SERVO_SENSE),
+    }
+    _PROTECTED_NAMES = {
+        int(ParamIndex.FW_ROLL_PITCH_FF): "FW Roll→Pitch FF",
+        int(ParamIndex.FW_PITCH_THROTTLE_FF): "FW Pitch→Throttle FF",
+        int(ParamIndex.FW_AILERON_DIFFERENTIAL): "FW Aileron Differential",
+        int(ParamIndex.FW_AILERON_RUDDER_MIX): "FW Aileron→Rudder Mix",
+        int(ParamIndex.AF_TYPE): "Airframe Type",
+        int(ParamIndex.ESC_TYPE): "ESC Protocol",
+        int(ParamIndex.PERCENT_IDLE_THR): "Idle Throttle %",
+        int(ParamIndex.CONFIG1_BITS): "Config1 Bits",
+        int(ParamIndex.VOLT_SCALE): "Voltage Scale",
+        int(ParamIndex.SERVO_SENSE): "Servo Sense",
+    }
+    _PROTECTED_WARNINGS = {
+        int(ParamIndex.FW_ROLL_PITCH_FF): "This is a physics-computed default based on your airframe's lift curve.\nWrong values cause poor roll-to-pitch coupling.",
+        int(ParamIndex.FW_PITCH_THROTTLE_FF): "This is a physics-computed default based on your airframe's pitch-trim.\nWrong values cause throttle oscillation in climb/dive.",
+        int(ParamIndex.FW_AILERON_DIFFERENTIAL): "This prevents adverse yaw from aileron deflection.\nWrong values cause uncoordinated turns and yaw oscillation.",
+        int(ParamIndex.FW_AILERON_RUDDER_MIX): "This coordinates rudder with aileron input.\nWrong values cause slipping/skidding turns.",
+        int(ParamIndex.AF_TYPE): "Wrong airframe type selects incorrect mixing.\nThis WILL cause an immediate crash on motor spin-up.",
+        int(ParamIndex.ESC_TYPE): "Wrong ESC protocol means no motor response or random spin.\nMotors may not start or may spin erratically.",
+        int(ParamIndex.PERCENT_IDLE_THR): "Idle throttle too low = motors stop in flight (descent).\nToo high = quad walks on ground and wastes power.",
+        int(ParamIndex.CONFIG1_BITS): "Config bits enable/disable safety features.\nWrong bits can silently disable critical protections.",
+        int(ParamIndex.VOLT_SCALE): "Wrong voltage scale defeats low-voltage battery protection.\nRisk of battery damage or fire from over-discharge.",
+        int(ParamIndex.SERVO_SENSE): "Wrong servo sense reverses control surface direction.\nReversed ailerons = spiral dive. Reversed elevator = loss of pitch control.",
+    }
+
+    # Params the user must configure per-aircraft — highlighted until set to non-default
+    _REQUIRED_SETUP_PARAMS = {
+        int(ParamIndex.AF_TYPE): "Airframe type must match your actual airframe",
+        int(ParamIndex.ESC_TYPE): "ESC protocol must match your ESCs",
+        int(ParamIndex.RF_SENSOR_TYPE): "RF module type must match your radio",
+        int(ParamIndex.AS_SENSOR_TYPE): "Airspeed sensor type (0 = none)",
+        int(ParamIndex.BATTERY_CAPACITY): "Battery capacity in mAh (param stores 0.1 Ah units)",
+        int(ParamIndex.NAV_MAG_VAR): "Magnetic declination in degrees (set to 0 if unsure)",
+        int(ParamIndex.VOLT_SCALE): "Voltage sensor scale — calibrate against multimeter reading",
+        int(ParamIndex.CURRENT_SCALE): "Current sensor scale — calibrate against known load",
+    }
+
+    # Character slider param curves: {param_idx: (conservative_display, aggressive_display)}
+    # Slider 0.0 = conservative (stable, forgiving), 1.0 = aggressive (responsive, tight)
+    # All values in display units — compute_defaults() converts to raw via _display_mult
+    _PARAM_CURVES = {
+        # Angle quaternion gains (display = raw, scale=1.0 for legacy)
+        int(ParamIndex.ROLL_ANGLE_KP):    (5.0, 9.0),
+        int(ParamIndex.PITCH_ANGLE_KP):   (5.0, 9.0),
+        int(ParamIndex.YAW_ANGLE_KP):     (5.0, 10.0),
+        # Angle integral gains (display = raw / PARAM_SCALE, scale=0.05)
+        int(ParamIndex.ROLL_ANGLE_KI):    (1.0, 10.0),
+        int(ParamIndex.PITCH_ANGLE_KI):   (1.0, 10.0),
+        int(ParamIndex.YAW_ANGLE_KI):     (1.0, 10.0),
+        # Angle integral limits (display = raw / PARAM_SCALE)
+        int(ParamIndex.ROLL_ANGLE_INT_LIMIT): (19.1, 114.6),
+        int(ParamIndex.PITCH_ANGLE_INT_LIMIT): (19.1, 114.6),
+        int(ParamIndex.YAW_ANGLE_INT_LIMIT): (11.5, 68.8),
+        # Rate proportional gains (display = raw / PARAM_SCALE, scale=0.005)
+        int(ParamIndex.ROLL_RATE_KP):     (25.0, 100.0),
+        int(ParamIndex.PITCH_RATE_KP):    (25.0, 100.0),
+        int(ParamIndex.YAW_RATE_KP):      (25.0, 150.0),
+        # Rate derivative gains (display = raw / PARAM_SCALE)
+        int(ParamIndex.ROLL_RATE_KD):     (50.0, 200.0),
+        int(ParamIndex.PITCH_RATE_KD):    (50.0, 200.0),
+        int(ParamIndex.YAW_RATE_KD):      (200.0, 800.0),
+        # Rate limits (display = deg/s)
+        int(ParamIndex.MAX_ROLL_RATE):    (80.0, 360.0),
+        int(ParamIndex.MAX_PITCH_RATE):   (60.0, 240.0),
+        int(ParamIndex.MAX_COMPASS_YAW_RATE): (15.0, 120.0),
+        # Altitude
+        int(ParamIndex.ALT_POS_KP):       (10.9, 27.3),
+        int(ParamIndex.ALT_POS_KI):       (2.2, 10.9),
+        int(ParamIndex.ALT_THROTTLE_COMP_LIMIT): (10.0, 35.0),
+        # Navigation
+        int(ParamIndex.NAV_POS_KP):       (4.5, 18.2),
+        int(ParamIndex.NAV_POS_KI):       (1.5, 6.3),
+        int(ParamIndex.NAV_VEL_KP):       (1.7, 6.7),
+        int(ParamIndex.HORIZON):          (2.0, 5.0),
+        # Angle limits (display = deg)
+        int(ParamIndex.MAX_PITCH_ANGLE):  (20.0, 40.0),
+        int(ParamIndex.MAX_ROLL_ANGLE):   (20.0, 40.0),
+    }
+
+    # Physical descriptor definitions for Setup row (dynamic per AF category)
+    # Each entry: (metadata_key, label, decimals, default, tooltip)
+    _MR_PHYS_DESCRIPTORS = [
+        ("PHYS_AUW_G",      "AUW (g)",         0, 800,    "All-up weight in grams — weigh the aircraft on a scale"),
+        ("PHYS_ARM_MM",     "Arm (mm)",        0, 220,    "Motor shaft to center distance"),
+        ("PHYS_PROP_INCH",  "Prop (in)",       1, 11.0,   "Prop diameter in inches"),
+        ("PHYS_MOTOR_W",    "Motor W",         0, 100,    "Watts per motor — from ESC or power meter"),
+        ("PHYS_MOTOR_COUNT","Motors",          0, 4,      "Number of motors"),
+    ]
+    _FW_PHYS_DESCRIPTORS = [
+        ("PHYS_AUW_G",       "AUW (g)",        0, 1000,  "All-up weight in grams — weigh the aircraft on a scale"),
+        ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1800,  "Wingtip to wingtip"),
+        ("PHYS_CHORD_MM",    "Chord (mm)",     0, 250,   "Average root chord"),
+        ("PHYS_PROP_INCH",   "Prop (in)",      1, 10.0,  "Prop diameter in inches"),
+        ("PHYS_MOTOR_W",     "Motor W",        0, 150,   "Watts — from ESC or power meter"),
+    ]
+    _LAND_PHYS_DESCRIPTORS = [
+        ("PHYS_AUW_G",       "AUW (g)",        0, 5000,  "All-up weight in grams — weigh the vehicle on a scale"),
+        ("PHYS_TRACK_MM",    "Track/WB (mm)",  0, 300,   "Track width or wheelbase in mm"),
+        ("PHYS_WHEEL_DIA",   "Wheel dia (mm)", 0, 100,   "Drive wheel diameter in mm"),
+    ]
+
+    # Hover throttle sanity bounds
+    # Hover throttle: 45-55% is ideal (equal climb/descent margin)
+    # Warning outside 25-75% catches genuinely wrong inputs
+    _HOVER_THR_MIN = 0.25
+    _HOVER_THR_MAX = 0.75
+
+    # Motor count lookup from AF type (MR only)
+    _MR_MOTOR_COUNT = {
+        3: 4, 4: 4, 5: 4, 6: 4,   # QUAD, QUAD_X, QUAD_COAX, QUAD_COAX_X
+        7: 6, 8: 6,                 # HEX, HEX_X
+        9: 8, 10: 8,                # OCT, OCT_X
+    }
+
+    # MR shape factors for inertia from arm length
+    _MR_SHAPE_KF = {4: 0.55, 6: 0.50, 8: 0.45}
+
+    # Default base curves (unscaled) for computing scale factors
+    # These represent a "reference" MR at 800g AUW, 220mm arm, 1000kv, 11"
+    _REF_MR_AUW_G = 800
+    _REF_MR_ARM_MM = 220
+    _REF_MR_PROP_INCH = 11.0
+    _REF_FW_AUW_G = 1000
+    _REF_FW_WINGSPAN_MM = 1800
+
     # Parameter groups defined with enums
     PID_PARAMS = [
         ("Q Angle", ParamIndex.ROLL_ANGLE_KP, ParamIndex.PITCH_ANGLE_KP, ParamIndex.YAW_ANGLE_KP, 7.0, 7.0, 3.0),
@@ -228,6 +370,9 @@ class ParameterWindow(QMainWindow):
         self.voltage_trim = 1.0
         self._params_received = False
         self._read_request_id = None
+        self._committed_values = {}  # last FC-loaded values for protected param revert
+        self._baseline_snapshot = {}  # param values at last load — for dirty detection
+        self._baseline_source_path = None  # .af path that was loaded (for default save path)
         self._write_request_id = None
         self._read_timeout_timer = None
         self._write_timeout_timer = None
@@ -242,6 +387,10 @@ class ParameterWindow(QMainWindow):
         self._config_values = {}
         self._current_airframe_path = None
         self._legacy_mode = False
+        self._character_slider = None
+        self._character_value_label = None
+        self._advanced_checkbox = None
+        self._computed_values = {}  # last computed values for reset
         self.setWindowTitle("UAVX Parameters")
         self.setMinimumSize(1200, 900)
         
@@ -420,7 +569,10 @@ class ParameterWindow(QMainWindow):
                     fc_float = received_float.get(idx, float(received_u8[idx]))
                     widget.setValue(fc_float * mult)
                 elif isinstance(widget, QComboBox):
-                    if received_u8[idx] < widget.count():
+                    cb_idx = widget.findData(int(received_u8[idx]))
+                    if cb_idx >= 0:
+                        widget.setCurrentIndex(cb_idx)
+                    elif received_u8[idx] < widget.count():
                         widget.setCurrentIndex(received_u8[idx])
             except Exception:
                 pass
@@ -438,6 +590,7 @@ class ParameterWindow(QMainWindow):
 
         self.dirty_params.clear()
         self._params_received = True
+        self.sync_setup_from_advanced()
         self.status_label.setText("✅ Parameters loaded from FC (typed)")
         self.status_label.setStyleSheet("color: #27ae60;")
         self.reset_read_button()
@@ -498,7 +651,10 @@ class ParameterWindow(QMainWindow):
                         widget.setValue(float(value) * mult)
                         update_count += 1
                     elif isinstance(widget, QComboBox):
-                        if value < widget.count():
+                        cb_idx = widget.findData(int(value))
+                        if cb_idx >= 0:
+                            widget.setCurrentIndex(cb_idx)
+                        elif value < widget.count():
                             widget.setCurrentIndex(value)
                             update_count += 1
                 except Exception as e:
@@ -512,6 +668,7 @@ class ParameterWindow(QMainWindow):
         
         self._log(f"  ✅ Updated {update_count} parameters")
         self.update_config_display()
+        self.sync_setup_from_advanced()
         self.dirty_params.clear()
         self._params_received = True
         self.status_label.setText(f"✅ Parameters loaded from FC (Set={param_set})")
@@ -655,7 +812,10 @@ class ParameterWindow(QMainWindow):
                     else:
                         widget.setValue(float(value) * mult)
                 elif isinstance(widget, QComboBox):
-                    if value < widget.count():
+                    cb_idx = widget.findData(int(value))
+                    if cb_idx >= 0:
+                        widget.setCurrentIndex(cb_idx)
+                    else:
                         widget.setCurrentIndex(max(0, min(widget.count()-1, int(value))))
             except Exception:
                 pass
@@ -943,25 +1103,48 @@ class ParameterWindow(QMainWindow):
         rc_motor_row.setSpacing(0)
         rc_motor_row.setContentsMargins(0, 0, 0, 0)
         rc_combined = self._create_rc_combined_group()
+        rc_combined.setFixedHeight(160)
         rc_motor_row.addWidget(rc_combined, 3)
         motor_group = self._create_motor_group()
+        motor_group.setFixedHeight(160)
         rc_motor_row.addWidget(motor_group, 2)
         main_layout.addLayout(rc_motor_row)
         
-        # Parameter groups directly in main layout (no scroll bar = perfect width alignment)
+        # Params page — Setup+Physics, Advanced toggle, and grid all inside here
         params_container = QWidget()
         self.param_layout = QVBoxLayout(params_container)
         self.param_layout.setSpacing(4)
         self.param_layout.setContentsMargins(2, 2, 2, 2)
         
+        # Create the 2×4 grid FIRST (hidden until Advanced checked)
+        # Must come before Setup group so self.params widgets exist
         self.create_parameter_groups()
         
+        # Setup + Physics side by side
+        setup_physics_row = QHBoxLayout()
+        setup_physics_row.setSpacing(4)
+        setup_group = self._create_setup_group()
+        setup_physics_row.addWidget(setup_group, 1)
+        physics_group = self._create_physics_group()
+        setup_physics_row.addWidget(physics_group, 1)
+        self.param_layout.addLayout(setup_physics_row)
+        
         # AF_TYPE combo controls FW group styling
-        af_combo = self.params.get(int(ParamIndex.AF_TYPE))
+        af_combo = self._setup_widgets.get(int(ParamIndex.AF_TYPE))
         if af_combo and isinstance(af_combo, QComboBox):
             af_combo.currentIndexChanged.connect(self._update_fw_style)
         
+        # Advanced toggle
+        self._advanced_checkbox = QCheckBox("Advanced Parameters")
+        self._advanced_checkbox.setToolTip("Show all parameter groups (PID, General, Config, etc.)")
+        self._advanced_checkbox.setStyleSheet("font-weight: bold; padding: 2px;")
+        self._advanced_checkbox.toggled.connect(self._on_advanced_toggled)
+        self.param_layout.addWidget(self._advanced_checkbox)
+        
         main_layout.addWidget(params_container)
+        
+        # Prevent RC/Motors from stretching vertically
+        main_layout.addStretch(0)
         
         info_box = QGroupBox()
         info_box.setTitle("Info")
@@ -974,6 +1157,15 @@ class ParameterWindow(QMainWindow):
         info_layout.addWidget(self.info_text)
         info_box.setLayout(info_layout)
         main_layout.addWidget(info_box)
+    
+    def _on_advanced_toggled(self, checked):
+        """Show/hide the advanced parameter grid. Window expands when Advanced is shown."""
+        if hasattr(self, '_grid_container'):
+            self._grid_container.setVisible(checked)
+        if checked:
+            self.adjustSize()
+        else:
+            self.adjustSize()
     
     def _show_param_info(self, idx):
         param = PARAMETER_DEFS.get(int(idx))
@@ -1041,7 +1233,12 @@ class ParameterWindow(QMainWindow):
         self._fw_group = self._create_fixed_wing_group()
         grid.addWidget(self._fw_group, 1, 3)
 
-        self.param_layout.addLayout(grid)
+        # Wrap grid in a widget so Advanced toggle can show/hide it
+        grid_container = QWidget()
+        grid_container.setLayout(grid)
+        self._grid_container = grid_container
+        self.param_layout.addWidget(grid_container)
+        grid_container.setVisible(False)
         
         # Connect AF_TYPE combo to FW styling
         QTimer.singleShot(0, self._update_fw_style)
@@ -1279,6 +1476,710 @@ class ParameterWindow(QMainWindow):
                     "background-color: #999; font-weight: bold;"
                 )
     
+    def _create_setup_group(self):
+        """Create Setup section with FC param widgets only"""
+        group = QGroupBox("Aircraft Config")
+        group.setStyleSheet("""
+            QGroupBox { font-weight: bold; border: 1px solid #e74c3c; border-radius: 4px; margin-top: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; color: #e74c3c; }
+        """)
+        layout = QVBoxLayout()
+        layout.setSpacing(3)
+        layout.setContentsMargins(6, 10, 6, 6)
+
+        self._setup_widgets = {}
+        self._phys_widgets = {}
+        self._setup_group = group
+        self._setup_layout = layout
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(2)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        setup_params = [
+            (ParamIndex.RX_TYPE, "Rx Type", "combo", 0,
+             list(RX_TYPE_NAMES.values()), None),
+            (ParamIndex.ESC_TYPE, "ESC Protocol", "combo", 0,
+             list(ESC_TYPE_NAMES.values()), None),
+            (ParamIndex.RF_SENSOR_TYPE, "RF Module", "combo", 0,
+             list(RF_TYPE_NAMES.values()), None),
+            (ParamIndex.AS_SENSOR_TYPE, "Airspeed Sensor", "combo", 0,
+             list(AS_SENSOR_TYPE_NAMES.values()), None),
+            (ParamIndex.BATTERY_CAPACITY, "Battery (mAh)", "spin", 0, None, None),
+            (ParamIndex.NAV_MAG_VAR, "Mag Decl (°)", "spin", 1, None, None),
+            (ParamIndex.VOLT_SCALE, "Volt Scale", "spin", 1, None, None),
+            (ParamIndex.CURRENT_SCALE, "Curr Scale (A)", "spin", 1, None, None),
+        ]
+        for i, (idx, name, wtype, dec, items, data) in enumerate(setup_params):
+            row = i // 3
+            col = i % 3
+            idx_int = int(idx)
+            if wtype == "combo":
+                combo = QComboBox()
+                for j, item in enumerate(items):
+                    d = data[j] if data is not None else j
+                    combo.addItem(item, d)
+                combo.setMaximumWidth(120)
+                combo.setEditable(True)
+                combo.lineEdit().setReadOnly(True)
+                combo.lineEdit().setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                combo.setStyleSheet("QComboBox { padding: 1px 2px; } QComboBox::drop-down { width: 16px; }")
+                combo.currentIndexChanged.connect(lambda v, ii=idx_int: self._setup_sync_to_advanced(ii))
+                self._setup_widgets[idx_int] = combo
+                grid.addWidget(combo, row, col * 2)
+            else:
+                spin = QDoubleSpinBox()
+                spin.setRange(0, 9999)
+                spin.setDecimals(dec)
+                spin.setMaximumWidth(80)
+                spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                spin.setStyleSheet("QDoubleSpinBox { padding: 1px 2px; }")
+                spin.valueChanged.connect(lambda v, ii=idx_int: self._setup_sync_to_advanced(ii))
+                self._setup_widgets[idx_int] = spin
+                grid.addWidget(spin, row, col * 2)
+            lbl = QLabel(name)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            lbl.setStyleSheet("font-weight: normal;")
+
+        layout.addLayout(grid)
+
+        # Character slider — single compact row
+        slider_row = QHBoxLayout()
+        slider_row.setSpacing(4)
+        lbl_con = QLabel("Steady")
+        lbl_con.setStyleSheet("font-weight: normal; color: #666;")
+        lbl_con.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        slider_row.addWidget(lbl_con)
+
+        self._character_slider = QSlider(Qt.Horizontal)
+        self._character_slider.setRange(0, 100)
+        self._character_slider.setValue(50)
+        self._character_slider.setTickPosition(QSlider.TicksBelow)
+        self._character_slider.setTickInterval(10)
+        self._character_slider.setMinimumWidth(80)
+        self._character_slider.valueChanged.connect(self._on_character_slider)
+        slider_row.addWidget(self._character_slider, 1)
+
+        lbl_ag = QLabel("Frisky")
+        lbl_ag.setStyleSheet("font-weight: normal; color: #666;")
+        lbl_ag.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        slider_row.addWidget(lbl_ag)
+
+        self._character_value_label = QLabel("50%")
+        self._character_value_label.setMinimumWidth(28)
+        self._character_value_label.setAlignment(Qt.AlignCenter)
+        self._character_value_label.setStyleSheet("font-weight: bold; color: #3498db;")
+        slider_row.addWidget(self._character_value_label)
+
+        compute_btn = QPushButton("Compute")
+        compute_btn.setToolTip("Compute tuning params from slider + physical descriptors")
+        compute_btn.setStyleSheet("padding: 2px 6px; font-weight: bold;")
+        compute_btn.clicked.connect(self.compute_defaults)
+        slider_row.addWidget(compute_btn)
+
+        reset_btn = QPushButton("Reset")
+        reset_btn.setToolTip("Reset to last computed values")
+        reset_btn.setStyleSheet("padding: 2px 6px;")
+        reset_btn.clicked.connect(self.reset_to_computed)
+        slider_row.addWidget(reset_btn)
+
+        layout.addLayout(slider_row)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_physics_group(self):
+        """Create Physics box: AF_TYPE on top, physical descriptors below"""
+        group = QGroupBox("Physics")
+        group.setStyleSheet("""
+            QGroupBox { font-weight: bold; border: 1px solid #9b59b6; border-radius: 4px; margin-top: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; color: #9b59b6; }
+        """)
+        layout = QVBoxLayout()
+        layout.setSpacing(3)
+        layout.setContentsMargins(6, 10, 6, 6)
+
+        self._phys_widgets = {}
+        self._phys_group = group
+
+        # AF_TYPE combo — label AFTER combo
+        af_row = QHBoxLayout()
+        af_row.setSpacing(4)
+        af_combo = QComboBox()
+        for af in sorted(ACTIVE_AIRFRAMES, key=lambda x: AIRFRAME_NAMES[x].lower()):
+            af_combo.addItem(AIRFRAME_NAMES[af], af.value)
+        af_combo.setEditable(True)
+        af_combo.lineEdit().setReadOnly(True)
+        af_combo.lineEdit().setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        af_combo.setStyleSheet("QComboBox { padding: 1px 2px; } QComboBox::drop-down { width: 16px; }")
+        af_combo.currentIndexChanged.connect(lambda v, ii=int(ParamIndex.AF_TYPE): self._setup_sync_to_advanced(ii))
+        self._setup_widgets[int(ParamIndex.AF_TYPE)] = af_combo
+        af_row.addWidget(af_combo)
+        lbl = QLabel("Airframe Type")
+        lbl.setStyleSheet("font-weight: normal;")
+        af_row.addWidget(lbl)
+        af_row.addStretch(1)
+        layout.addLayout(af_row)
+
+        # Physical descriptor grid — rebuilt when AF_TYPE changes
+        self._phys_grid = QGridLayout()
+        self._phys_grid.setHorizontalSpacing(6)
+        self._phys_grid.setVerticalSpacing(2)
+        self._phys_grid.setContentsMargins(0, 0, 0, 0)
+        self._phys_row = 0
+        self._build_phys_row()
+        layout.addLayout(self._phys_grid)
+
+        self._phys_hover_lbl = QLabel("")
+        self._phys_hover_lbl.setStyleSheet("font-weight: bold; font-size: 10px;")
+        self._phys_hover_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._phys_hover_lbl.hide()
+        layout.addWidget(self._phys_hover_lbl)
+
+        group.setLayout(layout)
+        return group
+
+    def _build_phys_row(self):
+        """Build or rebuild the physical descriptor row based on current AF_TYPE category"""
+        if not hasattr(self, '_phys_grid') or not hasattr(self, '_phys_row'):
+            return
+        grid = self._phys_grid
+        row = self._phys_row
+
+        # Clear old widgets from grid
+        for key, widget in self._phys_widgets.items():
+            grid.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+        self._phys_widgets.clear()
+
+        # Clear old labels too
+        while grid.count():
+            item = grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+        af_combo = self._setup_widgets.get(int(ParamIndex.AF_TYPE))
+        cat = 'MR'
+        if af_combo and isinstance(af_combo, QComboBox):
+            af_data = af_combo.currentData()
+            if af_data is not None:
+                cat = self._category_for_af(int(af_data))
+
+        if cat == 'FW':
+            descriptors = self._FW_PHYS_DESCRIPTORS
+        elif cat == 'LAND':
+            descriptors = self._LAND_PHYS_DESCRIPTORS
+        else:
+            descriptors = self._MR_PHYS_DESCRIPTORS
+
+        for i, (key, label, dec, default, tooltip) in enumerate(descriptors):
+            row = i // 3
+            col = i % 3
+            spin = QDoubleSpinBox()
+            spin.setDecimals(dec)
+            spin.setMaximumWidth(70)
+            spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            spin.setToolTip(tooltip)
+            spin.setStyleSheet("QDoubleSpinBox { padding: 1px 2px; }")
+            spin.valueChanged.connect(lambda v, k=key: self._phys_changed(k))
+            # Sensible ranges to catch obviously wrong values
+            if 'AUW' in key:
+                spin.setRange(50, 20000)
+            elif 'ARM' in key or 'WING' in key or 'CHORD' in key or 'TRACK' in key:
+                spin.setRange(10, 5000)
+            elif 'PROP' in key or 'WHEEL' in key:
+                spin.setRange(1, 50)
+            elif 'MOTOR_W' in key:
+                spin.setRange(1, 5000)
+            elif 'COUNT' in key:
+                spin.setRange(1, 16)
+            else:
+                spin.setRange(0, 99999)
+            spin.setValue(default)
+            self._phys_widgets[key] = spin
+            grid.addWidget(spin, row, col * 2)
+            lbl = QLabel(label)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            lbl.setStyleSheet("font-weight: normal;")
+            lbl.setToolTip(tooltip)
+            grid.addWidget(lbl, row, col * 2 + 1)
+
+    def _phys_changed(self, key):
+        """Handle change to a physical descriptor — recompute derived values and check sanity"""
+        phys_meta = {}
+        for k, widget in self._phys_widgets.items():
+            if isinstance(widget, QDoubleSpinBox):
+                phys_meta[k] = str(int(widget.value())) if widget.decimals() == 0 else str(widget.value())
+        self._current_phys_meta = self._compute_physics_from_descriptors(phys_meta)
+
+        if hasattr(self, '_phys_hover_lbl'):
+            thr = float(self._current_phys_meta.get('PHYS_HOVER_THR', 0.5))
+            self._phys_hover_lbl.setText(f"Est Hover Throttle: {thr:.0%}")
+            if thr < self._HOVER_THR_MIN:
+                self._phys_hover_lbl.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 10px;")
+                self._phys_hover_lbl.show()
+            elif thr > self._HOVER_THR_MAX:
+                self._phys_hover_lbl.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 10px;")
+                self._phys_hover_lbl.show()
+            else:
+                self._phys_hover_lbl.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 10px;")
+                self._phys_hover_lbl.show()
+
+    # Old → new metadata key migration (backward compat with pre-existing .af files)
+    _PHYS_KEY_MAP = {
+        'PHYS_MASS_KG': 'PHYS_AUW_G',
+        'PHYS_ARM_LEN_M': 'PHYS_ARM_MM',
+        'PHYS_PROP_DIAMETER_INCH': 'PHYS_PROP_INCH',
+    }
+    _PHYS_CONVERSIONS = {
+        'PHYS_MASS_KG': lambda v: float(v) * 1000,      # kg → g
+        'PHYS_ARM_LEN_M': lambda v: float(v) * 1000,     # m → mm
+        'PHYS_PROP_DIAMETER_INCH': lambda v: float(v),    # same units
+    }
+
+    def _load_phys_from_metadata(self, meta):
+        """Populate physical descriptor widgets from .af metadata.
+
+        Handles backward compatibility: converts old PHYS_MASS_KG→PHYS_AUW_G,
+        PHYS_ARM_LEN_M→PHYS_ARM_MM, etc.
+        """
+        normalized = {}
+        for k, v in meta.items():
+            if k in self._PHYS_KEY_MAP:
+                new_key = self._PHYS_KEY_MAP[k]
+                try:
+                    converted = self._PHYS_CONVERSIONS[k](v)
+                    if new_key == 'PHYS_AUW_G':
+                        normalized[new_key] = str(int(converted))
+                    elif new_key == 'PHYS_ARM_MM':
+                        normalized[new_key] = str(int(converted))
+                    else:
+                        normalized[new_key] = str(converted)
+                except (ValueError, TypeError):
+                    normalized[new_key] = v
+            else:
+                normalized[k] = v
+        for key, widget in self._phys_widgets.items():
+            if key in normalized:
+                try:
+                    val = float(normalized[key])
+                    widget.blockSignals(True)
+                    widget.setValue(val)
+                    widget.blockSignals(False)
+                except (ValueError, TypeError):
+                    pass
+        self._phys_changed(next(iter(self._phys_widgets.keys()), None) or '')
+
+    def _phys_to_metadata(self):
+        """Collect current physical descriptor values as metadata dict"""
+        result = {}
+        for key, widget in self._phys_widgets.items():
+            if isinstance(widget, QDoubleSpinBox):
+                val = widget.value()
+                result[key] = str(int(val)) if widget.decimals() == 0 else str(val)
+        if result:
+            result = self._compute_physics_from_descriptors(result)
+        return result
+
+    def _setup_sync_to_advanced(self, idx_int):
+        """Sync setup widget value → advanced grid widget"""
+        setup_w = self._setup_widgets.get(idx_int)
+        adv_w = self.params.get(idx_int)
+        if not setup_w or not adv_w:
+            return
+        if isinstance(setup_w, QComboBox) and isinstance(adv_w, QComboBox):
+            data = setup_w.currentData()
+            if data is not None:
+                adv_idx = adv_w.findData(int(data))
+                if adv_idx >= 0:
+                    adv_w.blockSignals(True)
+                    adv_w.setCurrentIndex(adv_idx)
+                    adv_w.blockSignals(False)
+            self.dirty_params.add(idx_int)
+            self.combo_changed(idx_int, int(data) if data is not None else 0)
+            if idx_int == int(ParamIndex.AF_TYPE):
+                self._build_phys_row()
+        elif isinstance(setup_w, QDoubleSpinBox) and isinstance(adv_w, QDoubleSpinBox):
+            val = setup_w.value()
+            adv_w.blockSignals(True)
+            adv_w.setValue(val)
+            adv_w.blockSignals(False)
+            self.dirty_params.add(idx_int)
+            self.param_changed(idx_int, val)
+
+    def sync_setup_from_advanced(self):
+        """Sync advanced grid widget values → setup widgets (call after load/read)"""
+        for idx_int, setup_w in self._setup_widgets.items():
+            adv_w = self.params.get(idx_int)
+            if not adv_w:
+                continue
+            if isinstance(setup_w, QComboBox) and isinstance(adv_w, QComboBox):
+                adv_data = adv_w.currentData()
+                if adv_data is not None:
+                    s_idx = setup_w.findData(int(adv_data))
+                    if s_idx >= 0:
+                        setup_w.blockSignals(True)
+                        setup_w.setCurrentIndex(s_idx)
+                        setup_w.blockSignals(False)
+            elif isinstance(setup_w, QDoubleSpinBox) and isinstance(adv_w, QDoubleSpinBox):
+                setup_w.blockSignals(True)
+                setup_w.setValue(adv_w.value())
+                setup_w.blockSignals(False)
+        if hasattr(self, '_phys_grid'):
+            self._build_phys_row()
+
+    def _on_character_slider(self, value):
+        """Update the character label when slider moves"""
+        self._character_value_label.setText(f"{value}%")
+
+    def compute_defaults(self):
+        """Compute all tuning params from AF type + character slider position + physical descriptors.
+
+        The _PARAM_CURVES define base ranges for a reference MR/FW.
+        Physics scaling adjusts these ranges based on the actual aircraft's
+        mass, arm/wingspan, etc. from the Setup physical descriptor fields.
+        """
+        slider_pct = self._character_slider.value() / 100.0
+        af_combo = self.params.get(int(ParamIndex.AF_TYPE))
+        cat = 'MR'
+        af_type_int = 4
+        if af_combo and isinstance(af_combo, QComboBox):
+            af_data = af_combo.currentData()
+            if af_data is not None:
+                af_type_int = int(af_data)
+                cat = self._category_for_af(af_type_int)
+
+        scale_factors = self._get_scale_factors(cat)
+
+        computed = {}
+        for idx_str, (conservative, aggressive) in self._PARAM_CURVES.items():
+            base_val = conservative + slider_pct * (aggressive - conservative)
+            sf = scale_factors.get(idx_str, 1.0)
+            computed[idx_str] = base_val * sf
+
+        self._computed_values = computed.copy()
+        self._computed_slider_pos = self._character_slider.value()
+
+        for idx_str, display_val in computed.items():
+            widget = self.params.get(idx_str)
+            if widget is None:
+                continue
+            widget.blockSignals(True)
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setValue(display_val)
+            widget.blockSignals(False)
+            self.dirty_params.add(idx_str)
+
+        self.status_label.setText(f"Computed {len(computed)} params (Character={self._character_slider.value()}%)")
+        self.status_label.setStyleSheet("color: #3498db;")
+        self.update_config_display()
+
+    def _get_scale_factors(self, cat):
+        """Compute per-param scaling factors from physical descriptors.
+
+        Returns {param_idx: scale_factor}. Base curves are for the reference
+        aircraft; scale_factor adjusts for actual aircraft physics.
+
+        MR scaling:
+          - Rate Kp/Kd: ∝ 1/inertia → lighter/shorter arms → lower gains
+          - Angle Kp/Ki: ∝ mass → heavier → more authority
+          - Rate limits: ∝ 1/mass → lighter → faster response possible
+          - Alt Kp/Ki: ∝ mass → heavier → more authority
+          - Nav Kp/Ki: ∝ 1/mass → lighter → faster nav response
+
+        FW scaling:
+          - Rate Kp/Kd: ∝ 1/Ixx → larger wingspan → more inertia → higher gains
+          - Angle Kp/Ki: ∝ mass → heavier → more authority
+          - Rate limits: ∝ 1/mass → lighter → faster response
+          - Alt Kp/Ki: ∝ mass
+          - Nav Kp/Ki: ∝ 1/cruise_speed → faster cruise → quicker nav
+        """
+        sf = {}
+        try:
+            phys = self._current_phys_meta if hasattr(self, '_current_phys_meta') else {}
+        except AttributeError:
+            phys = {}
+
+        try:
+            auw_g = float(phys.get('PHYS_AUW_G', 0))
+        except (ValueError, TypeError):
+            auw_g = 0
+
+        if auw_g <= 0:
+            return sf
+
+        mass_kg = auw_g / 1000.0
+
+        if cat == 'MR':
+            ref_mass = self._REF_MR_AUW_G / 1000.0
+            try:
+                arm_mm = float(phys.get('PHYS_ARM_MM', self._REF_MR_ARM_MM))
+            except (ValueError, TypeError):
+                arm_mm = self._REF_MR_ARM_MM
+            ref_arm = self._REF_MR_ARM_MM / 1000.0
+            actual_arm = arm_mm / 1000.0
+
+            mass_ratio = mass_kg / ref_mass if ref_mass > 0 else 1.0
+            inertia_ratio = (actual_arm / ref_arm) ** 2 * mass_ratio if ref_arm > 0 else 1.0
+
+            for idx in self._PARAM_CURVES:
+                pname = ''
+                try:
+                    pname = ParamIndex(idx).name
+                except (ValueError, AttributeError):
+                    pass
+
+                if 'RATE_KP' in pname or 'RATE_KD' in pname:
+                    sf[idx] = 1.0 / inertia_ratio if inertia_ratio > 0 else 1.0
+                elif 'ANGLE_KP' in pname or 'ANGLE_KI' in pname or 'INT_LIMIT' in pname:
+                    sf[idx] = mass_ratio
+                elif 'MAX_ROLL_RATE' in pname or 'MAX_PITCH_RATE' in pname or 'MAX_COMPASS' in pname:
+                    sf[idx] = 1.0 / mass_ratio if mass_ratio > 0 else 1.0
+                elif 'ALT_POS' in pname:
+                    sf[idx] = mass_ratio
+                elif 'NAV_POS' in pname or 'NAV_VEL' in pname:
+                    sf[idx] = 1.0 / mass_ratio if mass_ratio > 0 else 1.0
+
+        elif cat == 'FW':
+            ref_mass = self._REF_FW_AUW_G / 1000.0
+            try:
+                wingspan_mm = float(phys.get('PHYS_WINGSPAN_MM', self._REF_FW_WINGSPAN_MM))
+            except (ValueError, TypeError):
+                wingspan_mm = self._REF_FW_WINGSPAN_MM
+            ref_wingspan = self._REF_FW_WINGSPAN_MM / 1000.0
+            actual_wingspan = wingspan_mm / 1000.0
+
+            mass_ratio = mass_kg / ref_mass if ref_mass > 0 else 1.0
+            inertia_ratio = (actual_wingspan / ref_wingspan) ** 2 * mass_ratio if ref_wingspan > 0 else 1.0
+
+            try:
+                cruise_ms = float(phys.get('PHYS_CRUISE_MS', 12))
+            except (ValueError, TypeError):
+                cruise_ms = 12
+
+            for idx in self._PARAM_CURVES:
+                pname = ''
+                try:
+                    pname = ParamIndex(idx).name
+                except (ValueError, AttributeError):
+                    pass
+
+                if 'RATE_KP' in pname or 'RATE_KD' in pname:
+                    sf[idx] = 1.0 / inertia_ratio if inertia_ratio > 0 else 1.0
+                elif 'ANGLE_KP' in pname or 'ANGLE_KI' in pname or 'INT_LIMIT' in pname:
+                    sf[idx] = mass_ratio
+                elif 'MAX_ROLL_RATE' in pname or 'MAX_PITCH_RATE' in pname or 'MAX_COMPASS' in pname:
+                    sf[idx] = 1.0 / mass_ratio if mass_ratio > 0 else 1.0
+                elif 'ALT_POS' in pname:
+                    sf[idx] = mass_ratio
+
+        return sf
+
+    def reset_to_computed(self):
+        """Revert all params and slider back to last computed values"""
+        if not self._computed_values:
+            QMessageBox.information(self, "No Computed Values",
+                "Click 'Compute' first to generate values from the slider.")
+            return
+        # Restore slider position
+        if hasattr(self, '_computed_slider_pos') and self._character_slider:
+            self._character_slider.setValue(self._computed_slider_pos)
+        for idx_str, display_val in self._computed_values.items():
+            widget = self.params.get(idx_str)
+            if widget is None:
+                continue
+            widget.blockSignals(True)
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setValue(display_val)
+            widget.blockSignals(False)
+            self.dirty_params.add(idx_str)
+        self.status_label.setText(f"Reset {len(self._computed_values)} params to computed values")
+        self.status_label.setStyleSheet("color: #3498db;")
+        self.update_config_display()
+
+    def _category_for_af(self, af_type):
+        """Return 'MR', 'FW', 'VTOL', or 'LAND' for a given AF type enum value"""
+        try:
+            from protocol_enums import AirframeType
+            name = AirframeType(af_type).name
+            if 'FW' in name or 'WING' in name or 'DELTA' in name or 'HELI' in name or 'AILERON' in name or 'SPOILERON' in name:
+                return 'FW'
+            if 'VTOL' in name:
+                return 'VTOL'
+            if 'TRACKED' in name or 'GLIDER' in name or 'CAR' in name:
+                return 'LAND'
+        except (ValueError, AttributeError):
+            pass
+        return 'MR'
+
+    def _compute_physics_from_descriptors(self, phys_meta):
+        """Compute derived quantities from physical descriptors.
+
+        Takes a dict of PHYS_* metadata strings, computes inertias, TWR, etc.
+        Returns a dict of all PHYS_* values (user inputs + computed).
+        Updates the input dict in-place with computed values.
+        """
+        result = dict(phys_meta)
+        try:
+            auw_g = float(result.get('PHYS_AUW_G', 800))
+        except (ValueError, TypeError):
+            auw_g = 800
+        mass_kg = auw_g / 1000.0
+
+        # Determine category from AF type
+        af_combo = self.params.get(int(ParamIndex.AF_TYPE))
+        cat = 'MR'
+        af_type_int = 4
+        if af_combo and isinstance(af_combo, QComboBox):
+            af_data = af_combo.currentData()
+            if af_data is not None:
+                af_type_int = int(af_data)
+                cat = self._category_for_af(af_type_int)
+
+        if cat == 'MR':
+            try:
+                arm_mm = float(result.get('PHYS_ARM_MM', 220))
+            except (ValueError, TypeError):
+                arm_mm = 220
+            arm_m = arm_mm / 1000.0
+            try:
+                prop_in = float(result.get('PHYS_PROP_INCH', 11))
+            except (ValueError, TypeError):
+                prop_in = 11
+            try:
+                motor_w = float(result.get('PHYS_MOTOR_W', 100))
+            except (ValueError, TypeError):
+                motor_w = 100
+
+            try:
+                n_motors = int(result.get('PHYS_MOTOR_COUNT', 0))
+            except (ValueError, TypeError):
+                n_motors = 0
+            if n_motors == 0:
+                n_motors = self._MR_MOTOR_COUNT.get(af_type_int, 4)
+            shape_kf = self._MR_SHAPE_KF.get(n_motors, 0.55)
+
+            # Moments of inertia (flat plate approximation)
+            ixx = mass_kg * arm_m * arm_m * shape_kf
+            iyy = ixx
+            izz = ixx * 1.6
+
+            # Thrust estimation from actuator disk theory + watts per motor
+            # η = electrical→thrust efficiency: ESC(93%) × motor(70%) × prop(50%) ≈ 0.30 at hover
+            prop_m = prop_in * 0.0254
+            disk_area = 3.14159 * (prop_m / 2.0) ** 2
+            rho = 1.225
+            eta = 0.30
+
+            # Static thrust from power: T = (η × P × √(2ρA))^(2/3)
+            p_shaft = max(motor_w, 10.0) * eta
+            thrust_per_motor = (p_shaft * (2.0 * rho * disk_area) ** 0.5) ** (2.0 / 3.0)
+            total_thrust_n = thrust_per_motor * n_motors
+            twr = total_thrust_n / (mass_kg * 9.81) if mass_kg > 0 else 5.0
+
+            # Hover throttle: electrical power needed / electrical power available
+            thrust_hover = (mass_kg * 9.81) / n_motors if n_motors > 0 else mass_kg * 9.81
+            v_induced = (thrust_hover / (2.0 * rho * disk_area)) ** 0.5 if disk_area > 0 else 5.0
+            p_hover_shaft = thrust_hover * v_induced
+            p_hover_elec = p_hover_shaft / eta
+            hover_thr = p_hover_elec / max(motor_w, 10.0)
+
+            result['PHYS_MOTOR_COUNT'] = str(n_motors)
+            result['PHYS_SHAPE_KF'] = f'{shape_kf:.3f}'
+            result['PHYS_IROLL'] = f'{ixx:.6f}'
+            result['PHYS_IPITCH'] = f'{iyy:.6f}'
+            result['PHYS_IYAW'] = f'{izz:.6f}'
+            result['PHYS_MAX_THRUST_N'] = f'{total_thrust_n:.2f}'
+            result['PHYS_TWR'] = f'{twr:.2f}'
+            result['PHYS_HOVER_THR'] = f'{hover_thr:.3f}'
+            result['PHYS_MASS_KG'] = f'{mass_kg:.3f}'
+            result['PHYS_ARM_LEN_M'] = f'{arm_m:.4f}'
+            result['PHYS_PROP_DIAMETER_INCH'] = str(int(prop_in))
+            result['PHYS_MOTOR_W'] = str(int(motor_w))
+
+        elif cat == 'FW':
+            try:
+                wingspan_mm = float(result.get('PHYS_WINGSPAN_MM', 1800))
+            except (ValueError, TypeError):
+                wingspan_mm = 1800
+            wingspan_m = wingspan_mm / 1000.0
+            try:
+                chord_mm = float(result.get('PHYS_CHORD_MM', 250))
+            except (ValueError, TypeError):
+                chord_mm = 250
+            chord_m = chord_mm / 1000.0
+            try:
+                prop_in = float(result.get('PHYS_PROP_INCH', 10))
+            except (ValueError, TypeError):
+                prop_in = 10
+            try:
+                motor_w = float(result.get('PHYS_MOTOR_W', 150))
+            except (ValueError, TypeError):
+                motor_w = 150
+
+            wing_area = wingspan_m * chord_m
+
+            # Moments of inertia (thin plate approximation)
+            ixx = mass_kg * wingspan_m * wingspan_m / 12.0
+            iyy = mass_kg * (wingspan_m * wingspan_m + chord_m * chord_m) / 12.0
+            izz = mass_kg * wingspan_m * wingspan_m / 6.0
+
+            # Cruise speed: V = sqrt(2mg / (rho * S * CL))
+            rho = 1.225
+            cl_cruise = 0.5
+            v_cruise = (2.0 * mass_kg * 9.81 / (rho * wing_area * cl_cruise)) ** 0.5
+
+            # Dynamic pressure at cruise
+            qbar = 0.5 * rho * v_cruise * v_cruise
+
+            # Max thrust from actuator disk theory (same η as MR)
+            prop_m = prop_in * 0.0254
+            disk_area = 3.14159 * (prop_m / 2.0) ** 2
+            eta = 0.30
+            p_shaft = max(motor_w, 10.0) * eta
+            thrust_n = (p_shaft * (2.0 * rho * disk_area) ** 0.5) ** (2.0 / 3.0)
+
+            result['PHYS_WINGSPAN_M'] = f'{wingspan_m:.4f}'
+            result['PHYS_CHORD_M'] = f'{chord_m:.4f}'
+            result['PHYS_WING_AREA'] = f'{wing_area:.4f}'
+            result['PHYS_IROLL'] = f'{ixx:.6f}'
+            result['PHYS_IPITCH'] = f'{iyy:.6f}'
+            result['PHYS_IYAW'] = f'{izz:.6f}'
+            result['PHYS_CRUISE_MS'] = f'{v_cruise:.1f}'
+            result['PHYS_QBAR'] = f'{qbar:.1f}'
+            result['PHYS_MAX_THRUST_N'] = f'{thrust_n:.2f}'
+            result['PHYS_MASS_KG'] = f'{mass_kg:.3f}'
+            result['PHYS_PROP_DIAMETER_INCH'] = str(int(prop_in))
+            result['PHYS_MOTOR_W'] = str(int(motor_w))
+
+        elif cat == 'LAND':
+            try:
+                track_mm = float(result.get('PHYS_TRACK_MM', 300))
+            except (ValueError, TypeError):
+                track_mm = 300
+            track_m = track_mm / 1000.0
+            try:
+                wheel_dia_mm = float(result.get('PHYS_WHEEL_DIA', 100))
+            except (ValueError, TypeError):
+                wheel_dia_mm = 100
+
+            # Simple box inertia for land vehicle
+            ixx = mass_kg * track_m * track_m / 12.0
+            iyy = mass_kg * track_m * track_m / 12.0
+            izz = mass_kg * (track_m * track_m + track_m * track_m) / 12.0
+
+            result['PHYS_TRACK_M'] = f'{track_m:.4f}'
+            result['PHYS_IROLL'] = f'{ixx:.6f}'
+            result['PHYS_IPITCH'] = f'{iyy:.6f}'
+            result['PHYS_IYAW'] = f'{izz:.6f}'
+            result['PHYS_MASS_KG'] = f'{mass_kg:.3f}'
+
+        return result
+
     def _create_pid_group(self):
         """Create PID group using enum definitions"""
         group = QGroupBox("PID (Roll / Pitch / Yaw)")
@@ -1638,7 +2539,36 @@ class ParameterWindow(QMainWindow):
         
         self.param_changed(pi, new_value)
         self.update_config_display()
-    
+
+    def _rc_channel_changed(self, idx_int, fn_idx, value):
+        """Handle RC channel spin box change — mark param dirty + check for clashes"""
+        self.dirty_params.add(idx_int)
+        self.status_label.setText(f"P{idx_int+1} changed ({len(self.dirty_params)})")
+        self.status_label.setStyleSheet("color: #f39c12;")
+
+        if value == 0:
+            return
+        clashes = []
+        for other_spin in self.rc_channel_spins:
+            if other_spin is self.params.get(idx_int):
+                continue
+            if other_spin.value() == value:
+                other_idx = other_spin.property("param_index")
+                other_fn = other_spin.property("fn_index")
+                if other_fn is not None and other_fn < len(self.RC_MAP_PARAMS):
+                    other_name = self.RC_MAP_PARAMS[other_fn][1]
+                else:
+                    other_name = f"P{other_idx+1}"
+                clashes.append(other_name)
+        if clashes:
+            func_name = self.RC_MAP_PARAMS[fn_idx][1] if fn_idx < len(self.RC_MAP_PARAMS) else f"P{idx_int+1}"
+            QMessageBox.warning(
+                self, "Channel Clash",
+                f"{func_name} is assigned to channel {value},\n"
+                f"which is also used by: {', '.join(clashes)}\n\n"
+                "Duplicate channel assignments will cause conflicts."
+            )
+
     def update_config_display(self):
         """Update config value displays and checkboxes"""
         val1 = self._config_values.get(ParamIndex.CONFIG1_BITS, 0)
@@ -1694,7 +2624,10 @@ class ParameterWindow(QMainWindow):
             try:
                 if isinstance(widget, QDoubleSpinBox):
                     mult = self._display_mult(i)
-                    widget.setValue(raw * mult)
+                    display_val = raw * mult
+                    widget.setValue(display_val)
+                    if i in self._PROTECTED_PARAMS:
+                        self._committed_values[i] = display_val
                 elif isinstance(widget, QComboBox):
                     cb_idx = widget.findData(int(raw))
                     if cb_idx >= 0:
@@ -1702,6 +2635,8 @@ class ParameterWindow(QMainWindow):
                     else:
                         idx = max(0, min(widget.count() - 1, int(raw)))
                         widget.setCurrentIndex(idx)
+                    if i in self._PROTECTED_PARAMS:
+                        self._committed_values[i] = float(int(raw))
             except Exception:
                 pass
         # Sync _config_values cache for config bit registers
@@ -1717,18 +2652,16 @@ class ParameterWindow(QMainWindow):
         name = self.airframe_combo.currentText()
         path = self.airframe_combo.itemData(index)
 
-        # Auto-save current params to previously-selected airframe before overwriting
-        if self._current_airframe_path and self._current_airframe_path != path:
-            try:
-                raw_vals = self._raw_float_values()
-                raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
-                prev_name, _ = af_module.parse_af_file(self._current_airframe_path)
-                text = af_module.format_af(prev_name, raw_dict)
-                with open(self._current_airframe_path, 'w') as f:
-                    f.write(text)
-                self._log(f"  💾 Auto-saved current params to \"{prev_name}\"")
-            except Exception as e:
-                self._log(f"  ⚠️ Could not auto-save to previous airframe: {e}")
+        # Prompt to save if dirty before switching
+        if not self._prompt_save_if_dirty():
+            # Revert combo to previous selection
+            self.airframe_combo.blockSignals(True)
+            for i in range(self.airframe_combo.count()):
+                if self.airframe_combo.itemData(i) == self._current_airframe_path:
+                    self.airframe_combo.setCurrentIndex(i)
+                    break
+            self.airframe_combo.blockSignals(False)
+            return
 
         if path == "__DEFAULTS__":
             reply = QMessageBox.question(
@@ -1762,7 +2695,7 @@ class ParameterWindow(QMainWindow):
                 self.airframe_combo.setCurrentIndex(-1)
                 return
             try:
-                read_name, raw_values = af_module.parse_af_file(path)
+                read_name, raw_values, meta = af_module.parse_af_file(path)
                 self._log(f"  📖 Loaded {len(raw_values)} params from \"{read_name}\"")
             except Exception as e:
                 self._log(f"  ❌ Failed to parse {path}: {e}")
@@ -1791,6 +2724,17 @@ class ParameterWindow(QMainWindow):
         self._ensure_config2_fast_start()
         self.update_config_display()
         self.update_rc_display()
+        # Restore character slider from .af metadata
+        if self._character_slider and 'Character' in meta:
+            try:
+                self._character_slider.setValue(int(meta['Character']))
+            except (ValueError, TypeError):
+                pass
+        self.sync_setup_from_advanced()
+        # Load physical descriptors from .af metadata
+        phys_meta = {k: v for k, v in meta.items() if k.startswith('PHYS_')}
+        if phys_meta:
+            self._load_phys_from_metadata(phys_meta)
         self.status_label.setText(f"📝 Loaded \"{name}\" defaults — writing to FC")
         self.status_label.setStyleSheet("color: #f39c12;")
 
@@ -1839,11 +2783,55 @@ class ParameterWindow(QMainWindow):
 
     
     def combo_changed(self, idx: int, value: int):
+        # Confirmation dialog for safety-critical combo params
+        if idx in self._PROTECTED_PARAMS:
+            old_val = self._committed_values.get(idx, float(value))
+            if abs(float(value) - old_val) > 0.001:
+                name = self._PROTECTED_NAMES.get(idx, f"P{idx+1}")
+                warning = self._PROTECTED_WARNINGS.get(idx, "This parameter affects critical behavior.")
+                reply = QMessageBox.question(
+                    self, "Confirm Parameter Change",
+                    f"{name}\n\n"
+                    f"{warning}\n\n"
+                    f"Are you sure you want to change this?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    widget = self.params[idx]
+                    widget.blockSignals(True)
+                    cb_idx = widget.findData(int(old_val))
+                    if cb_idx >= 0:
+                        widget.setCurrentIndex(cb_idx)
+                    widget.blockSignals(False)
+                    return
+                self._committed_values[idx] = float(value)
         self.dirty_params.add(idx)
         self.status_label.setText(f"P{idx+1} changed ({len(self.dirty_params)})")
         self.status_label.setStyleSheet("color: #f39c12;")
     
     def param_changed(self, idx: int, value: float):
+        # Confirmation dialog for safety-critical params
+        if idx in self._PROTECTED_PARAMS:
+            old_val = self._committed_values.get(idx, value)
+            if abs(value - old_val) > 0.001:
+                name = self._PROTECTED_NAMES.get(idx, f"P{idx+1}")
+                warning = self._PROTECTED_WARNINGS.get(idx, "This parameter affects critical behavior.")
+                reply = QMessageBox.question(
+                    self, "Confirm Parameter Change",
+                    f"{name}\n\n"
+                    f"{warning}\n\n"
+                    f"Current: {old_val:.4f}\nProposed: {value:.4f}\n\n"
+                    f"Are you sure you want to change this?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    widget = self.params[idx]
+                    widget.blockSignals(True)
+                    widget.setValue(old_val)
+                    widget.blockSignals(False)
+                    return
+                self._committed_values[idx] = value
+
         self.dirty_params.add(idx)
         self.status_label.setText(f"P{idx+1} changed ({len(self.dirty_params)})")
         self.status_label.setStyleSheet("color: #f39c12;")
@@ -1889,6 +2877,81 @@ class ParameterWindow(QMainWindow):
         self._log(f"  Write button request_id: {self._write_request_id}")
     
 
+
+    def _snapshot_baseline(self):
+        """Capture current widget values as the baseline for dirty detection"""
+        self._baseline_snapshot = {}
+        for idx, widget in self.params.items():
+            if isinstance(widget, QDoubleSpinBox):
+                self._baseline_snapshot[idx] = widget.value()
+            elif isinstance(widget, QComboBox):
+                self._baseline_snapshot[idx] = widget.currentData()
+            elif isinstance(widget, QSpinBox):
+                self._baseline_snapshot[idx] = widget.value()
+
+    def _is_dirty_from_baseline(self):
+        """Check if any widget differs from the last-loaded baseline"""
+        for idx, widget in self.params.items():
+            if isinstance(widget, QDoubleSpinBox):
+                current = widget.value()
+            elif isinstance(widget, QComboBox):
+                current = widget.currentData()
+            elif isinstance(widget, QSpinBox):
+                current = widget.value()
+            else:
+                continue
+            baseline = self._baseline_snapshot.get(idx)
+            if baseline is None:
+                if current is not None and current != 0:
+                    return True
+            elif abs(float(current) - float(baseline)) > 0.001:
+                return True
+        return False
+
+    def _default_save_path(self):
+        """Build default save path: ~/UAVX/<airframe_name>_Tuned.af"""
+        airframe_name = "Params"
+        if self._current_airframe_path:
+            airframe_name = os.path.splitext(os.path.basename(self._current_airframe_path))[0]
+        tuned_dir = os.path.expanduser("~/UAVX")
+        os.makedirs(tuned_dir, exist_ok=True)
+        return os.path.join(tuned_dir, f"{airframe_name}_Tuned.af")
+
+    def _prompt_save_if_dirty(self):
+        """Prompt to save if dirty. Returns True if safe to proceed, False to cancel."""
+        if not self._is_dirty_from_baseline():
+            return True
+        reply = QMessageBox.question(
+            self, "Unsaved Changes",
+            "You have unsaved parameter changes.\n\n"
+            "Save to ~/.af file before continuing?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save
+        )
+        if reply == QMessageBox.Save:
+            path = self._default_save_path()
+            try:
+                raw_vals = self._raw_float_values()
+                raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
+                metadata = {}
+                if self._character_slider:
+                    metadata['Character'] = str(self._character_slider.value())
+                metadata.update(self._phys_to_metadata())
+                text = af_module.format_af("Tuned Parameters", raw_dict, metadata=metadata)
+                with open(path, 'w') as f:
+                    f.write(text)
+                self._log(f"✅ Saved tuned params to {path}")
+                self.status_label.setText(f"✅ Saved to {os.path.basename(path)}")
+                self.status_label.setStyleSheet("color: #27ae60;")
+                return True
+            except Exception as e:
+                self._log(f"❌ Save failed: {e}")
+                QMessageBox.critical(self, "Save Failed", str(e))
+                return False
+        elif reply == QMessageBox.Discard:
+            return True
+        else:
+            return False
     
     def save_params(self):
         from datetime import datetime
@@ -1902,7 +2965,11 @@ class ParameterWindow(QMainWindow):
         if not path:
             return
         try:
-            text = af_module.format_af("Saved Parameters", raw_dict)
+            metadata = {}
+            if self._character_slider:
+                metadata['Character'] = str(self._character_slider.value())
+            metadata.update(self._phys_to_metadata())
+            text = af_module.format_af("Saved Parameters", raw_dict, metadata=metadata)
             with open(path, 'w') as f:
                 f.write(text)
             self._log(f"✅ Saved {self.MAX_PARAMS} parameters to {path}")
@@ -1918,13 +2985,20 @@ class ParameterWindow(QMainWindow):
         if not path:
             return
         try:
-            name, raw_values = af_module.parse_af_file(path)
+            name, raw_values, meta = af_module.parse_af_file(path)
             self._log(f"  📖 Loaded {len(raw_values)} params from \"{name}\"")
             self._set_widgets_from_raw(raw_values)
             self._ensure_config2_fast_start()
             self.update_config_display()
             self.update_rc_display()
             self.dirty_params.update(raw_values.keys())
+            # Restore character slider position from .af metadata
+            if self._character_slider and 'Character' in meta:
+                try:
+                    self._character_slider.setValue(int(meta['Character']))
+                except (ValueError, TypeError):
+                    pass
+            self.sync_setup_from_advanced()
             self._log(f"✅ Loaded {len(raw_values)} parameters from {path}")
             self.status_label.setText(f"✅ Loaded from {os.path.basename(path)}")
             self.status_label.setStyleSheet("color: #27ae60;")
@@ -2062,6 +3136,7 @@ class ParameterWindow(QMainWindow):
         
         self.update_config_display()
         self.update_rc_display()
+        self.sync_setup_from_advanced()
         self._log("✅ Default parameters loaded")
     
     def read_params(self):
@@ -2178,6 +3253,8 @@ class ParameterWindow(QMainWindow):
                 if isinstance(widget, QDoubleSpinBox):
                     mult = self._display_mult(i)
                     current_params[i] = int(widget.value() / mult)
+                elif isinstance(widget, QSpinBox):
+                    current_params[i] = widget.value()
                 elif isinstance(widget, QComboBox):
                     data = widget.currentData()
                     current_params[i] = data if data is not None else widget.currentIndex()
@@ -2352,15 +3429,9 @@ class ParameterWindow(QMainWindow):
             self._verification_timer.stop()
             self._verification_timer = None
         
-        if self.dirty_params:
-            reply = QMessageBox.question(
-                self, "Unsaved Changes",
-                "Discard unsaved parameter changes?",
-                QMessageBox.Discard | QMessageBox.Cancel
-            )
-            if reply == QMessageBox.Cancel:
-                event.ignore()
-                return
+        if not self._prompt_save_if_dirty():
+            event.ignore()
+            return
         event.accept()
     
     def set_buttons_enabled(self, enabled: bool):

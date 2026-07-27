@@ -12,7 +12,7 @@ for fn in sorted(os.listdir(DIR)):
     path = os.path.join(DIR, fn)
     with open(path) as f:
         text = f.read()
-    name, values = airframes.parse_af(text)
+    name, values, _meta = airframes.parse_af(text)
     new_text = airframes.format_af(name, values)
     with open(path, 'w') as f:
         f.write(new_text)

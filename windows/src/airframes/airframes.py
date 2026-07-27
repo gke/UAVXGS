@@ -31,26 +31,7 @@ AIRFRAMES_DIR = os.path.join(os.path.dirname(__file__))
 
 LINE_RE = re.compile(r'^\s*(\w+)\s*=\s*(.+?)\s*$')
 
-# Physical specification parameters for simulation (not sent to FC)
-PHYSICAL_PARAMS = {
-    'PHYS_MASS_KG': 'Mass in kg',
-    'PHYS_FRAME_MM': 'Frame size in mm (diagonal motor-to-motor)',
-    'PHYS_MOTOR_KV': 'Motor KV rating',
-    'PHYS_PROP_DIAMETER_INCH': 'Prop diameter in inches',
-    'PHYS_PROP_PITCH_INCH': 'Prop pitch in inches',
-    'PHYS_PROP_BLADES': 'Number of prop blades',
-    'PHYS_CELL_COUNT': 'Battery cell count (S)',
-    'PHYS_BATTERY_MAH': 'Battery capacity in mAh',
-    'PHYS_ARM_LEN_M': 'Arm length in meters (center to motor)',
-    'PHYS_INERTIA_ROLL_PITCH': 'Roll/Pitch inertia (kg·m²)',
-    'PHYS_INERTIA_YAW': 'Yaw inertia (kg·m²)',
-    'PHYS_MAX_THRUST_N': 'Max thrust per motor in Newtons',
-    'PHYS_CRUISE_SPEED_MS': 'Cruise speed m/s (FW only)',
-    'PHYS_MIN_SPEED_MS': 'Min speed m/s (FW only)',
-    'PHYS_MAX_SPEED_MS': 'Max speed m/s (FW only)',
-    'PHYS_LIFT_COEFF': 'Lift coefficient (FW only)',
-    'PHYS_DRAG_COEFF': 'Drag coefficient (FW only)',
-}
+
 
 ENUM_MAP: Dict[str, type] = {
     'AF_TYPE': AirframeType,
@@ -171,22 +152,38 @@ def _format_value(param_name: str, raw_value: float) -> str:
     return f'{raw_value:.6g}'
 
 
-def parse_af(text: str) -> Tuple[str, Dict[int, float]]:
-    """Parse .af file text → (name, {tag: raw_float_value})."""
+def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, str]]:
+    """Parse .af file text → (name, {tag: raw_float_value}, metadata_dict).
+
+    metadata_dict contains:
+      - 'Name', 'Character' from '# Key: Value' comment lines
+      - 'PHYS_*' keys from PHYS_* = value lines (physical descriptors)
+    """
     name = 'Unknown'
     values: Dict[int, float] = {}
+    metadata: Dict[str, str] = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith('#'):
             if line.startswith('# ') and name == 'Unknown':
-                name = line[2:].strip()
+                rest = line[2:].strip()
+                if ':' in rest and not rest.startswith(' '):
+                    key, val = rest.split(':', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if key in ('Name', 'Character'):
+                        metadata[key] = val
+                else:
+                    name = rest
             continue
         m = LINE_RE.match(line)
         if not m:
             continue
         param_name = m.group(1).strip().upper()
         value_text = m.group(2).strip()
-        # Find tag by name
+        if param_name.startswith('PHYS_'):
+            metadata[param_name] = value_text
+            continue
         tag = None
         try:
             tag = ParamIndex[param_name].value
@@ -196,18 +193,34 @@ def parse_af(text: str) -> Tuple[str, Dict[int, float]]:
             continue
         val = _parse_value(param_name, value_text)
         values[tag] = val
-    return name, values
+    return name, values, metadata
 
 
-def parse_af_file(path: str) -> Tuple[str, Dict[int, float]]:
-    """Read an .af file from disk and parse it → (name, {tag: raw_float})."""
+def parse_af_file(path: str) -> Tuple[str, Dict[int, float], Dict[str, str]]:
+    """Read an .af file from disk and parse it → (name, {tag: raw_float}, metadata)."""
     with open(path) as f:
         return parse_af(f.read())
 
 
-def format_af(name: str, values: Dict[int, float]) -> str:
-    """Format param values → .af file text."""
+def format_af(name: str, values: Dict[int, float], metadata: Dict[str, str] = None) -> str:
+    """Format param values → .af file text.
+
+    Optional metadata stored as:
+      - '# Key: Value' comment lines for Name, Character
+      - 'PHYS_KEY = Value' lines for physical descriptors and derived quantities
+    """
     lines = [f'# {name}', '']
+    phys_lines = []
+    if metadata:
+        for k, v in metadata.items():
+            if k.startswith('PHYS_'):
+                phys_lines.append(f'{k} = {v}')
+            else:
+                lines.append(f'# {k}: {v}')
+        if phys_lines:
+            lines.append('')
+            lines.extend(phys_lines)
+            lines.append('')
     for i in range(128):
         if i not in values:
             continue
@@ -262,7 +275,7 @@ def export_af_from_widgets(name: str, params: Dict[int, object]) -> str:
 
 def import_to_widgets(name: str, af_text: str, params: Dict[int, object]) -> str:
     """Parse .af text and set widget values. Returns airframe name."""
-    af_name, raw_values = parse_af(af_text)
+    af_name, raw_values, _meta = parse_af(af_text)
     from parameter_window import QDoubleSpinBox, QComboBox
     for tag, raw_val in raw_values.items():
         if tag not in params:
@@ -300,6 +313,6 @@ def list_airframes() -> List[Tuple[str, str]]:
         if not fn.endswith('.af'):
             continue
         path = os.path.join(AIRFRAMES_DIR, fn)
-        name, _ = parse_af_file(path)
+        name, _, _meta = parse_af_file(path)
         results.append((name, path))
     return results

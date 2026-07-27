@@ -488,8 +488,7 @@ class MainWindow(QMainWindow):
         self.revision_label.setStyleSheet("""
             font-size: 14px;
             font-weight: bold;
-            color: #00ff00;
-            background-color: black;
+            color: black;
             padding: 4px;
             border: 1px solid #444;
             border-radius: 4px;

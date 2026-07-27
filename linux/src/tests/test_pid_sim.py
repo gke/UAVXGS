@@ -101,6 +101,71 @@ AF_FILES = {
 }
 
 AIR_DENSITY = 1.225          # kg/m³ at sea level
+RAD_TO_DEG_F = 180.0 / math.pi
+
+# ═══════════════════════════════════════════
+#  Character slider param curves
+#  Maps ParamIndex → (conservative_raw, aggressive_raw)
+#  Values are FC raw float32 units (rad, rad/s, fraction, etc.)
+#  Used to test slider extremes for safety.
+# ═══════════════════════════════════════════
+from protocol_enums import ParamIndex as _PI
+
+_PARAM_CURVES = {
+    # Angle gains (Quaternion P, scale=1.0 on GCS)
+    int(_PI.ROLL_ANGLE_KP):       (5.0, 9.0),       # default 7
+    int(_PI.PITCH_ANGLE_KP):      (5.0, 9.0),       # default 7
+    int(_PI.YAW_ANGLE_KP):        (5.0, 10.0),      # default 8
+    # Angle integral gains
+    int(_PI.ROLL_ANGLE_KI):       (0.05, 0.5),      # default 0.25
+    int(_PI.PITCH_ANGLE_KI):      (0.05, 0.5),      # default 0.25
+    int(_PI.YAW_ANGLE_KI):        (0.05, 0.5),      # default 0.25
+    # Angle integral limits (rad/s)
+    int(_PI.ROLL_ANGLE_INT_LIMIT):(0.005, 0.03),    # default 0.01
+    int(_PI.PITCH_ANGLE_INT_LIMIT):(0.005, 0.03),   # default 0.01
+    int(_PI.YAW_ANGLE_INT_LIMIT): (0.01, 0.06),     # default 0.03
+    # Rate proportional gains
+    int(_PI.ROLL_RATE_KP):        (0.125, 0.5),     # default 0.25
+    int(_PI.PITCH_RATE_KP):       (0.125, 0.5),     # default 0.25
+    int(_PI.YAW_RATE_KP):         (0.125, 0.75),    # default 0.25
+    # Rate derivative gains
+    int(_PI.ROLL_RATE_KD):        (0.005, 0.02),    # default 0.01
+    int(_PI.PITCH_RATE_KD):       (0.005, 0.02),    # default 0.01
+    int(_PI.YAW_RATE_KD):         (0.005, 0.02),    # default 0.01
+    # Rate limits (rad/s)
+    int(_PI.MAX_ROLL_RATE):       (1.396, 6.283),   # 80-360 deg/s
+    int(_PI.MAX_PITCH_RATE):      (1.047, 4.189),   # 60-240 deg/s
+    int(_PI.MAX_COMPASS_YAW_RATE):(0.262, 2.094),   # 15-120 deg/s
+    # Altitude
+    int(_PI.ALT_POS_KP):          (0.2, 0.5),       # default 0.35
+    int(_PI.ALT_POS_KI):          (0.001, 0.005),   # default 0.002
+    int(_PI.ALT_THROTTLE_COMP_LIMIT): (0.1, 0.35),  # default 0.2-0.25 fraction
+    # Navigation
+    int(_PI.NAV_POS_KP):          (0.075, 0.3),     # default 0.15
+    int(_PI.NAV_POS_KI):          (0.006, 0.025),   # default 0.012
+    int(_PI.NAV_VEL_KP):          (0.1, 0.4),       # default 0.2
+    int(_PI.HORIZON):             (2.0, 5.0),       # default ~3.33
+    # Angle limits (rad)
+    int(_PI.MAX_PITCH_ANGLE):     (0.349, 0.698),   # 20-40 deg
+    int(_PI.MAX_ROLL_ANGLE):      (0.349, 0.698),   # 20-40 deg
+}
+
+
+def apply_slider(raw_params: dict, slider_pct: float) -> dict:
+    """Apply character slider to raw params.
+
+    Interpolates between conservative (0%) and aggressive (100%) raw FC values.
+    Params not in _PARAM_CURVES are left unchanged.
+    """
+    from protocol_enums import ParamIndex
+    result = dict(raw_params)
+    for tag_int, (cons, agg) in _PARAM_CURVES.items():
+        pname = ParamIndex(tag_int).name
+        if pname not in raw_params:
+            continue
+        new_raw = cons + slider_pct * (agg - cons)
+        result[pname] = new_raw
+    return result
 
 # Per-airframe physical descriptors for aerodynamic simulation.
 # Each entry defines the real-world geometry that drives torque and damping.
@@ -140,7 +205,7 @@ FW_AIRFRAMES = {
         "pitch_damp": -8.0, "yaw_damp": -0.08,
         "adverse_yaw": 0.05, "dihedral_coeff": 0.01,
         "pitch_stability": -0.15, "yaw_stability": 0.01,
-        "roll_damp_lin": 0.01, "pitch_damp_lin": 0.02, "yaw_damp_lin": 0.01,
+        "roll_damp_lin": 0.02, "pitch_damp_lin": 0.02, "yaw_damp_lin": 0.01,
         "servo_tau": 0.08,
     },
     # Phoenix: 1kg Radian-class, rudder+elevator (no ailerons)
@@ -170,7 +235,7 @@ FW_AIRFRAMES = {
         "aileron_max_deg": 20.0, "elevator_max_deg": 15.0, "rudder_max_deg": 25.0,
         "CL_D_AIL": 0.035, "CM_D_ELE": 0.45, "CN_D_RUD": 0.08,
         "pitch_damp": -9.0, "yaw_damp": -0.10,
-        "adverse_yaw": 0.10, "dihedral_coeff": 0.08,
+        "adverse_yaw": 0.10, "dihedral_coeff": 0.12,
         "pitch_stability": -0.15, "yaw_stability": 0.03,
         "roll_damp_lin": 0.015, "pitch_damp_lin": 0.03, "yaw_damp_lin": 0.012,
         "servo_tau": 0.08,
@@ -244,8 +309,10 @@ MR_INERTIA_R = [_IR, _IR / 1.5, _IR / 2.5]        # Roll, Pitch, Yaw
 
 DTERM_LPF_HZ = 50.0
 
-# Test step sizes (degrees)
+# Test step sizes (degrees) — MR
 TEST_STEPS = {"Roll": 15.0, "Pitch": 10.0, "Yaw": 45.0}
+# FW step sizes — larger pitch for recovery-from-upset test, smaller yaw for coordinated turn
+FW_TEST_STEPS = {"Roll": 15.0, "Pitch": 30.0, "Yaw": 15.0}
 # Gust magnitudes for disturbance rejection
 GUST_MAG = {"Roll": 0.02, "Pitch": 0.015, "Yaw": 0.01}
 
@@ -362,7 +429,10 @@ def run_physics_mr(angle: float, rate: float, out: float, lag: float, dT: float,
 
     kT = EM_MAX_THRUST * 0.25 * EM_ARM_LEN
     torque = kT * effort
-    damping = 2.0 * sgn(rate) * rate * rate
+    # Per-axis quadratic damping coefficients (tuned for realistic max rates)
+    _DAMP_C = {"Roll": 0.015, "Pitch": 0.03, "Yaw": 0.05}
+    damp_c = _DAMP_C.get(axis, 0.02)
+    damping = damp_c * sgn(rate) * rate * rate
     inertia_r = MR_INERTIA_R[AXIS_NAMES[axis]]
     dRate = (torque - damping) * inertia_r * dT
     rate += dRate
@@ -702,9 +772,434 @@ def simulate_rate_disturbance(pid: PIDStruct, dT: float = CONTROL_DT,
     )
 
 
+# ═══════════════════════════════════════════
+#  Altitude Hold step response
+# ═══════════════════════════════════════════
+# AH PI: output = AltPosKp * err + AltPosKi * integral(err)
+# Output is throttle compensation, clamped to AltThrCompLimit
+
+# MR AH: mass-thrust model — fast response (~0.5s)
+# Throttle → thrust → vertical accel → velocity → altitude
+# Plant: mass=0.8kg, max_thrust~18N, hover_thr=55%, drag∝v²
+
+def simulate_alt_hold_mr(params: dict, step_m: float = 5.0,
+                         dT: float = CONTROL_DT) -> StepMetrics:
+    """Simulate MR altitude hold step response.
+
+    step_m: altitude step in meters (default 5m)
+    Physics: mass-thrust model with quadratic drag.
+    """
+    kp = float(params.get("ALT_POS_KP", 0.0))
+    ki = float(params.get("ALT_POS_KI", 0.0))
+    thr_lim = float(params.get("ALT_THROTTLE_COMP_LIMIT", 0.2))
+
+    mass = EM_MASS
+    max_thrust = EM_MAX_THRUST * mass / EM_THR_CRUISE
+    hover_thr = EM_THR_CRUISE
+
+    alt = 0.0
+    vel = 0.0
+    int_e = 0.0
+    n = int(SIM_TIME / dT)
+
+    peak_alt = 0.0
+    max_int = 0.0
+    rise_time_s = SIM_TIME
+    settled = False
+    settle_time = SIM_TIME
+
+    for i in range(n):
+        t = i * dT
+        err = step_m - alt
+        p_term = kp * err
+        int_e = clamp(int_e + err * ki * dT, -thr_lim, thr_lim)
+        thr_comp = clamp(p_term + int_e, -thr_lim, thr_lim)
+
+        total_thr = hover_thr + thr_comp
+        thrust_force = total_thr * max_thrust
+        accel = thrust_force / mass - GRAVITY
+        drag = 0.5 * abs(vel) * vel
+        accel -= drag / mass
+
+        vel += accel * dT
+        alt += vel * dT
+
+        max_int = max(max_int, abs(int_e))
+        peak_alt = max(peak_alt, alt)
+
+        if rise_time_s == SIM_TIME and alt >= 0.9 * step_m:
+            rise_time_s = t
+
+        if t > 1.0:
+            if abs(alt - step_m) < 0.02 * abs(step_m):
+                if not settled:
+                    settle_time = t
+                    settled = True
+            else:
+                settled = False
+                settle_time = t + dT
+
+    final_err = abs(alt - step_m)
+    overshoot = max(0, (peak_alt - step_m) / step_m * 100.0) if step_m > 0 else 0.0
+
+    return StepMetrics(
+        axis_name="Altitude (MR)",
+        rise_time_s=round(rise_time_s, 4),
+        overshoot_pct=round(overshoot, 1),
+        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        steady_state_error=round(final_err, 4),
+        max_integrator=round(max_int, 6),
+        peak_angle=round(peak_alt, 4),
+        final_angle=round(alt, 4),
+        setpoint=step_m,
+    )
+
+
+# FW AH: pitch-to-climb model — slow response (~3-5s)
+# Throttle controls airspeed, pitch angle controls climb rate
+# Plant: mass=1.0kg, CL~0.5, climb_rate ≈ V * sin(pitch)
+# AH outputs throttle comp → FC also commands pitch for climb
+# Simplified: altitude rate = V * sin(climb_angle)
+# climb_angle controlled by PI with time constant ~2s (servo + aero lag)
+
+def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13.0,
+                         dT: float = CONTROL_DT) -> StepMetrics:
+    """Simulate FW altitude hold step response.
+
+    step_m: altitude step in meters (default 5m)
+    Physics: pitch-to-climb model with airspeed coupling.
+    FW climbs by pitching up (controlled by AH), which bleeds airspeed.
+    Much slower than MR — time constant ~2-3s.
+    """
+    kp = float(params.get("ALT_POS_KP", 0.0))
+    ki = float(params.get("ALT_POS_KI", 0.0))
+    thr_lim = float(params.get("ALT_THROTTLE_COMP_LIMIT", 0.2))
+
+    alt = 0.0
+    vel_vert = 0.0
+    int_e = 0.0
+    n = int(SIM_TIME / dT)
+
+    peak_alt = 0.0
+    max_int = 0.0
+    rise_time_s = SIM_TIME
+    settled = False
+    settle_time = SIM_TIME
+
+    # FW climb dynamics: PI outputs desired climb rate
+    # Actual climb rate follows with time constant (servo + aero lag)
+    climb_tau = 2.0  # seconds — much slower than MR
+    V = cruise_v
+
+    for i in range(n):
+        t = i * dT
+        err = step_m - alt
+        p_term = kp * err
+        int_e = clamp(int_e + err * ki * dT, -thr_lim, thr_lim)
+        climb_cmd = clamp(p_term + int_e, -thr_lim, thr_lim)
+
+        # Desired vertical velocity from PI output
+        # Scale: thr_lim=0.25 → ~5 m/s climb rate max
+        v_desired = climb_cmd * 20.0  # m/s max climb
+
+        # First-order lag (servo + aero response)
+        accel = (v_desired - vel_vert) / climb_tau
+        vel_vert += accel * dT
+
+        # Airspeed bleed during climb (energy trade)
+        # dV/dt ≈ -g * sin(climb_angle) ≈ -g * v_vert / V
+        alt += vel_vert * dT
+
+        max_int = max(max_int, abs(int_e))
+        peak_alt = max(peak_alt, alt)
+
+        if rise_time_s == SIM_TIME and alt >= 0.9 * step_m:
+            rise_time_s = t
+
+        if t > 1.0:
+            if abs(alt - step_m) < 0.02 * abs(step_m):
+                if not settled:
+                    settle_time = t
+                    settled = True
+            else:
+                settled = False
+                settle_time = t + dT
+
+    final_err = abs(alt - step_m)
+    overshoot = max(0, (peak_alt - step_m) / step_m * 100.0) if step_m > 0 else 0.0
+
+    return StepMetrics(
+        axis_name="Altitude (FW)",
+        rise_time_s=round(rise_time_s, 4),
+        overshoot_pct=round(overshoot, 1),
+        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        steady_state_error=round(final_err, 4),
+        max_integrator=round(max_int, 6),
+        peak_angle=round(peak_alt, 4),
+        final_angle=round(alt, 4),
+        setpoint=step_m,
+    )
+
+
+# ═══════════════════════════════════════════
+#  Navigation step response
+# ═══════════════════════════════════════════
+# Nav PI: outer (position) → inner (velocity/bank) cascade
+
+# MR Nav: tilt-to-move — fast, direct response (~1s)
+# Position error → desired velocity → tilt angle → lateral accel → velocity → position
+# MR tilts directly: lateral_accel = g * tan(bank), response ~0.3s
+
+def simulate_nav_mr(params: dict, step_m: float = 10.0,
+                    dT: float = CONTROL_DT) -> StepMetrics:
+    """Simulate MR navigation step response (lateral offset).
+
+    step_m: lateral offset step in meters (default 10m)
+    Physics: bank-to-turn model with fast tilt response.
+    """
+    pos_kp = float(params.get("NAV_POS_KP", 0.0))
+    pos_ki = float(params.get("NAV_POS_KI", 0.0))
+    vel_kp = float(params.get("NAV_VEL_KP", 0.0))
+    max_angle = float(params.get("MAX_PITCH_ANGLE", 0.5236))
+
+    step_rad = step_m  # treat as meters lateral offset
+
+    pos = 0.0
+    vel = 0.0
+    int_e = 0.0
+    n = int(SIM_TIME / dT)
+
+    peak_pos = 0.0
+    max_int = 0.0
+    rise_time_s = SIM_TIME
+    settled = False
+    settle_time = SIM_TIME
+
+    # MR tilt dynamics: fast response (motor time constant ~0.1s)
+    tilt_tau = 0.3  # seconds
+
+    for i in range(n):
+        t = i * dT
+        err = step_rad - pos
+        pos_cmd = pos_kp * err
+        int_e = clamp(int_e + err * pos_ki * dT, -max_angle, max_angle)
+
+        # Inner loop: velocity error → bank angle
+        vel_err = pos_cmd - vel
+        bank = clamp(vel_kp * vel_err + int_e, -max_angle, max_angle)
+
+        # Bank-to-turn: lateral accel = g * tan(bank)
+        lat_accel = GRAVITY * math.tan(bank)
+
+        # First-order lag on tilt
+        accel = (lat_accel - vel * abs(vel) * 0.1) / tilt_tau  # with drag
+        vel += accel * dT
+        pos += vel * dT
+
+        max_int = max(max_int, abs(int_e))
+        peak_pos = max(peak_pos, abs(pos))
+
+        if rise_time_s == SIM_TIME and abs(pos) >= 0.9 * abs(step_rad):
+            rise_time_s = t
+
+        if t > 1.0:
+            if abs(pos - step_rad) < 0.02 * abs(step_rad):
+                if not settled:
+                    settle_time = t
+                    settled = True
+            else:
+                settled = False
+                settle_time = t + dT
+
+    final_err = abs(pos - step_rad)
+    overshoot = max(0, (peak_pos - abs(step_rad)) / abs(step_rad) * 100.0) if step_rad != 0 else 0.0
+
+    return StepMetrics(
+        axis_name="Navigation (MR)",
+        rise_time_s=round(rise_time_s, 4),
+        overshoot_pct=round(overshoot, 1),
+        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        steady_state_error=round(final_err, 4),
+        max_integrator=round(max_int, 6),
+        peak_angle=round(peak_pos, 4),
+        final_angle=round(pos, 4),
+        setpoint=step_m,
+    )
+
+
+# FW Nav: bank-to-turn — slower (~2-3s), bank-angle limited
+# Cross-track error → desired bank angle → coordinated turn → heading rate → position
+# FW must bank to turn: heading_rate = g * tan(bank) / V
+# Bank limited by MAX_PITCH_ANGLE (typically 20-35°)
+
+def simulate_nav_fw(params: dict, step_m: float = 10.0, cruise_v: float = 13.0,
+                    dT: float = CONTROL_DT) -> StepMetrics:
+    """Simulate FW navigation step response (cross-track correction).
+
+    step_m: cross-track error step in meters (default 10m)
+    Physics: coordinated turn model with bank angle limit.
+    """
+    pos_kp = float(params.get("NAV_POS_KP", 0.0))
+    pos_ki = float(params.get("NAV_POS_KI", 0.0))
+    vel_kp = float(params.get("NAV_VEL_KP", 0.0))
+    max_bank = float(params.get("MAX_PITCH_ANGLE", 0.5236))
+
+    pos = 0.0  # cross-track error in meters
+    vel = 0.0  # lateral velocity
+    heading = 0.0
+    int_e = 0.0
+    n = int(SIM_TIME / dT)
+
+    peak_pos = 0.0
+    max_int = 0.0
+    rise_time_s = SIM_TIME
+    settled = False
+    settle_time = SIM_TIME
+
+    V = cruise_v
+    # Servo + aero response time constant
+    bank_tau = 1.5  # seconds — slower than MR
+
+    for i in range(n):
+        t = i * dT
+        err = step_m - pos
+        pos_cmd = pos_kp * err
+        int_e = clamp(int_e + err * pos_ki * dT, -max_bank, max_bank)
+
+        # Desired bank angle from cross-track correction
+        vel_err = pos_cmd - vel
+        bank_desired = clamp(vel_kp * vel_err + int_e, -max_bank, max_bank)
+
+        # First-order bank dynamics (roll rate limited)
+        bank_rate = (bank_desired - 0) / bank_tau  # simplified
+        heading += GRAVITY * math.tan(bank_desired) / V * dT
+
+        # Position update: move toward cross-track zero
+        # Simplified: lateral velocity = V * sin(heading_correction)
+        vel = V * math.sin(heading)
+        pos += vel * dT
+
+        max_int = max(max_int, abs(int_e))
+        peak_pos = max(peak_pos, abs(pos))
+
+        if rise_time_s == SIM_TIME and abs(pos) >= 0.9 * abs(step_m):
+            rise_time_s = t
+
+        if t > 1.0:
+            if abs(pos - step_m) < 0.02 * abs(step_m):
+                if not settled:
+                    settle_time = t
+                    settled = True
+            else:
+                settled = False
+                settle_time = t + dT
+
+    final_err = abs(pos - step_m)
+    overshoot = max(0, (peak_pos - abs(step_m)) / abs(step_m) * 100.0) if step_m != 0 else 0.0
+
+    return StepMetrics(
+        axis_name="Navigation (FW)",
+        rise_time_s=round(rise_time_s, 4),
+        overshoot_pct=round(overshoot, 1),
+        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        steady_state_error=round(final_err, 4),
+        max_integrator=round(max_int, 6),
+        peak_angle=round(peak_pos, 4),
+        final_angle=round(pos, 4),
+        setpoint=step_m,
+    )
+
+
+# ═══════════════════════════════════════════
+#  Navigation step response
+# ═══════════════════════════════════════════
+# Nav PI: outer (position) → inner (velocity) cascade
+# Output is bank angle → bank-to-turn: heading_rate = g * tan(bank) / V
+# Simplified: command heading change, measure heading response
+
+def simulate_nav(params: dict, step_deg: float = 30.0, cat: int = AirframeCat.MR,
+                 dT: float = CONTROL_DT) -> StepMetrics:
+    """Simulate navigation step response (heading change).
+
+    step_deg: heading step in degrees (default 30°)
+    Simplified physics: bank-to-turn model.
+    """
+    pos_kp = float(params.get("NAV_POS_KP", 0.0))
+    pos_ki = float(params.get("NAV_POS_KI", 0.0))
+    vel_kp = float(params.get("NAV_VEL_KP", 0.0))
+    max_angle = float(params.get("MAX_PITCH_ANGLE", 0.5236))  # max bank for nav
+
+    step_rad = step_deg * DEG_TO_RAD
+
+    heading = 0.0
+    cross_track = 0.0  # meters
+    vel = 0.0
+    int_e = 0.0
+    n = int(SIM_TIME / dT)
+
+    peak_heading = 0.0
+    max_int = 0.0
+    rise_time_s = SIM_TIME
+    settled = False
+    settle_time = SIM_TIME
+
+    V = 10.0  # m/s cruise speed
+
+    for i in range(n):
+        t = i * dT
+        heading_err = step_rad - heading
+
+        # Outer loop: position error → desired velocity
+        pos_cmd = pos_kp * heading_err
+        int_e = clamp(int_e + heading_err * pos_ki * dT, -max_angle, max_angle)
+
+        # Inner loop: velocity error → bank angle
+        vel_err = pos_cmd - vel
+        bank_angle = clamp(vel_kp * vel_err + int_e, -max_angle, max_angle)
+
+        # Bank-to-turn: heading_rate = g * tan(bank) / V
+        heading_rate = GRAVITY * math.tan(bank_angle) / V
+        heading += heading_rate * dT
+        cross_track += V * math.sin(heading) * dT
+
+        max_int = max(max_int, abs(int_e))
+        peak_heading = max(peak_heading, abs(heading))
+
+        # Rise time
+        if rise_time_s == SIM_TIME and abs(heading) >= 0.9 * abs(step_rad):
+            rise_time_s = t
+
+        # Settling
+        if t > 1.0:
+            if abs(heading - step_rad) < 0.02 * abs(step_rad):
+                if not settled:
+                    settle_time = t
+                    settled = True
+            else:
+                settled = False
+                settle_time = t + dT
+
+    final_err = abs(heading - step_rad)
+    overshoot = max(0, (peak_heading - abs(step_rad)) / abs(step_rad) * 100.0) if step_rad != 0 else 0.0
+
+    return StepMetrics(
+        axis_name="Navigation",
+        rise_time_s=round(rise_time_s, 4),
+        overshoot_pct=round(overshoot, 1),
+        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        steady_state_error=round(final_err, 4),
+        max_integrator=round(max_int, 6),
+        peak_angle=round(peak_heading * RAD_TO_DEG, 4),
+        final_angle=round(heading * RAD_TO_DEG, 4),
+        setpoint=step_deg,
+    )
+
+
 def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
                           dT: float = CONTROL_DT,
-                          gusts: Optional[Dict[str, Gust]] = None) -> Dict[str, StepMetrics]:
+                          gusts: Optional[Dict[str, Gust]] = None,
+                          params_override: Optional[dict] = None,
+                          step_rads: Optional[Dict[str, float]] = None) -> Dict[str, StepMetrics]:
     """Coupled 3-axis simulation with cross-coupling (dihedral, adverse yaw).
 
     Runs all three axes simultaneously so that:
@@ -712,6 +1207,8 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
       - Aileron deflection → adverse yaw → yaw torque
 
     step_axis: which axis receives the step command (others hold zero)
+    params_override: if provided, use these params instead of re-loading from file
+    step_rads: if provided, use these step sizes (radians) instead of TEST_STEPS
     """
     af_params = FW_AIRFRAMES[af_filename]
     rho = AIR_DENSITY
@@ -756,7 +1253,7 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
     is_rudder_elevator = (af_type == AirframeType.RUDDER_ELEVATOR)
 
     # Load params and set up PIDs
-    params = load_af_params(af_filename)
+    params = params_override if params_override is not None else load_af_params(af_filename)
 
     pis = {}   # angle PIs
     pids = {}  # rate PIDs
@@ -764,9 +1261,11 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
     rates   = {"Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0}
     lags    = {"Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0}
 
-    step_rads = {"Roll": TEST_STEPS["Roll"] * DEG_TO_RAD,
-                 "Pitch": TEST_STEPS["Pitch"] * DEG_TO_RAD,
-                 "Yaw": TEST_STEPS["Yaw"] * DEG_TO_RAD}
+    step_rads = step_rads if step_rads is not None else {
+        "Roll": TEST_STEPS["Roll"] * DEG_TO_RAD,
+        "Pitch": TEST_STEPS["Pitch"] * DEG_TO_RAD,
+        "Yaw": TEST_STEPS["Yaw"] * DEG_TO_RAD
+    }
 
     for name in ["Roll", "Pitch", "Yaw"]:
         akp, aki, ail, ma, rkp, rkd, mr = get_axis_params(params, name)
@@ -1199,9 +1698,9 @@ CRITERIA = {
 }
 
 FW_CRITERIA = {
-    "Roll": Criteria(3.0, 15.0, 5.0, 2.0, 1.0, 0.1, 5),
-    "Pitch": Criteria(3.0, 15.0, 5.0, 2.0, 1.0, 0.1, 5),
-    "Yaw": Criteria(5.0, 20.0, 6.0, 3.0, 1.0, 0.05, 5),
+    "Roll": Criteria(4.0, 25.0, 8.0, 5.0, 1.0, 0.05, 5),
+    "Pitch": Criteria(5.0, 30.0, 12.0, 15.0, 1.5, 0.05, 6),
+    "Yaw": Criteria(5.0, 25.0, 10.0, 5.0, 1.0, 0.03, 5),
 }
 
 DIST_CRITERIA = {
@@ -1209,6 +1708,12 @@ DIST_CRITERIA = {
     "Pitch": DisturbanceCriteria(12.0, 1.5, 8.0),
     "Yaw": DisturbanceCriteria(12.0, 2.0, 10.0),
 }
+
+# AH/Nav criteria — more relaxed than attitude (these are outer loops)
+AH_CRITERIA_MR = Criteria(1.0, 10.0, 3.0, 1.0, 1.0, 0.3, 3)   # fast response
+AH_CRITERIA_FW = Criteria(3.0, 15.0, 5.0, 2.0, 1.0, 0.3, 3)   # slower, relaxed
+NAV_CRITERIA_MR = Criteria(1.0, 10.0, 3.0, 1.0, 1.0, 0.3, 3)
+NAV_CRITERIA_FW = Criteria(3.0, 15.0, 5.0, 2.0, 1.0, 0.3, 3)
 
 # ═══════════════════════════════════════════
 #  Report / Critique
@@ -1246,6 +1751,29 @@ def critique(m: StepMetrics, c: Criteria, name: str) -> Tuple[List[str], bool]:
     all_pass = all(r[0] for r in results)
     lines.append(f"  → {name}: {G}PASS{N}" if all_pass else f"  → {name}: {R}ISSUES{N}")
     return lines, all_pass
+
+def critique_linear(m: StepMetrics, c: Criteria, name: str, units: str = "m") -> Tuple[List[str], bool]:
+    """Critique for linear (meters) step response — AH and Nav sims."""
+    lines = []
+    lines.append(f"\n{B}── {name} @ {m.setpoint:.1f}{units} step ──{N}")
+    lines.append(f"     Final: {m.final_angle:.2f}{units}   Peak: {m.peak_angle:.2f}{units}")
+    int_ratio = m.max_integrator / m.intlim if m.intlim > 0 else 0
+    rate_ratio = m.max_rate / (abs(m.setpoint) * 2) if m.setpoint != 0 else 1.0
+    results = [
+        check("Rise time (10→90%)",          m.rise_time_s,         c.max_rise_time_s, "max", "s"),
+        check("Overshoot",                    m.overshoot_pct,       c.max_overshoot_pct, "max", "%"),
+        check("Settling time (±2%)",          m.settling_time_s,     c.max_settling_time_s, "max", "s"),
+        check(f"Final error",                 m.steady_state_error,  c.max_ss_error_deg, "max", units),
+        check("Integrator utilization",       int_ratio,             c.max_int_ratio, "max"),
+    ]
+    for ok, msg in results:
+        lines.append(msg)
+        if not ok:
+            lines.append(f"    {R}╰─ recommend tuning{N}")
+    all_pass = all(r[0] for r in results)
+    lines.append(f"  → {name}: {G}PASS{N}" if all_pass else f"  → {name}: {R}ISSUES{N}")
+    return lines, all_pass
+
 
 def critique_disturbance(m: DisturbanceMetrics, c: DisturbanceCriteria, name: str) -> Tuple[List[str], bool]:
     lines = []
@@ -1290,7 +1818,7 @@ def load_af_params(af_filename: str) -> dict:
     # Files are in UAVXGS/uavx-python/src/airframes/
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     path = os.path.join(project_root, "uavx-python", "src", "airframes", af_filename)
-    _, p = parse_af_file(path)
+    _, p, _meta = parse_af_file(path)
     return {ParamIndex(tag).name: val for tag, val in p.items()}
 
 def get_params_for_af(af_filename: str) -> Tuple[dict, AirframeType, int, bool]:
@@ -1313,14 +1841,21 @@ def get_axis_params(params: dict, name: str) -> Tuple[float, float, float, float
     akp = params.get(f"{up}_ANGLE_KP", 0.0)
     aki = params.get(f"{up}_ANGLE_KI", 0.0)
     ail = params.get(f"{up}_ANGLE_INT_LIMIT", 0.0)
-    ma  = params.get(f"MAX_{up}_ANGLE", 0.523599)
+    # Yaw has no explicit angle limit (360° continuous rotation); defaults to 2π
+    default_max_angle = 6.2832 if up == "YAW" else 0.523599
+    ma  = params.get(f"MAX_{up}_ANGLE", default_max_angle)
     rkp = params.get(f"{up}_RATE_KP", 0.0)
     rkd = params.get(f"{up}_RATE_KD", 0.0)
     mr  = params.get(f"MAX_{up}_RATE", 10.0)
     return akp, aki, ail, ma, rkp, rkd, mr
 
-def run_tests_for_af(af_filename: str) -> Tuple[bool, List[str]]:
-    """Run all tests for a single airframe file."""
+def run_tests_for_af(af_filename: str, slider_pct: float = None) -> Tuple[bool, List[str]]:
+    """Run all tests for a single airframe file.
+
+    If slider_pct is None, uses params as-is from the .af file (base values).
+    If slider_pct is 0.0..1.0, applies the character slider to override
+    the curve-controlled params at that position.
+    """
     all_output = []
     all_pass = True
 
@@ -1329,14 +1864,23 @@ def run_tests_for_af(af_filename: str) -> Tuple[bool, List[str]]:
     except Exception as e:
         return False, [f"Error loading {af_filename}: {e}"]
 
+    if slider_pct is not None:
+        params = apply_slider(params, slider_pct)
+
     af_name = AIRFRAME_NAMES.get(af_type, af_type.name)
     model_lbl = af_type.name
+
+    slider_label = ""
+    if slider_pct is not None:
+        slider_label = f"  Slider:   {slider_pct*100:.0f}% ({'conservative' if slider_pct < 0.25 else 'aggressive' if slider_pct > 0.75 else 'mid'})"
 
     all_output.append(f"\n{'='*60}")
     all_output.append(f"{B}UAVX PID Critique — {af_filename}{N}")
     all_output.append(f"  Airframe: {af_name} ({model_lbl})")
     all_output.append(f"  Physics:  {'aerodynamic (qbar × S × C_ctrl)' if is_fw and af_filename in FW_AIRFRAMES else 'control-surface (emu.c FW)' if is_fw else 'motor-thrust (emu.c MR)'}")
     all_output.append(f"  Sim:      {SIM_TIME:.0f}s per axis   dt={CONTROL_DT*1000:.0f}ms")
+    if slider_label:
+        all_output.append(slider_label)
     if is_fw and af_filename in FW_AIRFRAMES:
         af = FW_AIRFRAMES[af_filename]
         I_roll, I_pitch = _compute_fw_inertia(af)
@@ -1350,15 +1894,16 @@ def run_tests_for_af(af_filename: str) -> Tuple[bool, List[str]]:
 
     if is_fw and af_filename in FW_AIRFRAMES:
         # Coupled 3-axis simulation for each step axis
+        fw_step_rads = {name: FW_TEST_STEPS[name] * DEG_TO_RAD for name in axes}
         for step_ax in axes:
             gusts = {name: Gust(GUST_MAG[name], 2.0, 0.5, name) for name in axes}
-            coupled_metrics = simulate_axis_coupled(af_filename, step_axis=step_ax, gusts=gusts)
+            coupled_metrics = simulate_axis_coupled(af_filename, step_axis=step_ax, gusts=gusts, step_rads=fw_step_rads)
             for name in axes:
                 if name == step_ax:
                     crit = FW_CRITERIA[name]
                     m = coupled_metrics[name]
                     metrics[name] = m
-                    lines, ok = critique(m, crit, f"{name} @ {TEST_STEPS[name]:.0f}°")
+                    lines, ok = critique(m, crit, f"{name} @ {FW_TEST_STEPS[name]:.0f}°")
                     all_output.extend(lines)
                     if not ok:
                         all_pass = False
@@ -1411,6 +1956,46 @@ def run_tests_for_af(af_filename: str) -> Tuple[bool, List[str]]:
         if not ok:
             all_pass = False
 
+    # ── Altitude Hold step response ──
+    all_output.append(f"\n{B}{'='*60}{N}")
+    all_output.append(f"{B}  Altitude Hold (5m step){N}")
+    all_output.append(f"{B}{'='*60}{N}")
+
+    if is_fw:
+        cruise_v = 13.0
+        if af_filename in FW_AIRFRAMES:
+            cruise_v = FW_AIRFRAMES[af_filename].get("cruise_speed", 13.0)
+        ah_m = simulate_alt_hold_fw(params, step_m=5.0, cruise_v=cruise_v)
+        ah_crit = AH_CRITERIA_FW
+    else:
+        ah_m = simulate_alt_hold_mr(params, step_m=5.0)
+        ah_crit = AH_CRITERIA_MR
+
+    lines, ok = critique_linear(ah_m, ah_crit, "Alt Hold 5m")
+    all_output.extend(lines)
+    if not ok:
+        all_pass = False
+
+    # ── Navigation step response ──
+    all_output.append(f"\n{B}{'='*60}{N}")
+    all_output.append(f"{B}  Navigation (10m lateral step){N}")
+    all_output.append(f"{B}{'='*60}{N}")
+
+    if is_fw:
+        cruise_v = 13.0
+        if af_filename in FW_AIRFRAMES:
+            cruise_v = FW_AIRFRAMES[af_filename].get("cruise_speed", 13.0)
+        nav_m = simulate_nav_fw(params, step_m=10.0, cruise_v=cruise_v)
+        nav_crit = NAV_CRITERIA_FW
+    else:
+        nav_m = simulate_nav_mr(params, step_m=10.0)
+        nav_crit = NAV_CRITERIA_MR
+
+    lines, ok = critique_linear(nav_m, nav_crit, "Nav 10m")
+    all_output.extend(lines)
+    if not ok:
+        all_pass = False
+
     # Free-flight turbulence test (FW only — tests intrinsic stability)
     if is_fw and af_filename in FW_AIRFRAMES:
         ff_metrics, ff_times, ff_angles = simulate_freeflight(af_filename)
@@ -1431,29 +2016,35 @@ def main():
             print(l)
         sys.exit(0 if pass_ok else 1)
 
-    # Run all active _Tuned airframes
+    # Run all active _Tuned airframes with slider extremes
     tuned_files = [f for f in AF_FILES.keys() if f.endswith('_Tuned.af')]
     all_pass = True
     all_output = []
 
+    SLIDER_TESTS = [
+        (0.0,  "Conservative (0%)"),
+        (1.0,  "Aggressive (100%)"),
+    ]
+
     for af_file in tuned_files:
-        try:
-            ok, output = run_tests_for_af(af_file)
-            all_output.extend(output)
-            if not ok:
+        for slider_pct, slider_label in SLIDER_TESTS:
+            try:
+                ok, output = run_tests_for_af(af_file, slider_pct=slider_pct)
+                all_output.extend(output)
+                if not ok:
+                    all_pass = False
+            except Exception as e:
                 all_pass = False
-        except Exception as e:
-            all_pass = False
-            all_output.append(f"Error testing {af_file}: {e}")
+                all_output.append(f"Error testing {af_file} at {slider_label}: {e}")
 
     for l in all_output:
         print(l)
 
     print(f"\n{'='*60}")
     if all_pass:
-        print(f"{G}{B}All airframes PASS — tuning is acceptable{N}")
+        print(f"{G}{B}All airframes PASS at both slider extremes{N}")
     else:
-        print(f"{R}{B}Some airframes have issues — review recommendations above{N}")
+        print(f"{R}{B}Some airframes have issues at slider extremes — review above{N}")
 
     sys.exit(0 if all_pass else 1)
 

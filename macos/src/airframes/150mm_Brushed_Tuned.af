@@ -1,5 +1,10 @@
-# 150mm Brushed — converted from originaldefaults.h
-#
+# 150mm Brushed — 1S brushed micro, 150mm frame, ~65mm props
+PHYS_AUW_G = 80
+PHYS_ARM_MM = 75
+PHYS_PROP_INCH = 2.5
+PHYS_MOTOR_W = 2
+PHYS_MOTOR_COUNT = 4
+
 ROLL_RATE_KP = 0.16
 ALT_POS_KI = 0.0046
 ROLL_ANGLE_KP = 7
@@ -62,7 +67,6 @@ BALANCE = 0.5
 RX_AUX4_CH = 8
 NAV_POS_KI = 0.008
 UNUSED_GPS_PROTOCOL = 4
-TILT_THROTTLE_FF = 0
 MAX_YAW_RATE = 0.6
 FW_ROLL_PITCH_FF = 0.25
 FW_PITCH_THROTTLE_FF = 0.1
