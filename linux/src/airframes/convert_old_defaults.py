@@ -30,18 +30,18 @@ OLD_SCALES = {
     90: (0.000025,    "YawRateKd: P() * 0.000025"),
 
     # ---- Angle PID gains (P.Kp = uint8 * 0.25 = Q) ----
-    2:  (0.25,        "RollAngleKp → Roll Q: P() * 0.25"),
-    7:  (0.25,        "PitchAngleKp → Pitch Q: P() * 0.25"),
+    2:  (0.25,        "RollAngleQKp → Roll Q: P() * 0.25"),
+    7:  (0.25,        "PitchAngleQKp → Pitch Q: P() * 0.25"),
 
     # ---- Angle PID Ki ----
-    23: (0.05,        "RollAngleKi: P() * 0.05"),
-    24: (0.05,        "PitchAngleKi: P() * 0.05"),
-    99: (0.05,        "YawAngleKi: P() * 0.05"),
+    23: (0.05,        "RollAngleQKi: P() * 0.05"),
+    24: (0.05,        "PitchAngleQKi: P() * 0.05"),
+    99: (0.05,        "YawAngleQKi: P() * 0.05"),
 
     # ---- Angle PID IntLim (uses DEG_RAD * 0.015) ----
-    4:  (DEG_RAD * 0.015, "RollAngleIntLimit: P() * DEG_RAD * 0.015"),
-    9:  (DEG_RAD * 0.015, "PitchAngleIntLimit: P() * DEG_RAD * 0.015"),
-    100: (DEG_RAD * 0.05, "YawAngleIntLimit: P() * DEG_RAD * 0.05"),
+    4:  (DEG_RAD * 0.015, "RollAngleQIntLimit: P() * DEG_RAD * 0.015"),
+    9:  (DEG_RAD * 0.015, "PitchAngleQIntLimit: P() * DEG_RAD * 0.015"),
+    100: (DEG_RAD * 0.05, "YawAngleQIntLimit: P() * DEG_RAD * 0.05"),
 
     # ---- Altitude PID ----
     1:  (0.00046,     "AltPosKi: P() * 0.00046"),
@@ -76,7 +76,7 @@ OLD_SCALES = {
     52: (0.01,        "AccConfSD: P() * 0.01 (= 1/sdev)"),
     40: (1.0,         "NavPosIntLimit → MaxVelocity: direct uint8 (= m/s)"),
     63: (10.0,        "MaxYawRate: P() * 10 (°/s) → DEG_RAD in InitPIDStructs"),
-    88: (10.0,        "MaxCompassYawRate: P() * 10 (°/s) → DEG_RAD in InitPIDStructs"),
+    88: (10.0,        "MaxCompassYawRate → MaxHeadingRate: was P() * 10 (°/s) → DEG_RAD in InitPIDStructs"),
     67: (1.0,         "FWMaxClimbAngle: direct uint8 (= deg) → DEG_RAD"),
     68: (1.0,         "NavMaxAngle: direct uint8 (= deg) → DEG_RAD"),
     74: (1.0,         "MaxPitchAngle: direct uint8 (= deg) → DEG_RAD"),
@@ -115,9 +115,9 @@ OLD_SCALES = {
     84: (1.0,         "CurrentScale: direct uint8"),
     85: (1.0,         "VoltScale: direct uint8"),
     89: (1.0,         "AccLPFSel: U8 enum"),
-    96: (0.25,        "Yaw Q (was YawAngleKp): approx P() * 0.25"),
-    97: (0.05,        "YawAngleKi: P() * 0.05"),
-    98: (DEG_RAD * 0.05, "YawAngleIntLimit: P() * DEG_RAD * 0.05"),
+    96: (0.25,        "Yaw Q (was YawAngleQKp): approx P() * 0.25"),
+    97: (0.05,        "YawAngleQKi: P() * 0.05"),
+    98: (DEG_RAD * 0.05, "YawAngleQIntLimit: P() * DEG_RAD * 0.05"),
     104: (1.0,        "Unused105: U8 raw"),
     106: (1.0,        "NavProxAltM: direct uint8"),
     107: (1.0,        "NavProxRadiusM: direct uint8 (= metres)"),

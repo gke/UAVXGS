@@ -15,17 +15,17 @@ Enum values are looked up by name from the matching protocol enum.
 import os
 import re
 import struct
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from protocol_enums import (
     ParamIndex, AirframeType, ESCType, RxType, ArmingMode,
     TelemetryType, RangefinderType, AirspeedSensorType,
-    IMUFilterType, Config1Bits, Config2Bits,
+    IMUFilterType, Config1Bits, Config2Bits, FailsafeAction,
     AIRFRAME_NAMES, ESC_TYPE_NAMES, RX_TYPE_NAMES, ARMING_MODE_NAMES,
-    TELEMETRY_TYPE_NAMES, RF_TYPE_NAMES, AS_SENSOR_TYPE_NAMES,
-    MOTOR_STOP_NAMES, BB_LOG_NAMES,
+    RF_TYPE_NAMES, AS_SENSOR_TYPE_NAMES,
+    MOTOR_STOP_NAMES, BB_LOG_NAMES, FAILSAFE_ACTION_NAMES,
 )
-from parameters import PARAM_SCALES, PARAM_TYPES, PARAM_DISPLAY_MULT
+from parameters import PARAM_DISPLAY_MULT
 
 AIRFRAMES_DIR = os.path.join(os.path.dirname(__file__))
 
@@ -44,6 +44,7 @@ ENUM_MAP: Dict[str, type] = {
     'IMU_FILT_TYPE': IMUFilterType,
     'CONFIG1_BITS': Config1Bits,
     'CONFIG2_BITS': Config2Bits,
+    'FAILSAFE_ACTION': FailsafeAction,
     'BB_LOG_TYPE': None,
     'SERVO_SENSE': None,
     'THROTTLE_GAIN_RATE': None,
@@ -61,11 +62,11 @@ _COMBO_ENUM_MAP: Dict[int, tuple] = {
     ParamIndex.ESC_TYPE: (ESCType, ESC_TYPE_NAMES),
     ParamIndex.RX_TYPE: (RxType, RX_TYPE_NAMES),
     ParamIndex.ARMING_MODE: (ArmingMode, ARMING_MODE_NAMES),
-    ParamIndex.TELEMETRY_TYPE: (TelemetryType, TELEMETRY_TYPE_NAMES),
     ParamIndex.RF_SENSOR_TYPE: (RangefinderType, RF_TYPE_NAMES),
     ParamIndex.AS_SENSOR_TYPE: (AirspeedSensorType, AS_SENSOR_TYPE_NAMES),
     ParamIndex.MOTOR_STOP_SEL: (None, MOTOR_STOP_NAMES),
     ParamIndex.BB_LOG_TYPE: (None, BB_LOG_NAMES),
+    ParamIndex.FAILSAFE_ACTION: (FailsafeAction, FAILSAFE_ACTION_NAMES),
 }
 
 
@@ -146,22 +147,25 @@ def _format_value(param_name: str, raw_value: float) -> str:
         if i > 9:
             return str(i)
     if abs(raw_value) < 0.001:
-        return f'{raw_value:.6g}'
+        return f'{raw_value:.8g}'
     if raw_value == int(raw_value) and abs(raw_value) < 1e9:
         return str(int(raw_value))
-    return f'{raw_value:.6g}'
+    return f'{raw_value:.8g}'
 
 
-def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, str]]:
+def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
     """Parse .af file text → (name, {tag: raw_float_value}, metadata_dict).
 
     metadata_dict contains:
       - 'Name', 'Character' from '# Key: Value' comment lines
       - 'PHYS_*' keys from PHYS_* = value lines (physical descriptors)
+      - 'LIMITS': {tag: (lo, hi)} from an optional [LIMITS] block (raw units)
     """
     name = 'Unknown'
     values: Dict[int, float] = {}
-    metadata: Dict[str, str] = {}
+    metadata: Dict[str, Any] = {}
+    limits: Dict[int, Tuple[float, float]] = {}
+    in_limits = False
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith('#'):
@@ -175,6 +179,9 @@ def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, str]]:
                         metadata[key] = val
                 else:
                     name = rest
+            continue
+        if line.upper() == '[LIMITS]':
+            in_limits = True
             continue
         m = LINE_RE.match(line)
         if not m:
@@ -191,28 +198,44 @@ def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, str]]:
             pass
         if tag is None:
             continue
+        if in_limits:
+            parts = value_text.split(',')
+            if len(parts) != 2:
+                continue
+            try:
+                limits[tag] = (float(parts[0].strip()), float(parts[1].strip()))
+            except ValueError:
+                continue
+            continue
         val = _parse_value(param_name, value_text)
         values[tag] = val
+    if limits:
+        metadata['LIMITS'] = limits
     return name, values, metadata
 
 
-def parse_af_file(path: str) -> Tuple[str, Dict[int, float], Dict[str, str]]:
+def parse_af_file(path: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
     """Read an .af file from disk and parse it → (name, {tag: raw_float}, metadata)."""
     with open(path) as f:
         return parse_af(f.read())
 
 
-def format_af(name: str, values: Dict[int, float], metadata: Dict[str, str] = None) -> str:
+def format_af(name: str, values: Dict[int, float], metadata: Dict[str, Any] = None) -> str:
     """Format param values → .af file text.
 
     Optional metadata stored as:
       - '# Key: Value' comment lines for Name, Character
       - 'PHYS_KEY = Value' lines for physical descriptors and derived quantities
+      - 'LIMITS': {tag: (lo, hi)} emitted as a [LIMITS] block (raw units)
     """
     lines = [f'# {name}', '']
     phys_lines = []
+    limits = None
     if metadata:
+        limits = metadata.get('LIMITS')
         for k, v in metadata.items():
+            if k == 'LIMITS':
+                continue
             if k.startswith('PHYS_'):
                 phys_lines.append(f'{k} = {v}')
             else:
@@ -231,6 +254,16 @@ def format_af(name: str, values: Dict[int, float], metadata: Dict[str, str] = No
         raw = values[i]
         formatted = _format_value(param_name, raw)
         lines.append(f'{param_name} = {formatted}')
+    if limits:
+        lines.append('')
+        lines.append('[LIMITS]')
+        for tag in sorted(limits):
+            lo, hi = limits[tag]
+            try:
+                param_name = ParamIndex(tag).name
+            except ValueError:
+                param_name = f'UNUSED_{tag}'
+            lines.append(f'{param_name} = {lo:.8g}, {hi:.8g}')
     lines.append('')
     return '\n'.join(lines)
 
@@ -247,8 +280,12 @@ def _display_for_raw_float(tag: int, raw_val: float) -> float:
     return raw_val * mult
 
 
-def export_af_from_widgets(name: str, params: Dict[int, object]) -> str:
-    """Export current widget values as .af text."""
+def export_af_from_widgets(name: str, params: Dict[int, object],
+                           limits: Dict[int, Tuple[float, float]] = None) -> str:
+    """Export current widget values as .af text.
+
+    Optional `limits` {tag: (lo, hi)} raw is emitted as a [LIMITS] block.
+    """
     from parameter_window import QDoubleSpinBox, QComboBox
     raw_values: Dict[int, float] = {}
     for tag, widget in params.items():
@@ -270,7 +307,7 @@ def export_af_from_widgets(name: str, params: Dict[int, object]) -> str:
                     raw_values[tag] = float(widget.currentIndex())
             else:
                 raw_values[tag] = float(widget.currentIndex())
-    return format_af(name, raw_values)
+    return format_af(name, raw_values, metadata={'LIMITS': limits} if limits else None)
 
 
 def import_to_widgets(name: str, af_text: str, params: Dict[int, object]) -> str:
