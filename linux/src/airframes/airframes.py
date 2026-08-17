@@ -81,6 +81,87 @@ def _enum_for_param(param_name: str):
         return None
     return None
 
+_LEGACY_ENUM_TOKENS = {
+    cls_name: {old: new for old, new in m.items()}
+    for cls_name, m in {
+        'AirframeType': {
+            'TRI': 'eTriAF', 'TRI_COAX': 'eTriCoaxAF', 'VTAIL': 'eVTailAF',
+            'QUAD': 'eQuadAF', 'QUAD_X': 'eQuadXAF', 'QUAD_COAX': 'eQuadCoaxAF',
+            'QUAD_COAX_X': 'eQuadCoaxXAF', 'HEX': 'eHexAF', 'HEX_X': 'eHexXAF',
+            'OCT': 'eOctAF', 'OCT_X': 'eOctXAF', 'HELI_90': 'eHeli90AF',
+            'BI': 'eBiAF', 'ELEVON': 'eElevonAF', 'DELTA': 'eDeltaAF',
+            'AILERON': 'eAileronAF', 'AILERON_SPOILER_FLAPS': 'eAileronSpoilerFlapsAF',
+            'AILERON_VTAIL': 'eAileronVTailAF', 'RUDDER_ELEVATOR': 'eRudderElevatorAF',
+            'DIFFERENTIAL_TWIN': 'eDifferentialTwinAF', 'VTOL': 'eVTOLAF',
+            'VTOL2': 'eVTOL2AF', 'TRACKED': 'eTrackedAF', 'FOUR_WHEEL': 'eFourWheelAF',
+            'TWO_WHEEL': 'eTwoWheelAF', 'INSTRUMENTATION': 'eInstrumentation',
+            'UNKNOWN': 'eAFUnknown',
+        },
+        'ESCType': {'FAST_PWM': 'eESCPWM', 'DC_MOTORS': 'eDCMotors',
+                    'DRIVES_DISARMED': 'eMotorsOff'},
+        'RxType': {'CPPM': 'eCPPMRx', 'FUTABA_SBUS': 'eFutabaSBusRx',
+                   'SPEKTRUM_1024': 'eSpektrum1024Rx', 'SPEKTRUM_2048': 'eSpektrum2048Rx',
+                   'CRSF': 'eCRSFRx', 'UNKNOWN': 'eUnknownRx'},
+        'ArmingMode': {'TX_ARMING': 'eTxArming', 'SWITCH_ARMING': 'eSwitchArming',
+                       'UNUSED_ARMING_2': 'eUnusedArming2',
+                       'UNUSED_ARMING_3': 'eUnusedArming3'},
+        'TelemetryType': {'UAVX_DJT': 'eUAVXDJTTelemetry', 'INAV_LUA': 'eINavLUATelemetry',
+                          'NO_TELEMETRY': 'eNoTelemetry', 'U4': 'eU4Telemetry',
+                          'U5': 'eU5Telemetry', 'U6': 'eU6Telemetry', 'U7': 'eU7Telemetry',
+                          'U8': 'eU8Telemetry'},
+        'RangefinderType': {'MAX_SONAR_CM': 'eMaxSonarcm', 'SRF_I2C_CM': 'eSRFI2Ccm',
+                            'MAX_SONAR_I2C_CM': 'eMaxSonarI2Ccm',
+                            'SHARP_IR_GP2Y0A02YK': 'eSharpIRGP2Y0A02YK',
+                            'SHARP_IR_GP2Y0A710K': 'eSharpIRGP2Y0A710K', 'NO_RF': 'eNoRF'},
+        'AirspeedSensorType': {'MS4525D0_I2C': 'eMS4525D0I2C',
+                               'MPXV7002DP_ANALOG': 'eMPXV7002DPAnalog',
+                               'AS_THERMOPILE_ANALOG': 'eASThermopileAnalog',
+                               'AS_GPS_DERIVED': 'eASGPSDerived', 'NO_AS': 'eNoAS'},
+        'IMUFilterType': {'LPFILT': 'eLP2Filt', 'MPUFILT': 'eHDLPFilt',
+                          'PT1FILT': 'eF1', 'IMU_FILT_3': 'eF2', 'IMU_FILT_4': 'eF3',
+                          'IMU_FILT_5': 'eF4'},
+        'Config1Bits': {'USE_INVERT_MAG': 'eUseInvertMag', 'USE_RTH_DESCEND': 'eUseRTHDescend',
+                        'DISABLE_LEDS_IN_FLIGHT': 'eDisableLEDsInFlight',
+                        'EMULATION_ENABLE': 'eEmulationEnable',
+                        'USE_ALT_HOLD_ALARM': 'eUseAltHoldAlarm',
+                        'USE_OFFSET_HOME': 'eUseOffsetHome',
+                        'USE_RAPID_DESCENT': 'eUseRapidDescent',
+                        'ENFORCE_DRIVE_SYMMETRY': 'eEnforceDriveSymmetry'},
+        'Config2Bits': {'USE_BATTERY_COMP': 'eUseBatteryComp', 'USE_FAST_START': 'eUseFastStart',
+                        'USE_BLHELI': 'eUseBLHeli', 'USE_HAVE_GPS': 'eUseGPS',
+                        'USE_PROP_SENSE': 'eUsePropSense', 'USE_TURN_TO_WP': 'eUseTurnToWP',
+                        'USE_NAV_BEEP': 'eUseNavBeep'},
+        'FailsafeAction': {'FS_RTH': 'eFsRth', 'FS_Land': 'eFsLand',
+                           'FS_MOTORS_OFF': 'eFsMotorsOff'},
+    }.items()
+}
+
+
+def _resolve_enum_member(enum_cls, token: str):
+    """Resolve an .af enum token to an enum member.
+
+    Order: exact match -> case-insensitive match -> legacy UPPER token -> None.
+    Handles both new e-* tokens and pre-sweep UPPER-SNAKE tokens.
+    """
+    if enum_cls is None:
+        return None
+    t = token.strip()
+    try:
+        return enum_cls[t]
+    except (KeyError, ValueError):
+        pass
+    for name, member in enum_cls.__members__.items():
+        if name.lower() == t.lower():
+            return member
+    legacy = _LEGACY_ENUM_TOKENS.get(enum_cls.__name__)
+    if legacy and t in legacy:
+        try:
+            return enum_cls[legacy[t]]
+        except (KeyError, ValueError):
+            pass
+    return None
+
+
 def _find_enum(param_name: str, raw_value: float) -> str:
     """Convert raw float value → enum name for a known enum param."""
     for enum_cls in ENUM_MAP.values():
@@ -106,14 +187,11 @@ def _parse_value(param_name: str, text: str) -> float:
             part = part.strip()
             found = False
             for enum_cls in ENUM_MAP.values():
-                if enum_cls is None:
-                    continue
-                try:
-                    total += enum_cls[part.upper()].value
+                member = _resolve_enum_member(enum_cls, part)
+                if member is not None:
+                    total += member.value
                     found = True
                     break
-                except (KeyError, AttributeError):
-                    pass
             if not found:
                 # If any part unrecognized, fall through to plain float
                 break
@@ -121,12 +199,9 @@ def _parse_value(param_name: str, text: str) -> float:
             return float(total)
     # Try enum name lookup
     for enum_cls in ENUM_MAP.values():
-        if enum_cls is None:
-            continue
-        try:
-            return float(enum_cls[text.upper()].value)
-        except (KeyError, AttributeError):
-            pass
+        member = _resolve_enum_member(enum_cls, text)
+        if member is not None:
+            return float(member.value)
     # Plain float
     return float(text)
 

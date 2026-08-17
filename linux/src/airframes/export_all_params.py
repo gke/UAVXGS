@@ -21,11 +21,11 @@ from protocol_enums import ParamIndex, AirframeType
 GROUPS = ['original', 'user', 'generic']
 CLASS_ORDER = {'FW': 0, 'MR': 1, 'VTOL': 2, 'Land': 3, 'Sensor': 4}
 
-FW_TYPES = (AirframeType.ELEVON, AirframeType.DELTA, AirframeType.AILERON,
-            AirframeType.AILERON_SPOILER_FLAPS, AirframeType.AILERON_VTAIL,
-            AirframeType.RUDDER_ELEVATOR)
-VTOL_TYPES = (AirframeType.VTOL, AirframeType.VTOL2)
-LAND_TYPES = (AirframeType.TRACKED, AirframeType.TWO_WHEEL, AirframeType.FOUR_WHEEL)
+FW_TYPES = (AirframeType.eElevonAF, AirframeType.eDeltaAF, AirframeType.eAileronAF,
+            AirframeType.eAileronSpoilerFlapsAF, AirframeType.eAileronVTailAF,
+            AirframeType.eRudderElevatorAF)
+VTOL_TYPES = (AirframeType.eVTOLAF, AirframeType.eVTOL2AF)
+LAND_TYPES = (AirframeType.eTrackedAF, AirframeType.eTwoWheelAF, AirframeType.eFourWheelAF)
 
 
 def classify(af_type) -> str:
@@ -40,7 +40,7 @@ def classify(af_type) -> str:
         return 'VTOL'
     if af in LAND_TYPES:
         return 'Land'
-    if af is AirframeType.INSTRUMENTATION:
+    if af is AirframeType.eInstrumentation:
         return 'Sensor'
     return 'MR'
 
