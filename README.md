@@ -1,29 +1,32 @@
-# UAVX Ground Station
+# UAVXArmQ Flight Controller Firmware
 
-Ground Control Station for UAVX flight controllers (UAVXArmQ firmware).
+Quaternion-attitude fork of the UAVX flight control firmware for STM32F4
+boards (C, ARM Cortex-M4). Fixed-wing and multirotor: autonomous navigation,
+altitude hold, soaring, wind estimation, and failsafe.
 
-Python 3 / PyQt5 desktop application connecting to the FC over USB serial.
+## Releases
 
-## Features
+Prebuilt binaries in `obj/<TARGET>/`:
 
-- Live telemetry: attitude, altitude, battery, GPS, nav status
-- Full parameter tuning with per-airframe `.af` files (FC-native units)
-- Airframe save/load and comparison against FC defaults
-- Firmware flashing via STM32 DFU or UART bootloader
-- Navigation setup, failsafe configuration, calibration tools
+| Target | File |
+|--------|------|
+| FLYINGRCF4WINGMINI | `FLYINGRCF4WINGMINIQ_r0.bin` |
+| SPEEDYF4WINGMINI   | `SPEEDYF4WINGMINIQ_r11.bin` |
+| UAVXF4V3           | `UAVXF4V3Q_r17.bin` |
 
-## Running
+## Flashing
 
-Standalone kits (PyInstaller, local venv):
+Flash the `.bin` using either:
 
-| Platform | Build |
-|----------|-------|
-| Linux    | `cd linux && bash build.sh` |
-| macOS    | `cd macos && bash build.sh` |
-| Windows  | Double-click `build.bat` |
+- **UAVXGS** — built-in flasher (DFU or UART bootloader), or
+- Any STM32 DFU tool (e.g. `dfu-util`, STM32CubeProgrammer).
 
-Or run from source: `python3 uavx-python/src/main.py` (requires PyQt5, pyserial).
+## Building from source
+
+Requires `arm-none-eabi-gcc` and `make`:
+
+    make BOARD=FLYINGRCF4WINGMINI
 
 ## Documentation
 
-See `wiki/docs/` for setup guides, flight modes, and failsafe.
+See `wiki/docs/` for loading firmware, startup, architecture, and tuning.
