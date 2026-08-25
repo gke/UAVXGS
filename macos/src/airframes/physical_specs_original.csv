@@ -1,0 +1,13 @@
+airframe,ARM_MM,AUW_G,BATT_V,CHORD_MM,MOTOR_COUNT,MOTOR_W,PROP_INCH,WINGSPAN_MM
+original/150mm_Brushed.af,220,800,,,4,100,11.0,
+original/DevEBox.af,220,800,,,4,100,11.0,
+original/Ecks_220mm.af,220,800,,,4,100,11.0,
+original/Ken_s_450_1165.af,220,800,,,4,100,11.0,
+original/Ken_s_Alpha_Test.af,220,800,,,4,100,11.0,
+original/Ken_s_LadyBug.af,220,800,,,4,100,11.0,
+original/Phoenix_FW.af,,1000,50.0,250,,150,10.0,1800
+original/Rok_s_Quad.af,220,800,,,4,100,11.0,
+original/S500_1137.af,220,800,,,4,100,11.0,
+original/Sky_Surfer_Test.af,,1000,50.0,250,,150,10.0,1800
+original/Spoileron.af,,1000,50.0,250,,150,10.0,1800
+original/Wing_900mm.af,,1000,50.0,250,,150,10.0,1800
