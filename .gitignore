@@ -5,6 +5,10 @@
 */**/*.pyc
 */.venv/
 .venv/
+# runtime log debris — written by packet_logger on every serial packet;
+# never ship or push (a 5.5 GB log.txt once blocked the push via GH001)
+**/log.txt
+**/*.log
 *.pdf
 !*/wiki/docs/*.pdf
 */src/Params_*.af
