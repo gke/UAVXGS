@@ -21,10 +21,11 @@ Exits 0 if all axes pass, 1 if any axis has tuning issues.
 """
 
 import math
+import cmath
 import sys
 import os
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Callable, Sequence
 
 # Find project root (UAVXGS directory)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,9 +33,69 @@ AIRFRAMES_DIR = os.path.join(PROJECT_ROOT, "uavx-python", "src", "airframes")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Shared critic: measurement definitions + pass/fail criteria, so the FC
+# (trace.c captures) and the sim judge a response identically.
+from critic.metrics import (  # noqa: E402
+    StepMetrics,
+    DisturbanceMetrics,
+    count_zero_crossings,
+    step_metrics_window,
+    step_metrics_persist,
+    disturbance_metrics,
+)
+from critic.criteria import (  # noqa: E402
+    Criteria,
+    DisturbanceCriteria,
+    CRITERIA,
+    FW_CRITERIA,
+    DIST_CRITERIA,
+    AH_CRITERIA_MR,
+    AH_CRITERIA_FW,
+    NAV_CRITERIA_MR,
+    NAV_CRITERIA_FW,
+    Verdict,
+    step_verdicts,
+    disturbance_verdicts,
+    check,
+    critique,
+    critique_linear,
+    critique_disturbance,
+    recommend,
+    G,
+    Y,
+    R,
+    B,
+    N,
+)
+
 RAD_TO_DEG = 180.0 / math.pi
 DEG_TO_RAD = math.pi / 180.0
 GRAVITY = 9.80665
+
+# ── Control-authority calibration knob ─────────────────────────────────────
+# The FW plant's deflection→rate gain is UNCALIBRATED (the sim assumes
+# qbar·S·b·C_ctrl vs the machine's real surface effectiveness).  FW_AUTHORITY_SCALE
+# multiplies the control-torque coefficients (CL_D_AIL, CM_D_ELE, CN_D_RUD).
+#
+# 2026-09-13 FIELD-DERIVED FUDGE — authority ×4 (Greg, Shadow flight):
+#   The real Shadow (1000 g plank) was stable/controllable in rough air with the
+#   Ch10 RateGainScale pot at its low end (scale 0.25, 4^(2p-1)), i.e. an
+#   EFFECTIVE rate Kp of 0.1 × 0.25 = 0.025.  The sim, at 1× authority, tuned
+#   the same frame to Kp = 0.1.  A rate loop's closed-loop pole scales with
+#   (CE · Kp / I); the airframe needed 4× LESS gain than the sim for a
+#   comparable response, so the sim's implicit control effectiveness is 4× too
+#   SMALL.  Multiplying CE by 4 makes the sim reproduce the field: stored
+#   Kp=0.1 becomes too hot (as flown) and the retuned gain drops toward 0.025.
+#   Direction is NOT authority /4 — that would make the sim MORE docile and
+#   push recommended gains UP, the opposite of what the aircraft demanded.
+#
+# PROVISIONAL: derived from one aircraft in one air mass; a correctly-working
+#   trace dump (missing today — the 2026-09-13 dump was a 32-byte no-capture
+#   placeholder) is the intended per-airframe calibration instrument.  This is
+#   "the best fudge we have", not truth.  Override for sweeps/sensitivity:
+#   UAVX_FW_AUTHORITY=2.0 python3 src/tests/test_pid_sim.py generic/Shadow.af
+#   (1.0 restores the pre-2026-09-13 sim so old report numbers are reproducible).
+FW_AUTHORITY_SCALE = float(os.environ.get("UAVX_FW_AUTHORITY", "4.0"))
 
 # ═══════════════════════════════════════════
 #  Airframe Category (matches FC AirframeCategory enum)
@@ -49,20 +110,12 @@ class AirframeCat:
 #  Active airframe configs — loaded from protocol_enums
 # ═══════════════════════════════════════════
 from protocol_enums import AirframeType, ACTIVE_AIRFRAMES, AIRFRAME_NAMES, REDACTED_AIRFRAMES
+from protocol_enums import AirframeCategory, category_of as _af_category_of
 
-# Map AirframeType enum value → category
-AF_CATEGORY = {
-    AirframeType.eQuadXAF: AirframeCat.MR,
-    AirframeType.eHexXAF: AirframeCat.MR,
-    AirframeType.eOctXAF: AirframeCat.MR,
-    AirframeType.eElevonAF: AirframeCat.FW,
-    AirframeType.eDeltaAF: AirframeCat.FW,
-    AirframeType.eAileronSpoilerFlapsAF: AirframeCat.FW,
-    AirframeType.eRudderElevatorAF: AirframeCat.FW,
-    AirframeType.eDifferentialTwinAF: AirframeCat.MR,
-    AirframeType.eTrackedAF: AirframeCat.LAND,
-    AirframeType.eAileronAF: AirframeCat.FW,
-}
+# AF type -> category, derived from the single authority (protocol_enums
+# AIRFRAME_CATEGORY / FC ClassifyAFType()), filled for every enum member so
+# dict indexing never misses. Do NOT add a fork here.
+AF_CATEGORY = {af: _af_category_of(af) for af in AirframeType}
 
 # FW model index per active FW airframe (for physics params)
 FW_MODEL_IDX = {
@@ -86,6 +139,10 @@ AF_FILES = {
     "generic/RudderElevator.af": AirframeType.eRudderElevatorAF,
     "generic/Elevon.af": AirframeType.eElevonAF,
     "generic/Shadow.af": AirframeType.eElevonAF,
+    # Shadow2 = working template for encoding user knowledge: edit the FW_AIRFRAMES
+    # descriptor geometry keys (sweep_deg/dihedral_deg/anhedral_deg/anhedral_start/
+    # taper_ratio) — the .af file itself can only hold the scalar PHYS_DIHEDRAL.
+    "generic/Shadow2.af": AirframeType.eElevonAF,
     "generic/SkySurfer_Bixler.af": AirframeType.eAileronAF,
     "generic/SmallSpoileron.af": AirframeType.eAileronSpoilerFlapsAF,
     "generic/Dragon.af": AirframeType.eElevonAF,
@@ -140,6 +197,26 @@ AF_FILES = {
 
 AIR_DENSITY = 1.225          # kg/m³ at sea level
 RAD_TO_DEG_F = 180.0 / math.pi
+# Sweep contribution to effective dihedral: C_lβ,sweep = K_SWEEP · CL · tan(Λ) ·
+# Fλ.  Rolls over the spanwise-lift-leverage of a yawed swept wing (∝ total
+# lift); NASA NTRS 19930080953 states roll-due-to-sideslip for sweep is only
+# ~1/3–1/6 that of an equal dihedral angle, which places K_SWEEP near unity
+# (swept planks like Shadow 30°/Horten 40° read ~4–6° EDA at cruise CL).
+K_SWEEP = 1.0
+
+# ── Lateral-directional mode analysis (linearized, β-p-r-φ) ────────────────
+# Dutch-roll / spiral / roll-subsidence eigenvalues of the small-perturbation
+# lateral-directional rigid-body model about level cruise.  Diagnostic only —
+# not a tuning input and not read by simulate_axis_coupled.  The nonlinear
+# sim's quadratic damping is represented here as an equivalent LINEAR term
+# evaluated at a representative oscillation amplitude (LIN_EQ_RATE), making
+# the mode analysis a conservative worst-case (amplitude-dependent damping
+# only adds more at larger excursions).  Fin-derived sideforce Y_β and yaw
+# damping N_r use a fin lift-slope assumption A_V_FIN (typical RC fin AR≈1-2).
+A_V_FIN = 2.5            # fin lift slope a_v, /rad
+LIN_EQ_RATE = 0.25       # representative |rate| for eq-linear damping, rad/s
+DR_ZETA_MIN = 0.05       # FAIL: Dutch-roll damping ratio below this
+SPIRAL_T_DOUBLE_MIN = 8.0  # FAIL: unstable spiral with time-to-double below, s
 
 # ═══════════════════════════════════════════
 #  Character slider param curves
@@ -149,7 +226,50 @@ RAD_TO_DEG_F = 180.0 / math.pi
 # ═══════════════════════════════════════════
 from protocol_enums import ParamIndex as _PI
 
+# Character-slider curve tables (cons → agg, raw FC values).
+#
+# Two layers:
+#   _PARAM_CURVES — vehicle-shared envelope: rate/angle limits, altitude
+#                   hold, angle limits, horizon. Applies to every airframe.
+#   MR_CURVES / FW_CURVES — per-category attitude + nav gains. MR and FW are
+#                   different plants: a single global curve cannot fit both
+#                   (MR nav needs NAV_POS_KP ≥ ~2.5 to meet its 2s rise with a
+#                   20° bank; FW nav overshoots past its 15% bar above ~2.0 and
+#                   is happy at 1.0-1.5. MR rate Kp ~0.2 gives a tight clean
+#                   attitude; FW needs ~0.6+ or the rate error can never elicit
+#                   enough elevator for a 30° pitch step). Mirrors the existing
+#                   FW-vs-MR criteria split.
 _PARAM_CURVES = {
+    # Angle integral limits (rad/s)
+    int(_PI.ROLL_ANGLE_Q_INT_LIMIT):(0.005, 0.03),    # default 0.01
+    int(_PI.PITCH_ANGLE_Q_INT_LIMIT):(0.005, 0.03),   # default 0.01
+    int(_PI.YAW_ANGLE_Q_INT_LIMIT): (0.01, 0.06),     # default 0.03
+    # Rate limits (rad/s)
+    int(_PI.MAX_ROLL_RATE):       (1.396, 6.283),   # 80-360 deg/s
+    int(_PI.MAX_PITCH_RATE):      (1.047, 4.189),   # 60-240 deg/s
+    int(_PI.MAX_HEADING_RATE):(0.262, 2.094),   # 15-120 deg/s
+    # Altitude (drag-limited vertical plant — CONS must still climb 5m in ~2s:
+    # ALT_POS_KP/ALT_ROC_KP/comp-limit were genuinely too weak to do so).
+# comp-limit: pinned to the FC max (PARAM_LIMITS[102] = 0.0..0.25), which
+     # the generic .af bases now carry (0.25) so the sim actually binds it;
+     # at 0.25 CONS the heavy-quad AH rise is ~1.86s (was 2.01 at the 0.2 sim
+     # default the suite silently fell back to while the param was absent).
+     int(_PI.ALT_POS_KP):          (2.0, 2.4),       # default 2.0
+     int(_PI.ALT_POS_KI):          (0.002, 0.005),   # default 0.002
+     int(_PI.ALT_THROTTLE_COMP_LIMIT): (0.25, 0.25), # default 0.25, FC max 0.25
+    int(_PI.ALT_ROC_KP):          (1.3, 1.6),       # default 1.2
+    int(_PI.UNUSED_ALT_VEL_KI):   (0.0008, 0.0015), # default 0.001
+    int(_PI.MAX_CLIMB_RATE_MP_S): (1.0, 8.0),   # vertical-profile ascent shaping (m/s)
+    # Navigation — shared defaults; per-category sets below override for the
+    # param tags present in MR_CURVES / FW_CURVES.
+    int(_PI.HORIZON):             (2.0, 5.0),       # default ~3.33
+    # Angle limits (rad)
+    int(_PI.MAX_PITCH_ANGLE):     (0.349, 0.698),   # 20-40 deg
+    int(_PI.MAX_ROLL_ANGLE):      (0.349, 0.698),   # 20-40 deg
+}
+
+# MR attitude / nav curve envelope.
+MR_CURVES = {
     # Angle gains (Quaternion P, scale=1.0 on GCS)
     int(_PI.ROLL_ANGLE_Q_KP):       (5.0, 9.0),       # default 7
     int(_PI.PITCH_ANGLE_Q_KP):      (5.0, 9.0),       # default 7
@@ -158,49 +278,90 @@ _PARAM_CURVES = {
     int(_PI.ROLL_ANGLE_Q_KI):       (0.05, 0.5),      # default 0.25
     int(_PI.PITCH_ANGLE_Q_KI):      (0.05, 0.5),      # default 0.25
     int(_PI.YAW_ANGLE_Q_KI):        (0.05, 0.5),      # default 0.25
-    # Angle integral limits (rad/s)
-    int(_PI.ROLL_ANGLE_Q_INT_LIMIT):(0.005, 0.03),    # default 0.01
-    int(_PI.PITCH_ANGLE_Q_INT_LIMIT):(0.005, 0.03),   # default 0.01
-    int(_PI.YAW_ANGLE_Q_INT_LIMIT): (0.01, 0.06),     # default 0.03
     # Rate proportional gains
-    int(_PI.ROLL_RATE_KP):        (0.125, 0.5),     # default 0.25
-    int(_PI.PITCH_RATE_KP):       (0.125, 0.5),     # default 0.25
-    int(_PI.YAW_RATE_KP):         (0.125, 0.75),    # default 0.25
+    int(_PI.ROLL_RATE_KP):        (0.28, 0.5),     # default 0.25
+    int(_PI.PITCH_RATE_KP):       (0.28, 0.5),     # default 0.25
+    int(_PI.YAW_RATE_KP):         (0.20, 0.75),    # default 0.25
     # Rate derivative gains
-    int(_PI.ROLL_RATE_KD):        (0.005, 0.02),    # default 0.01
-    int(_PI.PITCH_RATE_KD):       (0.005, 0.02),    # default 0.01
+    int(_PI.ROLL_RATE_KD):        (0.008, 0.02),    # default 0.01
+    int(_PI.PITCH_RATE_KD):       (0.008, 0.02),    # default 0.01
     int(_PI.YAW_RATE_KD):         (0.005, 0.02),    # default 0.01
-    # Rate limits (rad/s)
-    int(_PI.MAX_ROLL_RATE):       (1.396, 6.283),   # 80-360 deg/s
-    int(_PI.MAX_PITCH_RATE):      (1.047, 4.189),   # 60-240 deg/s
-    int(_PI.MAX_HEADING_RATE):(0.262, 2.094),   # 15-120 deg/s
-    # Altitude
-    int(_PI.ALT_POS_KP):          (0.2, 0.5),       # default 0.35
-    int(_PI.ALT_POS_KI):          (0.001, 0.005),   # default 0.002
-    int(_PI.ALT_THROTTLE_COMP_LIMIT): (0.1, 0.35),  # default 0.2-0.25 fraction
-    int(_PI.ALT_ROC_KP):          (0.02, 0.10),     # default ~0.05
-    int(_PI.UNUSED_ALT_VEL_KI):   (0.0003, 0.003),  # default ~0.001
-    int(_PI.MAX_CLIMB_RATE_DMP_S): (1.0, 8.0),   # vertical-profile ascent shaping (m/s)
-    # Navigation
-    int(_PI.NAV_POS_KP):          (0.075, 0.3),     # default 0.15
-    int(_PI.NAV_POS_KI):          (0.006, 0.025),   # default 0.012
-    int(_PI.NAV_VEL_KP):          (0.1, 0.4),       # default 0.2
-    int(_PI.HORIZON):             (2.0, 5.0),       # default ~3.33
-    # Angle limits (rad)
-    int(_PI.MAX_PITCH_ANGLE):     (0.349, 0.698),   # 20-40 deg
-    int(_PI.MAX_ROLL_ANGLE):      (0.349, 0.698),   # 20-40 deg
+    # Navigation (bank-to-turn kinematic plant — needs a high position gain
+    # at the 20° CONS bank to cross 9m in ≤2s)
+    int(_PI.NAV_POS_KP):          (2.5, 3.0),     # default 2.5
+    int(_PI.NAV_POS_KI):          (0.02, 0.03),   # default 0.02
+    int(_PI.NAV_VEL_KP):          (1.0, 2.0),     # default 1.0
 }
 
+# FW attitude / nav curve envelope (see docblock above _PARAM_CURVES).
+FW_CURVES = {
+    # Angle gains (Quaternion P, scale=1.0 on GCS)
+    # Pitch CONS 11.0: at 60°/s demand the elevator effort saturates against
+    # the stiffness equilibrium (M_ctrl == M_stab) before reaching 27°; a P
+    # of ~11 crosses it in the 5s window. Roll CONS 3.0 keeps the aileron
+    # demand below the roll-rate clamp for the big-authority frames
+    # (Spoileron/Elevon peak ~19°=27% OS at any higher gain — gain-insensitive
+    # momentum overshoot, so the generation is capped, not the damping).
+    int(_PI.ROLL_ANGLE_Q_KP):       (3.0, 4.5),      # default 7
+    int(_PI.PITCH_ANGLE_Q_KP):      (11.0, 10.0),    # default 7
+    int(_PI.YAW_ANGLE_Q_KP):        (7.0, 11.0),     # default 8
+    # Angle integral gains
+    int(_PI.ROLL_ANGLE_Q_KI):       (0.05, 0.5),     # default 0.25
+    int(_PI.PITCH_ANGLE_Q_KI):      (0.05, 0.5),     # default 0.25
+    int(_PI.YAW_ANGLE_Q_KI):        (0.05, 0.5),     # default 0.25
+    # Angle integral limits (rad/s) — FW needs real authority here: the tiny
+    # shared 0.005 cap cannot push past the pitch stiffness equilibrium.
+    int(_PI.ROLL_ANGLE_Q_INT_LIMIT):  (0.15, 0.15),  # rad/s
+    int(_PI.PITCH_ANGLE_Q_INT_LIMIT): (0.15, 0.15),  # rad/s
+    # Rate proportional gains — FW needs enough gain to elicit meaningful
+    # elevator for a 30° pitch step (rate error only reaches ~1 rad/s before
+    # the MAX_*_RATE clamp; Kp must turn that into ≥0.5-0.7 effort)
+    int(_PI.ROLL_RATE_KP):        (1.2, 1.8),     # default 0.6
+    int(_PI.PITCH_RATE_KP):       (0.9, 1.5),     # default 0.6
+    int(_PI.YAW_RATE_KP):         (1.0, 1.8),     # default 0.8
+    # Rate derivative gains
+    int(_PI.ROLL_RATE_KD):        (0.050, 0.12),  # default 0.01
+    int(_PI.PITCH_RATE_KD):       (0.010, 0.03),  # default 0.01
+    int(_PI.YAW_RATE_KD):         (0.015, 0.04),  # default 0.01
+    # Per-category rate limits — the shared CONS clamp (80°/s roll, 60°/s
+    # pitch) does not fit the FW generation demand transfer: high-authority
+    # frames overshoot if the demand pins the clamp. FW CONS wants a gentler
+    # roll demand (~40°/s) yet a pitch generation that can actually climb.
+    int(_PI.MAX_ROLL_RATE):       (0.7, 0.9),     # 40-52 deg/s
+    int(_PI.MAX_PITCH_RATE):      (1.047, 1.57),  # 60-90 deg/s
+    # Navigation (heading-integrator bank-to-turn: high position gain
+    # over-drives the heading slew and overshoots the 15% bar)
+    int(_PI.NAV_POS_KP):          (1.0, 1.5),     # default 1.0
+    int(_PI.NAV_POS_KI):          (0.005, 0.015), # default 0.005
+    int(_PI.NAV_VEL_KP):          (0.6, 1.2),     # default 0.6
+}
 
-def apply_slider(raw_params: dict, slider_pct: float) -> dict:
+# Merge order: shared table first, then the category table overrides for the
+# attitude/nav param tags that legitimately differ MR vs FW.
+_CATEGORY_CURVES = {AirframeCat.MR: MR_CURVES, AirframeCat.FW: FW_CURVES}
+
+
+def apply_slider(raw_params: dict, slider_pct: float,
+                 cat: Optional[int] = None) -> dict:
     """Apply character slider to raw params.
 
     Interpolates between conservative (0%) and aggressive (100%) raw FC values.
-    Params not in _PARAM_CURVES are left unchanged.
+    Params not in the curve tables are left unchanged.
+
+    cat: airframe category (AF_CATEGORY value). Selects the per-category
+    attitude/nav envelope (MR_CURVES / FW_CURVES) layered over the shared
+    _PARAM_CURVES. If None, both category tables merge (MR then FW) so direct
+    callers without a category still get the full envelope.
     """
     from protocol_enums import ParamIndex
+    curves = dict(_PARAM_CURVES)
+    if cat in _CATEGORY_CURVES:
+        curves.update(_CATEGORY_CURVES[cat])
+    else:
+        for cset in _CATEGORY_CURVES.values():
+            curves.update(cset)
     result = dict(raw_params)
-    for tag_int, (cons, agg) in _PARAM_CURVES.items():
+    for tag_int, (cons, agg) in curves.items():
         pname = ParamIndex(tag_int).name
         if pname not in raw_params:
             continue
@@ -221,9 +382,12 @@ def apply_slider(raw_params: dict, slider_pct: float) -> dict:
 FW_AIRFRAMES = {
     # Sky Surfer / Bixler 2000mm: 1400g AUW, 231.5mm chord, area 0.4630 m²
     # CL_α≈4.7 → Cm_α=-0.235
+    # Conventional aircraft: long tail arm, mass distributed along span+chord.
+    # rf_roll=0.8 (wing mass near fuselage), rf_pitch=0.9 (tail at distance).
     "generic/SkySurfer_Bixler.af": {
         "mass": 1.4, "wingspan": 2.0, "wing_area": 0.463,
         "cruise_speed": 12.0,
+        "roll_mass_frac": 0.8, "pitch_mass_frac": 0.9,
         "aileron_area": 0.0126, "aileron_arm": 0.35,
         "elevator_area": 0.0081, "elevator_arm": 0.65,
         "rudder_area": 0.012, "rudder_arm": 0.75,
@@ -237,13 +401,23 @@ FW_AIRFRAMES = {
     },
     # S800 Shadow: 500g AUW, 820mm span, 185mm chord, area 0.1517 m²
     # CL_α≈4.9 → Cm_α=-0.245
-    "generic/Shadow.af": {
+    # Shadow2: Represents a flat constant-chord plank (cf. the "Reptile") —
+    # ~2° physical dihedral, NO sweep.  Template for encoding geometry: every
+    # key is optional; omit them to inherit the flat dihedral_coeff (≈3°).
+    # Common encodings:
+    #   plank 2°:               {sweep_deg: 0, dihedral_deg: 2}
+    #   swept 30° / 2°:         {sweep_deg: 30, dihedral_deg: 2}
+    #   nulled-tip (Arado):     {sweep_deg:45, dihedral_deg:5,
+    #                            anhedral_deg:5, anhedral_start:0.667}
+    "generic/Shadow2.af": {
         "mass": 0.5, "wingspan": 0.82, "wing_area": 0.1517,
         "cruise_speed": 13.0,
+        "sweep_deg": 0.0, "dihedral_deg": 2.0,
+        "roll_mass_frac": 0.4, "pitch_mass_frac": 0.3,
         "aileron_area": 0.0044, "aileron_arm": 0.25,
         "elevator_area": 0.0044, "elevator_arm": 0.25,
         "rudder_area": 0.0, "rudder_arm": 0.0,
-        "aileron_max_deg": 20.0, "elevator_max_deg": 20.0, "rudder_max_deg": 0.0,
+        "aileron_max_deg": 30.0, "elevator_max_deg": 12.0, "rudder_max_deg": 0.0,
         "CL_D_AIL": 0.025, "CM_D_ELE": 0.6, "CN_D_RUD": 0.0,
         "pitch_damp": -8.0, "yaw_damp": -0.08,
         "adverse_yaw": 0.05, "dihedral_coeff": 0.05,
@@ -251,11 +425,42 @@ FW_AIRFRAMES = {
         "roll_damp_lin": 0.02, "pitch_damp_lin": 0.02, "yaw_damp_lin": 0.01,
         "servo_tau": 0.08,
     },
+    # Shadow: 1000g AUW, 1800mm span, swept plank (30° sweep, ~2° dihedral).
+    # REF4 tuning baseline (overwrote the 2026-08-28 0.5kg/820mm descriptor).
+    # AUTHORITY RE-BASELINE 2026-09-10 (wiki/Session_Report_ShadowAuthorityTuning_Sep10.md):
+    #   CL_D_AIL 0.025 -> 0.18  — external aileron/elevon power band 0.12–0.32
+    #     per rad (flight-ID: Grillo & Montano 0.173, Tecnam flight test ~0.21);
+    #     the old 0.025 was 5–13× below the whole measured band (assumed, never
+    #     calibrated).  0.18 = defensible mid-band (report-recommended 0.15–0.20).
+    #   CM_D_ELE 0.6 KEPT — external elevator Cmδe band 0.33–0.56, our 0.6 is
+    #     already in/near band; pitch authority was never the deficit.
+    #   INERTIA: concentrated-mass model — plank with mass near CG.
+    #     rf_roll=0.4, rf_pitch=0.3 (roll ~6×, pitch ~30× higher angular accel
+    #     than uniform thin-rod).  Surfaces 40/16° (Greg: "40 deg roll, 16 pitch
+    #     — planks typically have 40% as much control deflection on pitch as on roll
+    #     because of the short moment arm").
+    "generic/Shadow.af": {
+        "mass": 1.0, "wingspan": 1.8, "wing_area": 0.45,
+        "cruise_speed": 8.4,
+        "sweep_deg": 30.0, "dihedral_deg": 2.0,
+        "roll_mass_frac": 0.4, "pitch_mass_frac": 0.3,
+        "aileron_area": 0.0132, "aileron_arm": 0.55,
+        "elevator_area": 0.0132, "elevator_arm": 0.55,
+        "rudder_area": 0.0, "rudder_arm": 0.0,
+        "aileron_max_deg": 40.0, "elevator_max_deg": 16.0, "rudder_max_deg": 0.0,
+        "CL_D_AIL": 0.18, "CM_D_ELE": 0.6, "CN_D_RUD": 0.0,
+        "pitch_damp": -0.04, "yaw_damp": -0.08,
+        "adverse_yaw": 0.05, "dihedral_coeff": 0.05,
+        "pitch_stability": -0.245, "yaw_stability": 0.01,
+        "roll_damp_lin": 0.02, "pitch_damp_lin": 0.18, "yaw_damp_lin": 0.01,
+        "servo_tau": 0.08,
+    },
     # Phoenix: 1000g AUW, 1800mm span, 250mm chord, rudder+elevator (no ailerons)
     # CL_α≈5.4 → Cm_α=-0.27
     "original/Phoenix.af": {
         "mass": 1.0, "wingspan": 1.8, "wing_area": 0.45,
         "cruise_speed": 13.0,
+        "roll_mass_frac": 0.85, "pitch_mass_frac": 0.95,
         "aileron_area": 0.0, "aileron_arm": 0.0,
         "elevator_area": 0.008, "elevator_arm": 0.60,
         "rudder_area": 0.012, "rudder_arm": 0.70,
@@ -269,9 +474,11 @@ FW_AIRFRAMES = {
     },
     # SmallSpoileron: 1200g AUW, 1800mm span, 280mm chord (area 0.504 m²)
     # CL_α≈5.1 → Cm_α=-0.255
+    # Conventional tail; mixed spar/inner mass → rf 0.75-0.85.
     "generic/SmallSpoileron.af": {
         "mass": 1.2, "wingspan": 1.8, "wing_area": 0.504,
         "cruise_speed": 14.0,
+        "roll_mass_frac": 0.75, "pitch_mass_frac": 0.85,
         "aileron_area": 0.0096, "aileron_arm": 0.28,
         "elevator_area": 0.0084, "elevator_arm": 0.40,
         "rudder_area": 0.006, "rudder_arm": 0.50,
@@ -285,13 +492,15 @@ FW_AIRFRAMES = {
     },
     # Dragon: 800g AUW, 1200mm span, 250mm chord, area 0.30 m² (twin elevon)
     # CL_α≈4.9 → Cm_α=-0.245
+    # Plank: mass near CG → rf 0.4.
     "generic/Dragon.af": {
         "mass": 0.8, "wingspan": 1.2, "wing_area": 0.30,
         "cruise_speed": 13.0,
+        "roll_mass_frac": 0.4, "pitch_mass_frac": 0.3,
         "aileron_area": 0.0055, "aileron_arm": 0.30,
         "elevator_area": 0.0055, "elevator_arm": 0.30,
         "rudder_area": 0.0, "rudder_arm": 0.0,
-        "aileron_max_deg": 20.0, "elevator_max_deg": 20.0, "rudder_max_deg": 0.0,
+        "aileron_max_deg": 30.0, "elevator_max_deg": 12.0, "rudder_max_deg": 0.0,
         "CL_D_AIL": 0.025, "CM_D_ELE": 0.6, "CN_D_RUD": 0.0,
         "pitch_damp": -8.0, "yaw_damp": -0.08,
         "adverse_yaw": 0.05, "dihedral_coeff": 0.05,
@@ -301,9 +510,11 @@ FW_AIRFRAMES = {
     },
     # Radian: 850g AUW, 2000mm span, 178mm chord, area 0.356 m²
     # CL_α≈5.4 → Cm_α=-0.27
+    # Conventional glider: massive tail + long moment arm → rf 0.9.
     "generic/Radian.af": {
         "mass": 0.85, "wingspan": 2.0, "wing_area": 0.356,
         "cruise_speed": 9.0,
+        "roll_mass_frac": 0.9, "pitch_mass_frac": 0.95,
         "aileron_area": 0.0, "aileron_arm": 0.0,
         "elevator_area": 0.007, "elevator_arm": 0.65,
         "rudder_area": 0.009, "rudder_arm": 0.70,
@@ -316,14 +527,19 @@ FW_AIRFRAMES = {
         "servo_tau": 0.08,
     },
     # Arado 555: 1300g AUW, 1200mm span, 350mm chord, area 0.42 m² (elevon)
-    # CL_α≈4.9 → Cm_α=-0.245
+    # CL_α≈4.9 → Cm_α=-0.245; geometry per user specs (2026-08-28):
+    # 45° sweep, +5° dihedral inboard 2/3 span, −5° anhedral tip panels.
+    # Plank: mass near CG → rf 0.4; 40/16 surface throw (plank ratio).
     "user/Arado_555.af": {
         "mass": 1.3, "wingspan": 1.2, "wing_area": 0.42,
         "cruise_speed": 13.0,
+        "sweep_deg": 45.0, "dihedral_deg": 5.0,
+        "anhedral_deg": 5.0, "anhedral_start": 0.667,
+        "roll_mass_frac": 0.4, "pitch_mass_frac": 0.3,
         "aileron_area": 0.006, "aileron_arm": 0.30,
         "elevator_area": 0.006, "elevator_arm": 0.30,
         "rudder_area": 0.0, "rudder_arm": 0.0,
-        "aileron_max_deg": 20.0, "elevator_max_deg": 20.0, "rudder_max_deg": 0.0,
+        "aileron_max_deg": 30.0, "elevator_max_deg": 12.0, "rudder_max_deg": 0.0,
         "CL_D_AIL": 0.025, "CM_D_ELE": 0.6, "CN_D_RUD": 0.0,
         "pitch_damp": -8.0, "yaw_damp": -0.08,
         "adverse_yaw": 0.05, "dihedral_coeff": 0.05,
@@ -332,14 +548,17 @@ FW_AIRFRAMES = {
         "servo_tau": 0.08,
     },
     # Horten: 550g AUW, 1200mm span, 225mm chord, area 0.27 m² (flying wing)
-    # CL_α≈4.9 → Cm_α=-0.245
+    # CL_α≈4.9 → Cm_α=-0.245; 40° sweep per user specs (2026-08-28).
+    # Plank: mass near CG → rf 0.4; 40/16 surface throw.
     "user/Horten.af": {
         "mass": 0.55, "wingspan": 1.2, "wing_area": 0.27,
         "cruise_speed": 13.0,
+        "sweep_deg": 40.0, "dihedral_deg": 2.0,
+        "roll_mass_frac": 0.4, "pitch_mass_frac": 0.3,
         "aileron_area": 0.0045, "aileron_arm": 0.28,
         "elevator_area": 0.0045, "elevator_arm": 0.28,
         "rudder_area": 0.0, "rudder_arm": 0.0,
-        "aileron_max_deg": 20.0, "elevator_max_deg": 20.0, "rudder_max_deg": 0.0,
+        "aileron_max_deg": 30.0, "elevator_max_deg": 12.0, "rudder_max_deg": 0.0,
         "CL_D_AIL": 0.025, "CM_D_ELE": 0.6, "CN_D_RUD": 0.0,
         "pitch_damp": -8.0, "yaw_damp": -0.08,
         "adverse_yaw": 0.05, "dihedral_coeff": 0.05,
@@ -349,13 +568,15 @@ FW_AIRFRAMES = {
     },
     # generic/Elevon.af: 1000g, 1400mm span, 200mm chord, BR2406S 5x4.3x3 3S
     # CL_α≈4.9 → Cm_α=-0.245
+    # Plank: mass near CG → rf 0.4; 40/16 surface throw.
     "generic/Elevon.af": {
         "mass": 1.0, "wingspan": 1.4, "wing_area": 0.28,
         "cruise_speed": 10.7,
+        "roll_mass_frac": 0.4, "pitch_mass_frac": 0.3,
         "aileron_area": 0.0042, "aileron_arm": 0.35,
         "elevator_area": 0.0042, "elevator_arm": 0.35,
         "rudder_area": 0.0, "rudder_arm": 0.0,
-        "aileron_max_deg": 20.0, "elevator_max_deg": 20.0, "rudder_max_deg": 0.0,
+        "aileron_max_deg": 30.0, "elevator_max_deg": 12.0, "rudder_max_deg": 0.0,
         "CL_D_AIL": 0.025, "CM_D_ELE": 0.6, "CN_D_RUD": 0.0,
         "pitch_damp": -8.0, "yaw_damp": -0.08,
         "adverse_yaw": 0.05, "dihedral_coeff": 0.05,
@@ -365,13 +586,15 @@ FW_AIRFRAMES = {
     },
     # generic/Delta.af: 1000g, 1000mm span, 250mm chord, BR2406S 5x4.3x3 3S
     # CL_α≈4.0 → Cm_α=-0.20
+    # Plank: mass near CG → rf 0.45; 40/16 surface throw.
     "generic/Delta.af": {
         "mass": 1.0, "wingspan": 1.0, "wing_area": 0.25,
         "cruise_speed": 11.3,
+        "roll_mass_frac": 0.45, "pitch_mass_frac": 0.35,
         "aileron_area": 0.00375, "aileron_arm": 0.25,
         "elevator_area": 0.00375, "elevator_arm": 0.25,
         "rudder_area": 0.003, "rudder_arm": 0.25,
-        "aileron_max_deg": 20.0, "elevator_max_deg": 20.0, "rudder_max_deg": 25.0,
+        "aileron_max_deg": 30.0, "elevator_max_deg": 12.0, "rudder_max_deg": 25.0,
         "CL_D_AIL": 0.025, "CM_D_ELE": 0.6, "CN_D_RUD": 0.10,
         "pitch_damp": -8.0, "yaw_damp": -0.12,
         "adverse_yaw": 0.05, "dihedral_coeff": 0.05,
@@ -381,9 +604,11 @@ FW_AIRFRAMES = {
     },
     # generic/Spoileron.af: 1200g, 1800mm span, 280mm chord, X2216 10x6" folder 3S
     # CL_α≈5.1 → Cm_α=-0.255
+    # Conventional tail: rf 0.75-0.85.
     "generic/Spoileron.af": {
         "mass": 1.2, "wingspan": 1.8, "wing_area": 0.504,
         "cruise_speed": 8.7,
+        "roll_mass_frac": 0.75, "pitch_mass_frac": 0.85,
         "aileron_area": 0.010, "aileron_arm": 0.50,
         "elevator_area": 0.0076, "elevator_arm": 0.70,
         "rudder_area": 0.005, "rudder_arm": 0.63,
@@ -397,9 +622,11 @@ FW_AIRFRAMES = {
     },
     # generic/RudderElevator.af: 1100g, 1800mm span, 250mm chord, X2216 10x6" folder 3S
     # CL_α≈4.9 → Cm_α=-0.245
+    # Conventional tail: rf 0.8.
     "generic/RudderElevator.af": {
         "mass": 1.1, "wingspan": 1.8, "wing_area": 0.45,
         "cruise_speed": 8.8,
+        "roll_mass_frac": 0.8, "pitch_mass_frac": 0.8,
         "aileron_area": 0.0, "aileron_arm": 0.0,
         "elevator_area": 0.00675, "elevator_arm": 0.625,
         "rudder_area": 0.0045, "rudder_arm": 0.63,
@@ -467,18 +694,70 @@ def get_fw_descriptor(af_filename: str) -> Optional[dict]:
             return None
     phys = load_af_physicals(af_filename)
     if not phys:
-        return desc
+        merged = dict(desc)
+        # Apply the control-authority calibration scale to the torque coeffs
+        merged["CL_D_AIL"] = merged.get("CL_D_AIL", 0.0) * FW_AUTHORITY_SCALE
+        merged["CM_D_ELE"] = merged.get("CM_D_ELE", 0.0) * FW_AUTHORITY_SCALE
+        merged["CN_D_RUD"] = merged.get("CN_D_RUD", 0.0) * FW_AUTHORITY_SCALE
+        return merged
     merged = dict(desc)
     for pk, dk in PHYS_TO_DESCRIPTOR.items():
         if pk in phys:
             merged[dk] = phys[pk]
+    # Apply the control-authority calibration scale to the torque coeffs
+    merged["CL_D_AIL"] = merged.get("CL_D_AIL", 0.0) * FW_AUTHORITY_SCALE
+    merged["CM_D_ELE"] = merged.get("CM_D_ELE", 0.0) * FW_AUTHORITY_SCALE
+    merged["CN_D_RUD"] = merged.get("CN_D_RUD", 0.0) * FW_AUTHORITY_SCALE
     return merged
 
 # Derived inertia and max-rate tuples (roll_pitch, yaw) — computed from physical params
+# Component build-up inertia fractions (AUW-based, literature: wing 50-64% of
+# sailplane empty mass — Hoff, Tech.Soaring; empennage ≈ 6%)
+FW_MASS_FRAC_WING   = 0.50
+FW_MASS_FRAC_TAIL   = 0.06
+FW_LEVER_TAIL       = 0.85   # aero centre vs mass-centre offset on the tail arm
+
 def _compute_fw_inertia(af: dict) -> Tuple[float, float]:
-    m, b, l = af["mass"], af["wingspan"], af["wing_area"] / af["wingspan"]
-    I_roll  = m * b * b / 12.0
-    I_pitch = m * (b * b + l * l) / 12.0
+    """Component build-up (parallel-axis) inertia for fixed-wing aircraft.
+
+    Literature: Raymer Class-II component/geometry build-up; NASA "representative
+    geometric figures" method (Rein Inge Hoff, "Estimating Sailplane Mass
+    Properties", Technical Soaring) — component masses at their CG offsets summed
+    via the parallel-axis (Huygens–Steiner) theorem.  Component fractions are
+    AUW-based: wing ≈ 0.50 (sailplane data: 50–64% of empty mass), empennage ≈ 0.06,
+    fuselage+pyload lumped on a slender rod of length L.
+
+    Roll (about the nose axis): spanwise mass distribution of the wing plate:
+        I_roll = m_wing·b²/12         (fuselage sits on the axis — no lever)
+    Pitch (about the span axis): wing chord + tail-arm lever + fuselage rod:
+        I_pitch = m_wing·c²/12 + m_tail·(k·l_tail)² + m_fuse·L²/12
+        plank:   c is tiny, no boom (l_tail≈0, L≈2c) → ultra pitch-sensitive
+        conventional: long boom + tail point mass at reality arm
+    Yaw = I_roll + I_pitch (thin-body identity).
+    rf_roll/rf_pitch kept for backward compatibility (ignored — geometry now
+    derives pitch from the stored elevator/rudder arms).
+    """
+    m = af["mass"]
+    b = af["wingspan"]
+    chord = af["wing_area"] / af["wingspan"]
+
+    plank = af.get("rudder_area", 0) <= 0
+    m_wing  = FW_MASS_FRAC_WING * m
+    m_tail  = FW_MASS_FRAC_TAIL * m
+    m_fuse  = m - m_wing - m_tail
+
+    I_roll = m_wing * b * b / 12.0
+
+    if plank:
+        l_tail = 0.0                # tail surfaces live on the wing — no boom
+        L = 2.0 * chord            # short pod
+    else:
+        l_tail = max(af.get("elevator_arm", 0.0), af.get("rudder_arm", 0.0))
+        L = 2.0 * l_tail           # boom extends ~arm behind CG, nose ahead
+
+    I_pitch = (m_wing * chord * chord / 12.0   # wing chord
+               + m_tail * (FW_LEVER_TAIL * l_tail) ** 2   # empennage point mass
+               + m_fuse * L * L / 12.0)        # fuselage rod
     return (I_roll, I_pitch)
 
 def is_yaw_structurally_limited(af_filename: str) -> bool:
@@ -603,8 +882,11 @@ DTERM_LPF_HZ = 50.0
 
 # Test step sizes (degrees) — MR
 TEST_STEPS = {"Roll": 15.0, "Pitch": 10.0, "Yaw": 45.0}
-# FW step sizes — larger pitch for recovery-from-upset test, smaller yaw for coordinated turn
-FW_TEST_STEPS = {"Roll": 15.0, "Pitch": 30.0, "Yaw": 15.0}
+# FW step sizes — pitch already max sustainable climb (~15 deg), yaw smaller for coordinated turn.
+# 30 deg sustained pitch step dropped 2026-09-12: not a realistic FW demand (climb attitude is small,
+# and pitch-up in a FW comes with throttle increase that boosts elevator authority via propwash —
+# the clamped fixed-qbar model here does not capture that slipstream gain).
+FW_TEST_STEPS = {"Roll": 15.0, "Pitch": 15.0, "Yaw": 15.0}
 # Gust magnitudes for disturbance rejection
 GUST_MAG = {"Roll": 0.02, "Pitch": 0.015, "Yaw": 0.01}
 
@@ -656,31 +938,6 @@ class Gust:
         return 0.0
 
 # ═══════════════════════════════════════════
-#  Metrics
-# ═══════════════════════════════════════════
-@dataclass
-class StepMetrics:
-    axis_name: str = ""
-    rise_time_s: float = 0.0
-    overshoot_pct: float = 0.0
-    settling_time_s: float = 0.0
-    steady_state_error: float = 0.0
-    max_integrator: float = 0.0
-    intlim: float = 0.0
-    max_rate: float = 0.0
-    peak_angle: float = 0.0
-    final_angle: float = 0.0
-    setpoint: float = 0.0
-    n_oscillations: int = 0
-
-@dataclass
-class DisturbanceMetrics:
-    peak_deviation_rad: float = 0.0
-    settling_time_s: float = 0.0
-    integrated_error: float = 0.0
-    steady_rate_error: float = 0.0
-
-# ═══════════════════════════════════════════
 #  Control functions
 # ═══════════════════════════════════════════
 def clamp(v: float, lo: float, hi: float) -> float:
@@ -729,12 +986,24 @@ def run_physics_mr(angle: float, rate: float, out: float, lag: float, dT: float,
     effort = lag + alpha * (out - lag)
 
     kT = max_thrust * 0.25 * arm_len
-    torque = kT * effort
     _DAMP_C = {"Roll": 0.015, "Pitch": 0.03, "Yaw": 0.05}
     damp_c = _DAMP_C.get(axis, 0.02)
-    damping = damp_c * sgn(rate) * rate * rate
-    dRate = (torque - damping) * inertia_r_axis * dT
-    rate += dRate
+
+    # Sub-step the rate integration: explicit Euler is unstable at CONTROL_DT
+    # when inertia_r_axis is large (tiny m*a² micro frames expose a rate mode
+    # far faster than the controller step). Keep the motor lag + rate ODE at
+    # an inertia-adaptive dt that honours the Euler bound for the quadratic
+    # damping, while the 1 kHz control loop above is unchanged.
+    stiff = 2.0 * damp_c * 2.0 * inertia_r_axis
+    sub = max(1, int(dT * stiff / 0.5) + 1)
+    dts = dT / sub
+    alphas = dts / (EM_MOTOR_TAU + dts)
+    effort = lag
+    for _ in range(sub):
+        effort += alphas * (out - effort)
+        torque = kT * effort
+        damping = damp_c * sgn(rate) * rate * rate
+        rate += (torque - damping) * inertia_r_axis * dts
     angle += rate * dT
     return angle, rate, effort
 
@@ -779,10 +1048,9 @@ def run_physics_fw(angle: float, rate: float, out: float, lag: float, dT: float,
     b = af_params["wingspan"]
     chord = S / b
 
-    # Moment of inertia (kg·m²) — thin rod approximation
-    I_roll  = af_params["mass"] * b * b / 12.0
-    I_pitch = af_params["mass"] * (b * b + chord * chord) / 12.0
-    I_yaw   = I_pitch
+    # Moment of inertia — component build-up (see _compute_fw_inertia)
+    I_roll, I_pitch = _compute_fw_inertia(af_params)
+    I_yaw   = I_roll + I_pitch
 
     I = {"Roll": I_roll, "Pitch": I_pitch, "Yaw": I_yaw}[axis]
     I_eff = max(I, 1e-6)
@@ -862,6 +1130,14 @@ def simulate_axis(pi: PIStruct, pid: PIDStruct, step_rad: float, max_angle_rad: 
     r_max = pid.Max
     af_params = None
 
+    # FW angle loop is pure-P by design — control.c DoAngleControl gates the
+    # quaternion integral accumulation on pAFTypeCategory != eCatFw (=:671), so
+    # a FW airframe NEVER runs its angle-I no matter what Ki the .af stores.
+    # Mirror that gate here so sim results reflect flight (derived FW Ki is
+    # dormant: shipped in the file, never applied).
+    if is_fw:
+        pi.Ki = 0.0
+
     # Compute MR physics from PHYS_ fields
     if cat == AirframeCat.MR and params is not None:
         try:
@@ -915,12 +1191,9 @@ def simulate_axis(pi: PIStruct, pid: PIDStruct, step_rad: float, max_angle_rad: 
     n_warmup = int(WARMUP_TIME / dT)
     decimate = 5
 
-    angles, times, intes = [], [], []
+    angles, times, intes, angles_full = [], [], [], []
 
     max_int = max_rate = peak_angle = 0.0
-    zero_crossings = 0
-    prev_angle = 0.0
-    crossed_zero = False
 
     pi.Max = max_angle_rad
     stick = step_rad / max_angle_rad if max_angle_rad > 0 else 0.0
@@ -935,7 +1208,13 @@ def simulate_axis(pi: PIStruct, pid: PIDStruct, step_rad: float, max_angle_rad: 
 
         d_torque = gust.torque(t) if gust else 0.0
 
-        if is_fw and fw_model_idx >= 0:
+        if is_fw:
+            if fw_model_idx < 0:
+                raise ValueError(
+                    f"{axis_name}: FW airframe routed without a FW model index "
+                    f"(FW_MODEL_IDX missing for this AF type). Focus-1 class boundary: "
+                    f"a FW airframe must NEVER run the MR plant — refuse rather than "
+                    f"silently cross-class.")
             angle, rate, lag = run_physics_fw(angle, rate, out, lag, dT,
                                                r_max, inertia, model_max_rate, axis_name,
                                                af_params=af_params)
@@ -949,7 +1228,7 @@ def simulate_axis(pi: PIStruct, pid: PIDStruct, step_rad: float, max_angle_rad: 
                 rate += d_torque / inertia * dT
                 rate = clamp(rate, -model_max_rate, model_max_rate)
             else:
-                rate += d_torque * mr_inertia_r[ai] * dT
+                rate += d_torque * MR_INERTIA_R[ai] * dT
 
         if i % decimate == 0:
             angles.append(angle)
@@ -959,61 +1238,21 @@ def simulate_axis(pi: PIStruct, pid: PIDStruct, step_rad: float, max_angle_rad: 
         max_int = max(max_int, abs(pi.IntE))
         max_rate = max(max_rate, abs(rate))
         peak_angle = max(peak_angle, abs(angle))
-
-        if i > n_warmup * 3:
-            if prev_angle * angle < 0 and not crossed_zero:
-                zero_crossings += 1
-                crossed_zero = True
-            elif prev_angle * angle >= 0:
-                crossed_zero = False
-        prev_angle = angle
+        angles_full.append(angle)
 
     final_angle = angles[-1] if angles else 0.0
     setpoint = step_rad
     ss_error = abs(final_angle - setpoint)
 
-    rise_time = SIM_TIME
-    overshoot = 0.0
-    settling = SIM_TIME
-
-    if setpoint > 0.01:
-        lo_thresh = 0.1 * setpoint
-        hi_thresh = 0.9 * setpoint
-        settle_band = 0.02 * setpoint
-        t10 = t90 = None
-        settled = False
-        window = min(200, len(times))
-
-        for j in range(len(times)):
-            a = abs(angles[j])
-            if t10 is None and a >= lo_thresh:
-                t10 = times[j]
-            if t90 is None and a >= hi_thresh:
-                t90 = times[j]
-            if t90 is not None and not settled:
-                ok = True
-                for k in range(j, min(j + window, len(times))):
-                    if abs(angles[k] - setpoint) > settle_band:
-                        ok = False
-                        break
-                if ok:
-                    settling = times[j]
-                    settled = True
-                    break
-
-        if t10 is not None and t90 is not None:
-            rise_time = t90 - t10
-
-        peak_above = max((a - setpoint for a in angles if a > setpoint), default=0.0)
-        if setpoint > 0:
-            overshoot = (peak_above / setpoint) * 100.0
+    rise_time, overshoot, settling = step_metrics_window(times, angles, setpoint)
+    zero_crossings = count_zero_crossings(angles_full, n_warmup * 3 + 1)
 
     return StepMetrics(
         rise_time_s=round(rise_time, 4),
         overshoot_pct=round(overshoot, 1),
         settling_time_s=round(settling, 4),
         steady_state_error=round(ss_error, 6),
-        max_integrator=round(max_int, 6),
+        max_integrator=max_int,
         intlim=pi.IntLim,
         max_rate=round(max_rate, 4),
         peak_angle=round(peak_angle, 4),
@@ -1053,14 +1292,10 @@ def simulate_rate_disturbance(pid: PIDStruct, dT: float = CONTROL_DT,
         model_max_rate = 100.0
 
     n = int(SIM_TIME / dT)
-    total_ie = 0.0
-    peak_dev = 0.0
-    settle_time = SIM_TIME
     rates = []
     times = []
-
-    gust_start_idx = int(gust.start_s / dT)
-    gust_end_idx = int((gust.start_s + gust.duration_s) / dT)
+    rates_full = []
+    times_full = []
 
     for i in range(n):
         t = i * dT
@@ -1069,7 +1304,13 @@ def simulate_rate_disturbance(pid: PIDStruct, dT: float = CONTROL_DT,
 
         d_torque = gust.torque(t)
 
-        if is_fw and fw_model_idx >= 0:
+        if is_fw:
+            if fw_model_idx < 0:
+                raise ValueError(
+                    f"{axis_name}: FW disturbance routed without a FW model index "
+                    f"(FW_MODEL_IDX missing for this AF type). Focus-1 class boundary: "
+                    f"a FW airframe must NEVER run the MR plant — refuse rather than "
+                    f"silently cross-class.")
             _, rate, lag = run_physics_fw(0.0, rate, out, lag, dT,
                                            pid.Max, inertia, model_max_rate, axis_name,
                                            af_params=af_params)
@@ -1084,28 +1325,17 @@ def simulate_rate_disturbance(pid: PIDStruct, dT: float = CONTROL_DT,
             rates.append(rate)
             times.append(t)
 
-        if gust_start_idx <= i <= gust_end_idx * 2:
-            total_ie += abs(rate) * dT
-        peak_dev = max(peak_dev, abs(rate))
+        rates_full.append(rate)
+        times_full.append(t)
 
-    # Settling: time after gust end for rate to stay within ±5% of peak deviation
-    settle_band = peak_dev * 0.05 + 1e-6
-    after_gust = int((gust.start_s + gust.duration_s) / dT)
-    settled = False
-    for i in range(after_gust, n):
-        t = i * dT
-        if abs(rate) < settle_band:
-            if not settled:
-                settle_time = t
-                settled = True
-            break
-        settled = False
+    peak_dev, settle_rel, total_ie, steady = disturbance_metrics(
+        times_full, rates_full, gust.start_s, gust.duration_s, dT)
 
     return DisturbanceMetrics(
         peak_deviation_rad=round(peak_dev, 6),
-        settling_time_s=round(settle_time - gust.start_s - gust.duration_s if settle_time < SIM_TIME else SIM_TIME, 4),
+        settling_time_s=round(settle_rel, 4),
         integrated_error=round(total_ie, 6),
-        steady_rate_error=round(abs(rate), 6),
+        steady_rate_error=round(steady, 6),
     )
 
 
@@ -1161,9 +1391,8 @@ def simulate_alt_hold_mr(params: dict, step_m: float = 5.0,
 
     peak_alt = 0.0
     max_int = 0.0
-    rise_time_s = SIM_TIME
-    settled = False
-    settle_time = SIM_TIME
+    atimes = []
+    alts = []
 
     for i in range(n):
         t = i * dT
@@ -1193,29 +1422,19 @@ def simulate_alt_hold_mr(params: dict, step_m: float = 5.0,
 
         max_int = max(max_int, abs(int_e_pos), abs(int_e_vel))
         peak_alt = max(peak_alt, alt)
-
-        if rise_time_s == SIM_TIME and alt >= 0.9 * step_m:
-            rise_time_s = t
-
-        if t > 1.0:
-            if abs(alt - step_m) < 0.02 * abs(step_m):
-                if not settled:
-                    settle_time = t
-                    settled = True
-            else:
-                settled = False
-                settle_time = t + dT
+        atimes.append(t)
+        alts.append(alt)
 
     final_err = abs(alt - step_m)
-    overshoot = max(0, (peak_alt - step_m) / step_m * 100.0) if step_m > 0 else 0.0
+    rise_time, overshoot, settling = step_metrics_persist(atimes, alts, step_m, dt=dT)
 
     return StepMetrics(
         axis_name="Altitude (MR)",
-        rise_time_s=round(rise_time_s, 4),
+        rise_time_s=round(rise_time, 4),
         overshoot_pct=round(overshoot, 1),
-        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        settling_time_s=round(settling, 4),
         steady_state_error=round(final_err, 4),
-        max_integrator=round(max_int, 6),
+        max_integrator=max_int,
         peak_angle=round(peak_alt, 4),
         final_angle=round(alt, 4),
         setpoint=step_m,
@@ -1247,7 +1466,7 @@ def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13
 
     # DoMotors mirror: TotalThrottle = DesiredThrottle + AltHoldThrComp
     #   + pFWPitchThrottleFFFrac*Abs(Pl), capped at pFWClimbThrottleFrac.
-    cruise_thr = float(params.get("EST_CRUISE_THR", 0.5))
+    cruise_thr = float(params.get("UNUSED_20", 0.5))
     climb_cap = float(params.get("FW_CLIMB_THROTTLE", 0.7))
     ff_pt = float(params.get("FW_PITCH_THROTTLE_FF", 0.0))
     climb_margin = max(0.0, climb_cap - cruise_thr)
@@ -1260,9 +1479,8 @@ def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13
 
     peak_alt = 0.0
     max_int = 0.0
-    rise_time_s = SIM_TIME
-    settled = False
-    settle_time = SIM_TIME
+    atimes = []
+    alts = []
 
     # FW climb dynamics: Position PI -> ROC setpoint -> Velocity PI -> climb
     # Actual climb rate follows with time constant (servo + aero lag)
@@ -1304,29 +1522,19 @@ def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13
 
         max_int = max(max_int, abs(int_e_pos), abs(int_e_vel))
         peak_alt = max(peak_alt, alt)
-
-        if rise_time_s == SIM_TIME and alt >= 0.9 * step_m:
-            rise_time_s = t
-
-        if t > 1.0:
-            if abs(alt - step_m) < 0.02 * abs(step_m):
-                if not settled:
-                    settle_time = t
-                    settled = True
-            else:
-                settled = False
-                settle_time = t + dT
+        atimes.append(t)
+        alts.append(alt)
 
     final_err = abs(alt - step_m)
-    overshoot = max(0, (peak_alt - step_m) / step_m * 100.0) if step_m > 0 else 0.0
+    rise_time, overshoot, settling = step_metrics_persist(atimes, alts, step_m, dt=dT)
 
     return StepMetrics(
         axis_name="Altitude (FW)",
-        rise_time_s=round(rise_time_s, 4),
+        rise_time_s=round(rise_time, 4),
         overshoot_pct=round(overshoot, 1),
-        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        settling_time_s=round(settling, 4),
         steady_state_error=round(final_err, 4),
-        max_integrator=round(max_int, 6),
+        max_integrator=max_int,
         peak_angle=round(peak_alt, 4),
         final_angle=round(alt, 4),
         setpoint=step_m,
@@ -1364,9 +1572,8 @@ def simulate_nav_mr(params: dict, step_m: float = 10.0,
 
     peak_pos = 0.0
     max_int = 0.0
-    rise_time_s = SIM_TIME
-    settled = False
-    settle_time = SIM_TIME
+    ntimes = []
+    npos = []
 
     # MR tilt dynamics: fast response (motor time constant ~0.1s)
     tilt_tau = 0.3  # seconds
@@ -1391,29 +1598,19 @@ def simulate_nav_mr(params: dict, step_m: float = 10.0,
 
         max_int = max(max_int, abs(int_e))
         peak_pos = max(peak_pos, abs(pos))
-
-        if rise_time_s == SIM_TIME and abs(pos) >= 0.9 * abs(step_rad):
-            rise_time_s = t
-
-        if t > 1.0:
-            if abs(pos - step_rad) < 0.02 * abs(step_rad):
-                if not settled:
-                    settle_time = t
-                    settled = True
-            else:
-                settled = False
-                settle_time = t + dT
+        ntimes.append(t)
+        npos.append(abs(pos))
 
     final_err = abs(pos - step_rad)
-    overshoot = max(0, (peak_pos - abs(step_rad)) / abs(step_rad) * 100.0) if step_rad != 0 else 0.0
+    rise_time, overshoot, settling = step_metrics_persist(ntimes, npos, abs(step_rad), dt=dT)
 
     return StepMetrics(
         axis_name="Navigation (MR)",
-        rise_time_s=round(rise_time_s, 4),
+        rise_time_s=round(rise_time, 4),
         overshoot_pct=round(overshoot, 1),
-        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        settling_time_s=round(settling, 4),
         steady_state_error=round(final_err, 4),
-        max_integrator=round(max_int, 6),
+        max_integrator=max_int,
         peak_angle=round(peak_pos, 4),
         final_angle=round(pos, 4),
         setpoint=step_m,
@@ -1435,7 +1632,9 @@ def simulate_nav_fw(params: dict, step_m: float = 10.0, cruise_v: float = 13.0,
     pos_kp = float(params.get("NAV_POS_KP", 0.0))
     pos_ki = float(params.get("NAV_POS_KI", 0.0))
     vel_kp = float(params.get("NAV_VEL_KP", 0.0))
-    max_bank = float(params.get("MAX_PITCH_ANGLE", 0.5236))
+    # FW bank = ROLL angle (bank-to-turn); pitch max is climb attitude, NOT the
+    # bank limit. FC clamps FW roll setpoint at A[eRoll].P.Max (control.c).
+    max_bank = float(params.get("MAX_ROLL_ANGLE", 0.7854))
 
     pos = 0.0  # cross-track error in meters
     vel = 0.0  # lateral velocity
@@ -1445,9 +1644,8 @@ def simulate_nav_fw(params: dict, step_m: float = 10.0, cruise_v: float = 13.0,
 
     peak_pos = 0.0
     max_int = 0.0
-    rise_time_s = SIM_TIME
-    settled = False
-    settle_time = SIM_TIME
+    ntimes = []
+    npos = []
 
     V = cruise_v
     # Servo + aero response time constant
@@ -1474,29 +1672,19 @@ def simulate_nav_fw(params: dict, step_m: float = 10.0, cruise_v: float = 13.0,
 
         max_int = max(max_int, abs(int_e))
         peak_pos = max(peak_pos, abs(pos))
-
-        if rise_time_s == SIM_TIME and abs(pos) >= 0.9 * abs(step_m):
-            rise_time_s = t
-
-        if t > 1.0:
-            if abs(pos - step_m) < 0.02 * abs(step_m):
-                if not settled:
-                    settle_time = t
-                    settled = True
-            else:
-                settled = False
-                settle_time = t + dT
+        ntimes.append(t)
+        npos.append(abs(pos))
 
     final_err = abs(pos - step_m)
-    overshoot = max(0, (peak_pos - abs(step_m)) / abs(step_m) * 100.0) if step_m != 0 else 0.0
+    rise_time, overshoot, settling = step_metrics_persist(ntimes, npos, abs(step_m), dt=dT)
 
     return StepMetrics(
         axis_name="Navigation (FW)",
-        rise_time_s=round(rise_time_s, 4),
+        rise_time_s=round(rise_time, 4),
         overshoot_pct=round(overshoot, 1),
-        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        settling_time_s=round(settling, 4),
         steady_state_error=round(final_err, 4),
-        max_integrator=round(max_int, 6),
+        max_integrator=max_int,
         peak_angle=round(peak_pos, 4),
         final_angle=round(pos, 4),
         setpoint=step_m,
@@ -1520,7 +1708,8 @@ def simulate_nav(params: dict, step_deg: float = 30.0, cat: int = AirframeCat.MR
     pos_kp = float(params.get("NAV_POS_KP", 0.0))
     pos_ki = float(params.get("NAV_POS_KI", 0.0))
     vel_kp = float(params.get("NAV_VEL_KP", 0.0))
-    max_angle = float(params.get("MAX_PITCH_ANGLE", 0.5236))  # max bank for nav
+    # FW bank = ROLL angle (bank-to-turn); see note in simulate_nav_fw_cross_track.
+    max_angle = float(params.get("MAX_ROLL_ANGLE", 0.7854))  # max bank for nav
 
     step_rad = step_deg * DEG_TO_RAD
 
@@ -1532,9 +1721,8 @@ def simulate_nav(params: dict, step_deg: float = 30.0, cat: int = AirframeCat.MR
 
     peak_heading = 0.0
     max_int = 0.0
-    rise_time_s = SIM_TIME
-    settled = False
-    settle_time = SIM_TIME
+    ntimes = []
+    nheading = []
 
     V = 10.0  # m/s cruise speed
 
@@ -1557,31 +1745,19 @@ def simulate_nav(params: dict, step_deg: float = 30.0, cat: int = AirframeCat.MR
 
         max_int = max(max_int, abs(int_e))
         peak_heading = max(peak_heading, abs(heading))
-
-        # Rise time
-        if rise_time_s == SIM_TIME and abs(heading) >= 0.9 * abs(step_rad):
-            rise_time_s = t
-
-        # Settling
-        if t > 1.0:
-            if abs(heading - step_rad) < 0.02 * abs(step_rad):
-                if not settled:
-                    settle_time = t
-                    settled = True
-            else:
-                settled = False
-                settle_time = t + dT
+        ntimes.append(t)
+        nheading.append(abs(heading))
 
     final_err = abs(heading - step_rad)
-    overshoot = max(0, (peak_heading - abs(step_rad)) / abs(step_rad) * 100.0) if step_rad != 0 else 0.0
+    rise_time, overshoot, settling = step_metrics_persist(ntimes, nheading, abs(step_rad), dt=dT)
 
     return StepMetrics(
         axis_name="Navigation",
-        rise_time_s=round(rise_time_s, 4),
+        rise_time_s=round(rise_time, 4),
         overshoot_pct=round(overshoot, 1),
-        settling_time_s=round(settle_time if settle_time < SIM_TIME else SIM_TIME, 4),
+        settling_time_s=round(settling, 4),
         steady_state_error=round(final_err, 4),
-        max_integrator=round(max_int, 6),
+        max_integrator=max_int,
         peak_angle=round(peak_heading * RAD_TO_DEG, 4),
         final_angle=round(heading * RAD_TO_DEG, 4),
         setpoint=step_deg,
@@ -1592,7 +1768,10 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
                           dT: float = CONTROL_DT,
                           gusts: Optional[Dict[str, Gust]] = None,
                           params_override: Optional[dict] = None,
-                          step_rads: Optional[Dict[str, float]] = None) -> Dict[str, StepMetrics]:
+                          step_rads: Optional[Dict[str, float]] = None,
+                          demand_frac: Optional[Callable[[float], float]] = None,
+                          return_series: bool = False,
+                          sim_time_s: Optional[float] = None) -> Dict[str, StepMetrics]:
     """Coupled 3-axis simulation with cross-coupling (dihedral, adverse yaw).
 
     Runs all three axes simultaneously so that:
@@ -1602,6 +1781,12 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
     step_axis: which axis receives the step command (others hold zero)
     params_override: if provided, use these params instead of re-loading from file
     step_rads: if provided, use these step sizes (radians) instead of TEST_STEPS
+    demand_frac: if provided, the step demand for step_axis is this callable of t
+        (seconds) returning a stick fraction (-1..1) instead of the instant step.
+        Default None = instant step after warmup (identification probe). Used by
+        the finite-rise and sawtooth process tests (Greg 2026-09-13 foci 5/6).
+    return_series: if True, also return (times, decimated angles of step_axis).
+        sim_time_s: override the 8 s wall for sawtooth runs that need full periods.
     """
     af_params = get_fw_descriptor(af_filename)
     rho = AIR_DENSITY
@@ -1612,9 +1797,9 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
     chord = S / b
     mass = af_params["mass"]
 
-    I_roll  = mass * b * b / 12.0
-    I_pitch = mass * (b * b + chord * chord) / 12.0
-    I_yaw   = I_pitch
+    # Moment of inertia — component build-up (see _compute_fw_inertia)
+    I_roll, I_pitch = _compute_fw_inertia(af_params)
+    I_yaw   = I_roll + I_pitch
 
     C_l_ail = qbar * S * b * af_params.get("CL_D_AIL", 0.0)
     C_m_ele = qbar * S * chord * af_params.get("CM_D_ELE", 0.0)
@@ -1650,6 +1835,7 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
     af_type = AF_FILES.get(af_filename)
     is_rudder_elevator = (af_type == AirframeType.eRudderElevatorAF)
     is_elevon = (af_type == AirframeType.eElevonAF)
+    is_fw = (AF_CATEGORY.get(af_type) == AirframeCat.FW)
 
     # Load params and set up PIDs
     params = params_override if params_override is not None else load_af_params(af_filename)
@@ -1674,10 +1860,15 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
 
     for name in ["Roll", "Pitch", "Yaw"]:
         akp, aki, ail, ma, rkp, rkd, mr = get_axis_params(params, name)
+        # FW angle loop is pure-P by design — control.c DoAngleControl gates the
+        # quaternion integral accumulation on pAFTypeCategory != eCatFw (=:671),
+        # so FW never runs its angle-I (derived FW Ki is dormant in the file).
+        if is_fw:
+            aki = 0.0
         pis[name]  = PIStruct(Kp=akp, Ki=aki, IntLim=ail, Max=ma)
         pids[name] = PIDStruct(Kp=rkp, Kd=rkd, Max=mr)
 
-    n = int(SIM_TIME / dT)
+    n = int((sim_time_s if sim_time_s is not None else SIM_TIME) / dT)
     n_warmup = int(WARMUP_TIME / dT)
     decimate = 5
 
@@ -1697,6 +1888,8 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
         efforts = {}
         for name in ["Roll", "Pitch", "Yaw"]:
             s = step_s if name == step_axis else 0.0
+            if name == step_axis and demand_frac is not None:
+                s = demand_frac(t)
             desired_rate = run_angle_loop(pis[name], angles[name], s, 0.0, dT)
             pids[name].Desired = clamp(desired_rate, -pids[name].Max, pids[name].Max)
             efforts[name] = run_rate_pd(pids[name], rates[name], dT)
@@ -1812,41 +2005,7 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
                 max_rate_val = max(max_rate_val, abs(dr))
 
         ss_error = abs(final_angle - setpoint)
-        rise_time = SIM_TIME
-        overshoot = 0.0
-        settling = SIM_TIME
-
-        if setpoint > 0.01:
-            lo_thresh = 0.1 * setpoint
-            hi_thresh = 0.9 * setpoint
-            settle_band = 0.02 * setpoint
-            t10 = t90 = None
-            settled = False
-            window = min(200, len(all_times))
-
-            for j in range(len(all_times)):
-                a = abs(a_list[j])
-                if t10 is None and a >= lo_thresh:
-                    t10 = all_times[j]
-                if t90 is None and a >= hi_thresh:
-                    t90 = all_times[j]
-                if t90 is not None and not settled:
-                    ok = True
-                    for k in range(j, min(j + window, len(all_times))):
-                        if abs(a_list[k] - setpoint) > settle_band:
-                            ok = False
-                            break
-                    if ok:
-                        settling = all_times[j]
-                        settled = True
-                        break
-
-            if t10 is not None and t90 is not None:
-                rise_time = t90 - t10
-
-            peak_above = max((a - setpoint for a in a_list if a > setpoint), default=0.0)
-            if setpoint > 0:
-                overshoot = (peak_above / setpoint) * 100.0
+        rise_time, overshoot, settling = step_metrics_window(all_times, a_list, setpoint)
 
         metrics[name] = StepMetrics(
             axis_name=name,
@@ -1863,7 +2022,215 @@ def simulate_axis_coupled(af_filename: str, step_axis: str = "Roll",
             n_oscillations=0,
         )
 
+    if return_series:
+        return {name: m for name, m in metrics.items()}, all_times, all_angles[step_axis]
     return metrics
+
+
+def _finite_rise_demand(rise_s: float, t_step: float) -> Callable[[float], float]:
+    """Return a demand_frac(t) ramping 0 → 1 over rise_s after t_step (focus 5).
+
+    A smooth first-order approach would need a time constant; the study directive
+    is a finite rise/decay "fractions of a second to seconds" mirroring real stick
+    motion, so a linear ramp over rise_s is used (hard step when rise_s == 0).
+    """
+    if rise_s <= 0:
+        return lambda t: (1.0 if t >= t_step else 0.0)
+    def frac(t):
+        return 0.0 if t < t_step else min(1.0, (t - t_step) / rise_s)
+    return frac
+
+
+def _sawtooth_demand(amp: float, period_s: float, t_start: float) -> Callable[[float], float]:
+    """Return a demand_frac(t): triangular wave, amplitude `amp` (fraction ±amp),
+    period `period_s`, starting at 0 at t_start and rising (focus 6).
+
+    Period and amplitude are chosen by the caller to mimic human stick inputs or
+    WP-navigation command shapes (per-airframe, see run_process_steps).
+    """
+    if amp <= 0 or period_s <= 0:
+        return lambda t: 0.0
+    def frac(t):
+        if t < t_start:
+            return 0.0
+        tt = (t - t_start) % period_s
+        q = tt / period_s * 4.0
+        if q < 1.0:
+            v = q
+        elif q < 3.0:
+            v = 2.0 - q
+        else:
+            v = q - 4.0
+        return amp * v
+    return frac
+
+
+@dataclass
+class TrackMetrics:
+    """Finite-rise / sawtooth tracking outcome."""
+    axis_name: str = ""
+    demand_kind: str = ""        # "step" | "finite-rise" | "sawtooth"
+    ndemand_ms: int = 0          # number of demand samples in the tracking window
+    rms_err_deg: float = 0.0
+    peak_err_deg: float = 0.0
+    lag_s: float = 0.0
+    reached_90_pct: bool = False  # finite-rise: demand tracked to 90% of target
+
+
+def _tracking_metrics(axis_name: str, kind: str,
+                      times: List[float], angle_deg: List[float],
+                      demand_deg: List[float],
+                      t_start: float, t_end: float) -> TrackMetrics:
+    """Error/lag of angle-deg versus demand-deg over the active [t_start, t_end] window."""
+    t_start = max(t_start, times[0] if times else 0.0)
+    t_end = min(t_end, times[-1] if times else t_start)
+    errs, n = [], 0
+    reached = False
+    win_a, win_d = [], []
+    for t, a, d in zip(times, angle_deg, demand_deg):
+        if t < t_start:
+            continue
+        if t >= t_end:
+            break
+        n += 1
+        errs.append(a - d)
+        if d != 0.0 and abs(a) >= 0.9 * abs(d):
+            reached = True
+        win_a.append(a)
+        win_d.append(d)
+    if not errs:
+        return TrackMetrics(axis_name=axis_name, demand_kind=kind)
+    peak = max((abs(e) for e in errs), default=0.0)
+    rms = math.sqrt(sum(e * e for e in errs) / len(errs))
+    # lag = time shift of angle vs demand that maximises correlation (angle lags
+    # demand → angle is a delayed copy → best_k negative → report +best_k·step).
+    lag = 0.0
+    if len(win_a) > 10:
+        step = (times[1] - times[0]) if len(times) > 1 else 0.01
+        lim = int(1.0 / step) if step > 0 else 0
+        def corr(k):
+            lo, hi = max(0, -k), min(len(win_a), len(win_a) - k)
+            if hi - lo < 4:
+                return -1e18
+            return sum(x * y for x, y in zip(win_a[lo:hi], win_d[lo + k:hi + k]))
+        best_k = max(range(-lim, lim + 1), key=corr)
+        lag = round(-best_k * step, 3)
+    return TrackMetrics(
+        axis_name=axis_name,
+        demand_kind=kind,
+        ndemand_ms=n,
+        rms_err_deg=round(rms, 3),
+        peak_err_deg=round(peak, 3),
+        lag_s=lag,
+        reached_90_pct=reached,
+    )
+
+
+def run_process_steps(af_filename: str,
+                      finite_rise_ss: Sequence[float] = (0.5, 1.0, 2.0),
+                      sawtooth_amp_deg: float = 3.0,
+                      sawtooth_period_s: float = 3.0,
+                      wp_amp_deg: float = 10.0,
+                      wp_period_s: float = 10.0,
+                      t_run_s: float = 7.5) -> Tuple[bool, List[str]]:
+    """Process-step battery (foci 5 & 6, Greg 2026-09-13): realish demands.
+
+    finite_rise_ss: rise times to step the same FW_TEST_STEPS demand (focus 5)
+    sawtooth_*:     human-stick-like triangular tracking demand (focus 6a)
+    wp_*:           WP-navigation-like triangular tracking demand (focus 6b)
+
+    All demand-command shapes are applied to the SAME coupled 3-axis plant used
+    by the identification battery (run_tests_for_af) — no separate plant, no
+    shared-body across MC/FW classes (FW-only here). Generic-frames only.
+    """
+    lines = []
+    ok = True
+    axes = ["Roll", "Pitch", "Yaw"]
+    step_deg = FW_TEST_STEPS
+    yaw_sl = is_yaw_structurally_limited(af_filename)
+    roll_sl = is_roll_structurally_limited(af_filename)
+    struct_skip = {"Roll": roll_sl, "Pitch": False, "Yaw": yaw_sl}
+
+    # Sawtooth runs need >= 2 full periods of a periodic command for a clean
+    # steady-state lag estimate: extend the sim wall beyond the 8 s identification
+    # default. The finite-rise step runs keep the identification 8 s wall.
+    saw_wall_s = min(2.0 * max(sawtooth_period_s, wp_period_s) + 1.0, 60.0)
+
+    lines.append(f"\n{'='*60}")
+    lines.append(f"{B}Process-step runs (foci 5/6) — {af_filename}{N}")
+    lines.append(f"  Finite-rise step rises: {finite_rise_ss}")
+    lines.append(f"  Sawtooth stick:  amp {sawtooth_amp_deg}°  period {sawtooth_period_s}s")
+    lines.append(f"  Sawtooth WP-nav: amp {wp_amp_deg}°  period {wp_period_s}s")
+    lines.append(f"  plant = coupled FW aero (same as ident battery)   saw sim wall {saw_wall_s:.0f}s")
+    lines.append(f"{'='*60}")
+
+    for ax in axes:
+        if struct_skip[ax]:
+            lines.append(f"\n{B}── {ax} ──{N}  {Y}structural skip (no scored demand){N}")
+            continue
+        t_start = 0.5
+        angles = step_deg[ax] * DEG_TO_RAD
+        lines.append(f"\n{B}── {ax} @ {step_deg[ax]:.0f}° ──{N}")
+
+        # Focus 5: finite-rise step (vs the ident battery's sharp step)
+        for rise in finite_rise_ss:
+            df = _finite_rise_demand(rise, t_start)
+            m, ts, an = simulate_axis_coupled(
+                af_filename, step_axis=ax, step_rads={a: step_deg[a] * DEG_TO_RAD for a in axes},
+                demand_frac=df, return_series=True)
+            dem = [df(t) * angles * RAD_TO_DEG for t in ts]
+            ag = [a * RAD_TO_DEG for a in an]
+            tm = _tracking_metrics(ax, f"finite-rise {rise:.1f}s", ts, ag, dem, t_start + rise, t_run_s)
+            r90 = "yes" if tm.reached_90_pct else "no"
+            lines.append(f"  rise {rise:.1f}s: 90% follower={r90:>3}  rms err {tm.rms_err_deg:5.2f}°  "
+                         f"peak err {tm.peak_err_deg:5.2f}°  lag {tm.lag_s:4.2f}s")
+            if rise == finite_rise_ss[0]:
+                crit = FW_CRITERIA[ax]
+                real_m = m[ax]
+                lines.append(f"    step metrics on finite-rise demand: rise {real_m.rise_time_s}s "
+                             f"settle {real_m.settling_time_s}s fe {real_m.steady_state_error*RAD_TO_DEG:.2f}°")
+                if real_m.settling_time_s > crit.max_settling_time_s or \
+                   real_m.steady_state_error * RAD_TO_DEG > 2 * crit.max_ss_error_deg:
+                    ok = False
+                    lines.append(f"    {R}! settle/fe out of identification bounds on finite-rise demand{N}")
+        # Focus 6a: human-stick-like sawtooth (>= 2 full periods; analyse the last)
+        df = _sawtooth_demand(sawtooth_amp_deg / step_deg[ax] if step_deg[ax] else 0.0,
+                              sawtooth_period_s, t_start)
+        _, ts, an = simulate_axis_coupled(
+            af_filename, step_axis=ax, step_rads={a: step_deg[a] * DEG_TO_RAD for a in axes},
+            demand_frac=df, return_series=True, sim_time_s=saw_wall_s)
+        dem = [df(t) * angles * RAD_TO_DEG for t in ts]
+        ag = [a * RAD_TO_DEG for a in an]
+        tm = _tracking_metrics(ax, "saw(stick)", ts, ag, dem,
+                               saw_wall_s - sawtooth_period_s - t_start, saw_wall_s - t_start)
+        lag_tol = 0.40 * sawtooth_period_s
+        sfail = tm.lag_s > lag_tol
+        lines.append(f"  sawstick ±{sawtooth_amp_deg}° / {sawtooth_period_s}s: "
+                     f"rms err {tm.rms_err_deg:5.2f}°  peak {tm.peak_err_deg:5.2f}°  lag {tm.lag_s:4.2f}s"
+                     + (f"  {R}! lag > {lag_tol:.2f}s (40% of period, provisional){N}" if sfail else ""))
+        if sfail:
+            ok = False
+        # Focus 6b: WP-nav-like sawtooth
+        df = _sawtooth_demand(wp_amp_deg / step_deg[ax] if step_deg[ax] else 0.0,
+                              wp_period_s, t_start)
+        _, ts, an = simulate_axis_coupled(
+            af_filename, step_axis=ax, step_rads={a: step_deg[a] * DEG_TO_RAD for a in axes},
+            demand_frac=df, return_series=True, sim_time_s=saw_wall_s)
+        dem = [df(t) * angles * RAD_TO_DEG for t in ts]
+        ag = [a * RAD_TO_DEG for a in an]
+        tm = _tracking_metrics(ax, "saw(wp)", ts, ag, dem,
+                               saw_wall_s - wp_period_s - t_start, saw_wall_s - t_start)
+        wp_tol = 0.40 * wp_period_s
+        # The corner-following peak error is slew×response-transient, not steady
+        # lag — the phase-lag gate is the defensible criterion (provisional).
+        wfail = tm.lag_s > wp_tol
+        lines.append(f"  saw-WP  ±{wp_amp_deg}° / {wp_period_s}s: "
+                     f"rms err {tm.rms_err_deg:5.2f}°  peak {tm.peak_err_deg:5.2f}°  lag {tm.lag_s:4.2f}s"
+                     + (f"  {R}! lag > {wp_tol:.2f}s (40% of period, provisional){N}" if wfail else ""))
+        if wfail:
+            ok = False
+
+    return ok, lines
 
 
 @dataclass
@@ -1887,6 +2254,44 @@ class FreeFlightMetrics:
     dihedral_roll_coupling: float = 0.0   # peak roll from yaw gust (dihedral effect)
 
 
+def _effective_dihedral(af_params: Dict, b: float, S: float, mass: float,
+                        qbar: float) -> Tuple[float, float]:
+    """Roll-due-to-sideslip C_lβ from geometric dihedral + sweepback, plus the
+    equivalent dihedral angle (EDA) that produces it — the
+    reconcile-with-Panknin figure.  Composition:
+      dihedral C_lβ : panels averaged via Δα = arctan(sinβ·tanΓ), weighted by
+          the panel span fraction, times the wing lift slope a_w (lifting-line)
+          and the taper factor Fλ = (1+2λ)/(3(1+λ)).
+      sweep C_lβ    : K_SWEEP · CL_cruise · tan(Λ), times Fλ (span-lift
+          leverage ∝ total lift — zero at CL=0, grows with CL).
+    Per-frame geometry lives in the descriptor as optional keys:
+      sweep_deg, dihedral_deg, anhedral_deg, anhedral_start (tip panels; the
+      remaining span holds +dihedral_deg), taper_ratio (default 0.5).
+    Frames without explicit geometry keep the existing dihedral_coeff (rad)
+    as their mean geometric dihedral.
+    """
+    dihedral_coeff = af_params.get("dihedral_coeff", 0.0)
+    sweep_deg = af_params.get("sweep_deg", 0.0)
+    lam = af_params.get("taper_ratio", 0.5)
+    if af_params.get("dihedral_deg") is not None:
+        g_start = float(af_params["dihedral_deg"])
+        if af_params.get("anhedral_deg"):
+            start = min(max(af_params.get("anhedral_start", 2.0 / 3.0), 0.0), 1.0)
+            g_eff_deg = g_start * start - abs(af_params["anhedral_deg"]) * (1.0 - start)
+        else:
+            g_eff_deg = g_start
+    else:
+        g_eff_deg = math.degrees(dihedral_coeff)
+    F_lambda = (1.0 + 2.0 * lam) / (3.0 * (1.0 + lam))
+    ar = b * b / max(S, 1e-9)
+    a_w = 2.0 * math.pi * ar / (2.0 + math.sqrt(4.0 + ar * ar))
+    cl_cruise = mass * GRAVITY / max(qbar * S, 1e-9)
+    C_l_beta = (a_w * math.tan(math.radians(g_eff_deg))
+                + K_SWEEP * cl_cruise * math.tan(math.radians(sweep_deg))) * F_lambda
+    eda_deg = math.degrees(math.atan(C_l_beta / max(a_w * F_lambda, 1e-9)))
+    return C_l_beta, eda_deg
+
+
 def simulate_freeflight(af_filename: str, dT: float = CONTROL_DT,
                         sim_time: float = 15.0,
                         gust_axes: Optional[List[str]] = None) -> FreeFlightMetrics:
@@ -1904,9 +2309,9 @@ def simulate_freeflight(af_filename: str, dT: float = CONTROL_DT,
     chord = S / b
     mass = af_params["mass"]
 
-    I_roll  = mass * b * b / 12.0
-    I_pitch = mass * (b * b + chord * chord) / 12.0
-    I_yaw   = I_pitch
+    # Moment of inertia — component build-up (see _compute_fw_inertia)
+    I_roll, I_pitch = _compute_fw_inertia(af_params)
+    I_yaw   = I_roll + I_pitch
 
     C_l_ail = qbar * S * b * af_params.get("CL_D_AIL", 0.0)
     C_m_ele = qbar * S * chord * af_params.get("CM_D_ELE", 0.0)
@@ -1928,6 +2333,15 @@ def simulate_freeflight(af_filename: str, dT: float = CONTROL_DT,
 
     adverse_yaw_coeff = af_params.get("adverse_yaw", 0.0)
     dihedral_coeff = af_params.get("dihedral_coeff", 0.0)
+
+    # Effective dihedral → roll-due-to-sideslip (C_lβ) — composition and
+    # per-frame geometry handling live in _effective_dihedral (shared with the
+    # lateral-mode analysis).  Prior versions had NO angle-based roll restoring
+    # at all (only rate damping + yaw coupling), so open-loop gust tests
+    # randomly walked off / spiralled on frames with a modest dihedral moment
+    # while their closed-loop sims (and real flying) were fine — a model gap,
+    # not an airframe defect.
+    C_l_beta, eda_deg = _effective_dihedral(af_params, b, S, mass, qbar)
 
     af_type = AF_FILES.get(af_filename)
     is_rudder_elevator = (af_type == AirframeType.eRudderElevatorAF)
@@ -1997,7 +2411,8 @@ def simulate_freeflight(af_filename: str, dT: float = CONTROL_DT,
         L_dihedral = dihedral_coeff * rates["Yaw"] if dihedral_coeff > 0 else 0.0
 
         # Total torques → angular accelerations (damping subtracted)
-        alpha_r = (L_ctrl + L_dihedral - L_damp + gust_torque["Roll"])         / max(I_roll,  1e-6)
+        L_restore = -C_l_beta * qbar * S * b * math.sin(angles["Roll"])
+        alpha_r = (L_ctrl + L_dihedral + L_restore - L_damp + gust_torque["Roll"]) / max(I_roll,  1e-6)
         alpha_p = (M_ctrl + M_stability - M_damp + gust_torque["Pitch"])       / max(I_pitch, 1e-6)
         alpha_y = (N_ctrl + N_adverse + N_stability - N_damp + gust_torque["Yaw"]) / max(I_yaw,   1e-6)
 
@@ -2093,138 +2508,243 @@ def format_freeflight(m: FreeFlightMetrics, af_filename: str) -> List[str]:
         lines.append(f"\n  {B}Dihedral coupling:{N} minimal roll from yaw (low dihedral or no yaw coupling)")
 
     return lines
-@dataclass
-class Criteria:
-    max_rise_time_s: float
-    max_overshoot_pct: float
-    max_settling_time_s: float
-    max_ss_error_deg: float
-    max_int_ratio: float
-    min_rate_ratio: float
-    max_oscillations: int
 
 @dataclass
-class DisturbanceCriteria:
-    max_peak_deviation_deg: float
-    max_settling_time_s: float
-    max_integrated_error: float
+class LateralModeMetrics:
+    """Linearized lateral-directional modes (β, p, r, φ small-perturbation)."""
+    dutch_roll_zeta: float = 0.0       # damping ratio (negative = unstable)
+    dutch_roll_period_s: float = 0.0
+    dutch_roll_wn_rads: float = 0.0
+    pair_real: bool = False            # True: no oscillatory DR (overdamped)
+    spiral_time_to_double_s: float = 0.0  # > 0 only when spiral is unstable
+    spiral_t_half_s: float = 0.0          # stable spiral: time to halve, s
+    roll_sub_tau_s: float = 0.0
+    dutch_roll_ok: bool = True
+    spiral_ok: bool = True
+    eda_deg: float = 0.0
 
-CRITERIA = {
-    "Roll": Criteria(1.0, 10.0, 2.5, 1.0, 1.0, 0.3, 3),
-    "Pitch": Criteria(1.0, 10.0, 2.5, 1.0, 1.0, 0.3, 3),
-    "Yaw": Criteria(3.0, 15.0, 5.0, 2.0, 1.0, 0.2, 4),
-}
+def _mat_mul(A: List[List[float]], B: List[List[float]]) -> List[List[float]]:
+    n = len(A)
+    return [[sum(A[i][k] * B[k][j] for k in range(n)) for j in range(n)] for i in range(n)]
 
-FW_CRITERIA = {
-    "Roll": Criteria(4.0, 25.0, 8.0, 5.0, 1.0, 0.05, 5),
-    "Pitch": Criteria(5.0, 30.0, 12.0, 15.0, 1.5, 0.05, 6),
-    "Yaw": Criteria(5.0, 25.0, 10.0, 5.0, 1.0, 0.03, 5),
-}
+def _mat_trace(M: List[List[float]]) -> float:
+    return sum(M[i][i] for i in range(len(M)))
 
-DIST_CRITERIA = {
-    "Roll": DisturbanceCriteria(15.0, 1.5, 10.0),
-    "Pitch": DisturbanceCriteria(12.0, 1.5, 8.0),
-    "Yaw": DisturbanceCriteria(12.0, 2.0, 10.0),
-}
+def _char_poly(A: List[List[float]]) -> List[float]:
+    """Characteristic polynomial det(λI − A) = λⁿ + a₁λⁿ⁻¹ + … + aₙ,
+    via Faddeev–LeVerrier."""
+    n = len(A)
+    B = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    coeffs = [1.0]
+    for k in range(1, n + 1):
+        M = _mat_mul(A, B)
+        a = -_mat_trace(M) / k
+        coeffs.append(a)
+        B = [[M[i][j] + (a if i == j else 0.0) for j in range(n)] for i in range(n)]
+    return coeffs
 
-# AH/Nav criteria — more relaxed than attitude (these are outer loops)
-AH_CRITERIA_MR = Criteria(2.0, 20.0, 5.0, 1.0, 1.0, 0.3, 3)   # 5m step, per-airframe physics
-AH_CRITERIA_FW = Criteria(6.0, 15.0, 8.0, 2.0, 1.0, 0.3, 3)   # rise 6s/settle 8s — FW climb-tau physics floor ~4.4s
-NAV_CRITERIA_MR = Criteria(2.0, 20.0, 5.0, 1.0, 1.0, 0.3, 3)
-NAV_CRITERIA_FW = Criteria(3.0, 15.0, 5.0, 2.0, 1.0, 0.3, 3)
+def _poly_eval(coeffs: List[float], z: complex) -> complex:
+    acc = complex(coeffs[0], 0.0)
+    for c in coeffs[1:]:
+        acc = acc * z + c
+    return acc
 
-# ═══════════════════════════════════════════
-#  Report / Critique
-# ═══════════════════════════════════════════
-G = "\033[92m"
-Y = "\033[93m"
-R = "\033[91m"
-B = "\033[1m"
-N = "\033[0m"
+def _cbrt(x: complex) -> complex:
+    """Cube root.  Python's ** (1/3) returns the complex principal root of a
+    negative real, which breaks Cardano (picks a complex root where a real one
+    exists); use a sign-preserving real cube root for real radicands."""
+    if abs(x.imag) < 1e-12:
+        re = x.real
+        return complex(-((-re) ** (1.0 / 3.0)), 0.0) if re < 0.0 else complex(re ** (1.0 / 3.0), 0.0)
+    return x ** (1.0 / 3.0)
 
-def check(label: str, v: float, limit: float, kind: str = "max", unit: str = "") -> Tuple[bool, str]:
-    ok = (v <= limit) if kind == "max" else (v >= limit)
-    icon = f"{G}PASS{N}" if ok else f"{R}FAIL{N}"
-    return ok, f"  [{icon}] {label}: {v:.4g}{unit}  (limit: {kind} {limit:.4g}{unit})"
+def _cubic_real_root(A: float, B: float, C: float) -> complex:
+    """One root of z³ + A z² + B z + C = 0 (Cardano; real for real inputs).
+    The depressed form t³ + pt + q = 0 yields a real root as the sum of a
+    conjugate pair of cube roots — valid also for Δ < 0 (3 real)."""
+    p = B - A * A / 3.0
+    q = 2.0 * A * A * A / 27.0 - A * B / 3.0 + C
+    disc = cmath.sqrt((q / 2.0) ** 2 + (p / 3.0) ** 3)
+    u = _cbrt(-q / 2.0 + disc)
+    v = _cbrt(-q / 2.0 - disc)
+    return u + v - A / 3.0
 
-def critique(m: StepMetrics, c: Criteria, name: str) -> Tuple[List[str], bool]:
-    lines = []
-    lines.append(f"\n{B}── {name} @ {m.setpoint*RAD_TO_DEG:.0f}° step ──{N}")
-    lines.append(f"     Final: {m.final_angle*RAD_TO_DEG:.1f}°   Peak: {m.peak_angle*RAD_TO_DEG:.1f}°   Max rate: {m.max_rate*RAD_TO_DEG:.0f}°/s")
-    int_ratio = m.max_integrator / m.intlim if m.intlim > 0 else 0
-    rate_ratio = m.max_rate / (abs(m.setpoint) * 2) if m.setpoint != 0 else 1.0
-    results = [
-        check("Rise time (10→90%)",          m.rise_time_s,         c.max_rise_time_s, "max", "s"),
-        check("Overshoot",                    m.overshoot_pct,       c.max_overshoot_pct, "max", "%"),
-        check("Settling time (±2%)",          m.settling_time_s,     c.max_settling_time_s, "max", "s"),
-        check("Final error",                  m.steady_state_error * RAD_TO_DEG, c.max_ss_error_deg, "max", "°"),
-        check("Integrator utilization",       int_ratio,             c.max_int_ratio, "max"),
-        check("Rate headroom (peak/2×sp)",    rate_ratio,            c.min_rate_ratio, "min"),
-        check("Zero crossings (oscillations)", m.n_oscillations,     c.max_oscillations, "max"),
+def _quartic_roots(coeffs: List[float]) -> List[complex]:
+    """Roots of monic quartic x⁴ + ax³ + bx² + cx + d = 0 via the closed-form
+    Ferrari solution (resolvent cubic → two quadratics).  Deterministic — the
+    alternative Durand–Kerner iteration stalls into non-root fixed points
+    whenever all four roots are real, which is the common case here."""
+    a, b, c, d = coeffs[1], coeffs[2], coeffs[3], coeffs[4]
+    p = b - 3.0 * a * a / 8.0
+    q = c - a * b / 2.0 + a * a * a / 8.0
+    r = d - a * c / 4.0 + a * a * b / 16.0 - 3.0 * a ** 4 / 256.0
+
+    # Resolvent cubic in u = α²: u³ + 2p·u² + (p² − 4r)·u − q² = 0
+    u0 = _cubic_real_root(2.0 * p, p * p - 4.0 * r, -q * q)
+    alpha = cmath.sqrt(u0)
+
+    if abs(alpha) < 1e-9 and abs(q) > 1e-9:
+        # Degenerate α≈0 is only consistent when q≈0; guard by solving the
+        # α=0 factor system (β+γ=p, βγ=r) directly.
+        beta = (p + cmath.sqrt(p * p - 4.0 * r)) / 2.0
+        gamma = (p - cmath.sqrt(p * p - 4.0 * r)) / 2.0
+    else:
+        beta = (u0 + p - q / alpha) / 2.0
+        gamma = (u0 + p + q / alpha) / 2.0
+
+    # The two quadratics are y² + αy + β = 0  and  y² − αy + γ = 0
+    roots = []
+    for l, t2 in [(alpha, beta), (-alpha, gamma)]:
+        discr = cmath.sqrt(alpha * alpha - 4.0 * t2)
+        roots.append((-l + discr) / 2.0 - a / 4.0)
+        roots.append((-l - discr) / 2.0 - a / 4.0)
+    return roots
+
+def _poly_roots(coeffs: List[float]) -> List[complex]:
+    """Roots of a monic quartic (closed-form, see _quartic_roots)."""
+    return _quartic_roots(coeffs)
+
+def analyze_lateral_modes(af_filename: str) -> LateralModeMetrics:
+    """Lateral-directional mode analysis (Dutch roll / spiral / roll
+    subsidence) from the FW descriptor aero data.
+
+    Forms the 4-state small-perturbation system (β, p, r, φ) about level
+    cruise (θ₀ = 0):
+        β̇ = (Yβ/mV)β − r + (g/V)φ
+        ṗ = (Lβ/Ixx)β + (Lp/Ixx)p + (Lr/Ixx)r
+        ṙ = (Nβ/Izz)β + (Nr/Izz)r
+        φ̇ = p
+    Derivatives use the same C_lβ / yaw-stability / damping conventions as
+    simulate_freeflight; quadratic damping is applied as an equivalent linear
+    term at |rate| = LIN_EQ_RATE.  Fin sideforce (Y_β) and yaw damping (N_r)
+    are estimated from rudder_area / rudder_arm with the A_V_FIN fin
+    lift-slope assumption.  N_p (roll→yaw) is deliberately 0 — the non-linear
+    sim has no roll-rate yaw coupling either.  Diagnostic only.
+    """
+    af_params = get_fw_descriptor(af_filename)
+    rho = AIR_DENSITY
+    V = af_params["cruise_speed"]
+    qbar = 0.5 * rho * V * V
+    S = af_params["wing_area"]
+    b = af_params["wingspan"]
+    chord = S / b
+    mass = af_params["mass"]
+
+    # Moment of inertia — component build-up (see _compute_fw_inertia)
+    I_roll, I_pitch = _compute_fw_inertia(af_params)
+    Ixx = I_roll
+    Izz = I_roll + I_pitch
+
+    C_l_beta, eda_deg = _effective_dihedral(af_params, b, S, mass, qbar)
+    L_beta = C_l_beta * qbar * S * b
+    N_beta = af_params.get("yaw_stability", 0.0) * qbar * S * b
+
+    C_d_roll = abs(af_params.get("roll_damp", 0.5 * rho * V * b * b * b * 0.04))
+    C_d_yaw  = abs(af_params.get("yaw_damp", 0.10)) if af_params.get("rudder_area", 0) > 0 else 0.2
+    roll_damp_lin = af_params.get("roll_damp_lin", 0.02)
+    yaw_damp_lin  = af_params.get("yaw_damp_lin", 0.015)
+
+    # Dihedral yaw-rate→roll coupling (same term as the non-linear sim)
+    L_r = af_params.get("dihedral_coeff", 0.0) / Ixx
+
+    # Equivalent-linear damping at representative oscillation amplitude
+    L_p = -(C_d_roll * LIN_EQ_RATE + roll_damp_lin) / Ixx
+
+    s_v = af_params.get("rudder_area", 0.0)
+    l_v = af_params.get("rudder_arm", 0.0)
+    if s_v > 0:
+        n_r_fin = A_V_FIN * qbar * s_v * l_v * l_v / V
+        y_beta  = A_V_FIN * qbar * s_v / (mass * V)
+        N_r = -(C_d_yaw * LIN_EQ_RATE + yaw_damp_lin + n_r_fin) / Izz
+    else:
+        N_r = -(C_d_yaw * LIN_EQ_RATE + yaw_damp_lin) / Izz
+        y_beta = 0.0
+
+    gv = GRAVITY / V
+
+    A = [
+        [y_beta,              0.0,      -1.0,      gv],
+        [L_beta / Ixx,        L_p,       L_r,      0.0],
+        [N_beta / Izz,        0.0,       N_r,      0.0],
+        [0.0,                 1.0,       0.0,      0.0],
     ]
-    for ok, msg in results:
-        lines.append(msg)
-        if not ok:
-            lines.append(f"    {R}╰─ recommend tuning{N}")
-    all_pass = all(r[0] for r in results)
-    lines.append(f"  → {name}: {G}PASS{N}" if all_pass else f"  → {name}: {R}ISSUES{N}")
-    return lines, all_pass
 
-def critique_linear(m: StepMetrics, c: Criteria, name: str, units: str = "m") -> Tuple[List[str], bool]:
-    """Critique for linear (meters) step response — AH and Nav sims."""
-    lines = []
-    lines.append(f"\n{B}── {name} @ {m.setpoint:.1f}{units} step ──{N}")
-    lines.append(f"     Final: {m.final_angle:.2f}{units}   Peak: {m.peak_angle:.2f}{units}")
-    int_ratio = m.max_integrator / m.intlim if m.intlim > 0 else 0
-    rate_ratio = m.max_rate / (abs(m.setpoint) * 2) if m.setpoint != 0 else 1.0
-    results = [
-        check("Rise time (10→90%)",          m.rise_time_s,         c.max_rise_time_s, "max", "s"),
-        check("Overshoot",                    m.overshoot_pct,       c.max_overshoot_pct, "max", "%"),
-        check("Settling time (±2%)",          m.settling_time_s,     c.max_settling_time_s, "max", "s"),
-        check(f"Final error",                 m.steady_state_error,  c.max_ss_error_deg, "max", units),
-        check("Integrator utilization",       int_ratio,             c.max_int_ratio, "max"),
-    ]
-    for ok, msg in results:
-        lines.append(msg)
-        if not ok:
-            lines.append(f"    {R}╰─ recommend tuning{N}")
-    all_pass = all(r[0] for r in results)
-    lines.append(f"  → {name}: {G}PASS{N}" if all_pass else f"  → {name}: {R}ISSUES{N}")
-    return lines, all_pass
+    roots = _poly_roots(_char_poly(A))
 
+    m = LateralModeMetrics()
+    m.eda_deg = eda_deg
 
-def critique_disturbance(m: DisturbanceMetrics, c: DisturbanceCriteria, name: str) -> Tuple[List[str], bool]:
-    lines = []
-    lines.append(f"\n{B}── {name} disturbance rejection @ gust={c.max_peak_deviation_deg:.0f}°/s limit ──{N}")
-    lines.append(f"     Peak deviation: {m.peak_deviation_rad*RAD_TO_DEG:.2f}°/s   Settle: {m.settling_time_s:.3f}s   IE: {m.integrated_error*RAD_TO_DEG:.3f}°")
-    results = [
-        check("Peak rate deviation", m.peak_deviation_rad*RAD_TO_DEG, c.max_peak_deviation_deg, "max", "°/s"),
-        check("Settling after gust", m.settling_time_s,               c.max_settling_time_s,    "max", "s"),
-        check("Integrated error",    m.integrated_error*RAD_TO_DEG,   c.max_integrated_error,   "max", "°"),
-    ]
-    for ok, msg in results:
-        lines.append(msg)
-        if not ok:
-            lines.append(f"    {R}╰─ recommend tuning{N}")
-    all_pass = all(r[0] for r in results)
-    lines.append(f"  → {name} disturbance rejection: {G}PASS{N}" if all_pass else f"  → {name}: {R}ISSUES{N}")
-    return lines, all_pass
+    pairs = sorted((z for z in roots if abs(z.imag) >= 1e-6),
+                   key=lambda z: abs(z.imag), reverse=True)
+    reals = [z for z in roots if abs(z.imag) < 1e-6]
 
-def recommend(metrics: dict, is_fw: bool = False) -> List[str]:
-    lines = [f"\n{B}Recommendations{N}"]
-    any_rec = False
-    for name, m in metrics.items():
-        os = m.overshoot_pct
-        st = m.settling_time_s
-        if os > (15 if is_fw else 8):
-            lines.append(f"  {Y}• {name}: reduce AngleKp or increase RateKp to cut overshoot ({os:.0f}%){N}")
-            any_rec = True
-        if st > (5 if is_fw else 2.5):
-            lines.append(f"  {Y}• {name}: response slow ({st:.1f}s settle) — consider higher gains{N}")
-            any_rec = True
-    if not any_rec:
-        lines.append(f"  {G}No issues detected — tuning is appropriate for this airframe.{N}")
+    # Dutch roll: the oscillatory pair (0 or 1 → overdamped, no oscillation)
+    if pairs:
+        lam = pairs[0]
+        wn = abs(lam)
+        if wn > 1e-9:
+            m.dutch_roll_wn_rads = wn
+            m.dutch_roll_period_s = 2.0 * math.pi / wn
+            m.dutch_roll_zeta = -lam.real / wn
+        m.dutch_roll_ok = m.dutch_roll_zeta >= DR_ZETA_MIN
+    else:
+        m.pair_real = True
+        m.dutch_roll_ok = True  # no oscillation ⇒ no unstable oscillation
+
+    # Spiral: the slowest mode — smallest |Re| among the real roots and any
+    # second (low-frequency) complex pair.  Time-to-double for Re>0 (i.e.
+    # unstable growth), time-to-half otherwise.
+    slow = list(reals)
+    if len(pairs) >= 2:
+        slow.append(pairs[1])
+    if slow:
+        l_spiral = min(slow, key=lambda z: abs(z.real))
+        re_spiral = l_spiral.real
+        if re_spiral > 0.0:
+            m.spiral_time_to_double_s = math.log(2.0) / re_spiral
+            m.spiral_ok = m.spiral_time_to_double_s >= SPIRAL_T_DOUBLE_MIN
+        else:
+            m.spiral_t_half_s = math.log(2.0) / abs(re_spiral)
+
+    # Roll subsidence: the fast large-negative real root (or the second pair's
+    # decay rate when the system is fully oscillatory).
+    if reals:
+        reals_neg = [z.real for z in reals if z.real < 0.0]
+        if reals_neg:
+            m.roll_sub_tau_s = 1.0 / abs(min(reals_neg))
+    elif len(pairs) >= 2 and pairs[1].real < 0.0:
+        m.roll_sub_tau_s = 1.0 / abs(pairs[1].real)
+
+    return m
+
+def format_lateral_modes(m: LateralModeMetrics, af_filename: str) -> List[str]:
+    """Format lateral-directional mode analysis as report lines."""
+    lines = [f"\n  {B}Lateral modes:{N} (linearized β-p-r-φ)   "
+             f"EDA {m.eda_deg:.1f}°"]
+    if m.pair_real:
+        lines.append(f"    Dutch roll:   overdamped (no oscillation)   [{G}PASS{N}]")
+    else:
+        icon = f"{G}PASS{N}" if m.dutch_roll_ok else f"{R}FAIL{N}"
+        lines.append(f"    Dutch roll:   ζ={m.dutch_roll_zeta:+.2f}  "
+                     f"T={m.dutch_roll_period_s:.1f}s  ωn={m.dutch_roll_wn_rads:.2f} rad/s  "
+                     f"(limit ζ ≥ {DR_ZETA_MIN:.2f})  [{icon}]")
+    if m.spiral_time_to_double_s > 0.0:
+        icon = f"{G}PASS{N}" if m.spiral_ok else f"{R}FAIL{N}"
+        lines.append(f"    Spiral:       UNSTABLE  T½={m.spiral_time_to_double_s:.1f}s  "
+                     f"(limit ≥ {SPIRAL_T_DOUBLE_MIN:.0f}s)  [{icon}]")
+    else:
+        lines.append(f"    Spiral:       stable  T½={m.spiral_t_half_s:.1f}s  [{G}PASS{N}]")
+    lines.append(f"    Roll subs.:   τ={m.roll_sub_tau_s:.1f}s  (informational)")
     return lines
+
+# ═══════════════════════════════════════════
+#  Report / Critique — shared with FC-side measurement
+# ═══════════════════════════════════════════
+# Criteria tables, verdict helpers, kritik/report renderers, and the
+# metric extractors live in src/critic/ (critic/metrics.py + critic/criteria.py)
+# so the FC in-flight trace tool can measure identically. All of it is
+# imported at the top of this file — nothing is defined locally anymore.
+# ═══════════════════════════════════════════
 
 # ═══════════════════════════════════════════
 #  Main
@@ -2323,6 +2843,15 @@ def get_axis_params(params: dict, name: str) -> Tuple[float, float, float, float
     mr  = params.get(f"MAX_{up}_RATE", 10.0)
     return akp, aki, ail, ma, rkp, rkd, mr
 
+def yaw_rate_max_mr(params: dict) -> float:
+    """MR yaw angle-loop rate clamp — mirrors control.c DoQuaternionAttitudeControl:
+    rate demand is capped at min(A[Yaw].R.Max, Nav.MaxHeadingRate). The quaternion
+    attitude step/disturbance paths must clamp with the same bound, else yaw
+    authority is over-estimated (MaxYawRate is typically 2x MaxHeadingRate)."""
+    vals = [v for v in (params.get("MAX_YAW_RATE"), params.get("MAX_HEADING_RATE"))
+            if v is not None and v > 0.0]
+    return min(vals) if vals else 10.0
+
 def check_cascade_integrity(params: dict) -> Tuple[bool, List[str]]:
     """Validate the quaternion attitude cascade against max-commanded-rate caps
     (mirrors control.c DoQuaternionAttitudeControl / the GCS tuning caveats).
@@ -2405,8 +2934,10 @@ def run_tests_for_af(af_filename: str, slider_pct: float = None) -> Tuple[bool, 
     except Exception as e:
         return False, [f"Error loading {af_filename}: {e}"]
 
+    cat = AF_CATEGORY[af_type]
+
     if slider_pct is not None:
-        params = apply_slider(params, slider_pct)
+        params = apply_slider(params, slider_pct, cat=cat)
 
     af_name = AIRFRAME_NAMES.get(af_type, af_type.name)
     model_lbl = af_type.name
@@ -2458,7 +2989,9 @@ def run_tests_for_af(af_filename: str, slider_pct: float = None) -> Tuple[bool, 
                 all_pass = all_pass and True
                 continue
             gusts = {name: Gust(GUST_MAG[name], 2.0, 0.5, name) for name in axes}
-            coupled_metrics = simulate_axis_coupled(af_filename, step_axis=step_ax, gusts=gusts, step_rads=fw_step_rads)
+            coupled_metrics = simulate_axis_coupled(af_filename, step_axis=step_ax,
+                                                    gusts=gusts, step_rads=fw_step_rads,
+                                                    params_override=params)
             for name in axes:
                 if name == step_ax:
                     crit = FW_CRITERIA[name]
@@ -2471,6 +3004,8 @@ def run_tests_for_af(af_filename: str, slider_pct: float = None) -> Tuple[bool, 
     else:
         for name in axes:
             akp, aki, ail, ma, rkp, rkd, mr = get_axis_params(params, name)
+            if name == "Yaw":
+                mr = yaw_rate_max_mr(params)
             pi = PIStruct(Kp=akp, Ki=aki, IntLim=ail, Max=ma)
             pid = PIDStruct(Kp=rkp, Kd=rkd, Max=mr)
             crit = CRITERIA[name]
@@ -2496,6 +3031,8 @@ def run_tests_for_af(af_filename: str, slider_pct: float = None) -> Tuple[bool, 
 
     for name in axes:
         akp, aki, ail, ma, rkp, rkd, mr = get_axis_params(params, name)
+        if name == "Yaw" and not is_fw:
+            mr = yaw_rate_max_mr(params)
         pid = PIDStruct(Kp=rkp, Kd=rkd, Max=mr)
         gust = Gust(GUST_MAG[name], 2.0, 0.5, name)
 
@@ -2572,10 +3109,27 @@ def run_tests_for_af(af_filename: str, slider_pct: float = None) -> Tuple[bool, 
         ff_lines = format_freeflight(ff_metrics, af_filename)
         all_output.extend(ff_lines)
 
+        # Lateral-directional mode analysis (Dutch roll / spiral recovery)
+        lm = analyze_lateral_modes(af_filename)
+        lm_lines = format_lateral_modes(lm, af_filename)
+        all_output.extend(lm_lines)
+        if not (lm.dutch_roll_ok and lm.spiral_ok):
+            all_pass = False
+
     return all_pass, all_output
 
 
 def main():
+    # Process-step battery (foci 5/6): python3 src/tests/test_pid_sim.py process <af>
+    if len(sys.argv) > 2 and sys.argv[1] == "process":
+        af_filename = sys.argv[2]
+        if not af_filename.endswith('.af'):
+            af_filename += '.af'
+        pass_ok, output = run_process_steps(af_filename)
+        for l in output:
+            print(l)
+        sys.exit(0 if pass_ok else 1)
+
     if len(sys.argv) > 1:
         # Single airframe specified
         af_filename = sys.argv[1]

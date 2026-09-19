@@ -11,11 +11,28 @@ from PyQt5.QtGui import *
 from protocol_enums import FlightState, NavState
 
 
+class _WrappedLabel(QLabel):
+    """QLabel whose sizeHint reflects the actual wrapped-text height."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        w = self.width() if self.width() > 0 else 200
+        rect = fm.boundingRect(0, 0, w, 10000,
+                               Qt.TextWordWrap, self.text())
+        return QSize(rect.width() + 8, rect.height() + 4)
+
+
 _TAG_NAMES = {
     15: "Stats", 21: "Mission", 50: "Request", 52: "Misc", 53: "Unused",
     54: "BB", 55: "Unused", 56: "Unused", 57: "Tuning", 58: "Unused",
     59: "Guidance", 60: "Unused", 61: "Unused", 64: "Wind", 65: "Unused",
     67: "ExecTime", 68: "Unused", 73: "TestReq", 74: "TestRsp",
+    76: "I2CErrors",
 }
 
 # Test selector entries: (label, test_id). testId matches FC tests.h TEST_ID_*.
@@ -163,21 +180,34 @@ class MiscWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeToContents)
         layout.addWidget(self.table)
 
         self._tag_row: dict[int, int] = {}
         self._populate_placeholders()
 
+    @staticmethod
+    def _fields_label(text="", color="#000"):
+        lbl = _WrappedLabel(text)
+        lbl.setStyleSheet(f"color: {color};")
+        return lbl
+
     def _populate_placeholders(self):
         for tag in sorted(_TAG_NAMES):
+            if _TAG_NAMES[tag] == "Unused":
+                continue
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem("—"))
             tag_name = _TAG_NAMES[tag]
             self.table.setItem(row, 1, QTableWidgetItem(f"R {tag_name}"))
-            item = QTableWidgetItem("(waiting)")
-            item.setForeground(QColor("#999"))
-            self.table.setItem(row, 2, item)
+            self.table.setCellWidget(row, 2,
+                                     self._fields_label("(waiting)", "#999"))
             self._tag_row[tag] = row
 
     def add_packet(self, tag: int, data: Any, direction: str):
@@ -194,15 +224,17 @@ class MiscWindow(QMainWindow):
             row = self._tag_row[tag]
             self.table.item(row, 0).setText(ts)
             self.table.item(row, 1).setText(header)
-            self.table.item(row, 2).setText(fields)
-            self.table.item(row, 2).setForeground(QColor("#000"))
+            lbl = self.table.cellWidget(row, 2)
+            if lbl:
+                lbl.setText(fields)
+                lbl.setStyleSheet("color: #000;")
         else:
             self.table.insertRow(0)
             if self.table.rowCount() > self.MAX_ROWS:
                 self.table.removeRow(self.table.rowCount() - 1)
             self.table.setItem(0, 0, QTableWidgetItem(ts))
             self.table.setItem(0, 1, QTableWidgetItem(header))
-            self.table.setItem(0, 2, QTableWidgetItem(fields))
+            self.table.setCellWidget(0, 2, self._fields_label(fields))
 
     # ------------------------------------------------------------------
     # Diagnostic test control

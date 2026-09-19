@@ -20,11 +20,11 @@ class Waypoint:
     index: int = 0
     lat: float = 0.0
     lon: float = 0.0
-    alt: int = 0
+    alt: float = 0.0
     velocity: float = 0.0
-    loiter: int = 0
-    orbit_radius: int = 0
-    orbit_alt: int = 0
+    loiter: float = 0.0
+    orbit_radius: float = 0.0
+    orbit_alt: float = 0.0
     orbit_velocity: float = 0.0
     pulse_width: int = 0
     pulse_period: int = 0

@@ -97,6 +97,13 @@ def extract_real32(data: bytes, offset: int) -> float:
     return struct.unpack('<f', data[offset:offset+4])[0]
 
 
+def extract_half(data: bytes, offset: int) -> float:
+    """Extract IEEE-754 binary16 (half) little-endian, widened to float"""
+    if len(data) < offset + 2:
+        return 0.0
+    return struct.unpack('<e', data[offset:offset+2])[0]
+
+
 # Scaling constants - from telem.c
 RAD_TO_DEG = 57.29578  # FC-native angles are radians
 RATE_GYRO_SCALE = 0.001064225154  # raw gyro counts -> rad/s (2048 LSB/(deg/s))
@@ -123,7 +130,6 @@ class FlightData:
     battery_current: float = 0.0
     battery_charge: float = 0.0
     battery_time_remaining_sec: int = 0
-    rc_glitches: int = 0
     q0: float = 1.0
     q1: float = 0.0
     q2: float = 0.0
@@ -185,6 +191,7 @@ class FlightData:
     pwm: List[int] = field(default_factory=list)
     rc_raw: List[int] = field(default_factory=list)
     rc_channels: List[int] = field(default_factory=list)
+    discovered_channels: int = 0
     pwm_diag: List[int] = field(default_factory=list)
     motors_and_servos: int = 0
     tilt_ff_comp: float = 0.0
@@ -197,7 +204,6 @@ class FlightData:
     mpu_temp: float = 0.0
     mission_time: float = 0.0
     airframe_type: int = 0
-    fw_rate_energy: float = 0.0
     fw_glide_offset: float = 0.0
     baro_variance: float = 0.0
     accu_variance: float = 0.0
@@ -308,8 +314,8 @@ class OriginData:
     """Origin packet data (Tag=19)"""
     num_waypoints: int = 0
     max_velocity: float = 0.0
-    fence_radius: int = 0
-    home_altitude: int = 0
+    fence_radius: float = 0.0  # m (was int16 m)
+    home_altitude: float = 0.0  # m (was int16 m)
     home_lat: int = 0
     home_lon: int = 0
 
@@ -328,9 +334,10 @@ class GuidanceData:
 @dataclass
 @dataclass
 class TuningData:
-    """Minimal tuning telemetry (Tag=57) - from telem.c SendTuningPacket()
-    Body: flags(1) + thr(1) + 3 axes×6 = 22 bytes
-    """
+    """Tuning telemetry (Tag=57) - from telem.c SendTuningPacket()
+    Body: flags(1) + thr(1) + 3 axes×3×f32(36) + ident block 3×(4×f32+u32)(60) = 98
+    Rates in rad/s; axis output in native mixer units.
+    Ident fields (Roll/Pitch/Yaw order): a, b (ARX params), sigA, sigB (variance), n (samples)."""
     flags: int = 0
     throttle_pct: float = 0.0
     rate_desired_roll: float = 0.0
@@ -342,6 +349,22 @@ class TuningData:
     rate_desired_yaw: float = 0.0
     rate_actual_yaw: float = 0.0
     out_yaw: float = 0.0
+    ident_a_roll: float = 0.0
+    ident_b_roll: float = 0.0
+    ident_sig_a_roll: float = 0.0
+    ident_sig_b_roll: float = 0.0
+    ident_n_roll: int = 0
+    ident_a_pitch: float = 0.0
+    ident_b_pitch: float = 0.0
+    ident_sig_a_pitch: float = 0.0
+    ident_sig_b_pitch: float = 0.0
+    ident_n_pitch: int = 0
+    ident_a_yaw: float = 0.0
+    ident_b_yaw: float = 0.0
+    ident_sig_a_yaw: float = 0.0
+    ident_sig_b_yaw: float = 0.0
+    ident_n_yaw: int = 0
+    has_ident: bool = False
 
     @property
     def armed(self) -> bool:
@@ -400,32 +423,33 @@ class WindData:
 
 def parse_flight_packet(data: bytes, voltage_trim: float = 1.0) -> Optional[FlightData]:
     """
-    Parse UAVXFlightPacket (Tag=13)
-    Based on telem.c SendFlightPacket() — all analog values raw float32.
-    Byte layout:
-      [0-11]  Flags (12)
-      [12]    State
-      [13-16] BatteryVolts f32   [17-20] BatteryCurrent f32
-      [21-22] mAH i16            [23-24] TimeRemaining i16  [25-26] Glitches i16
-      [27-30] DesiredThrottle f32 (fraction)
-      ShowAttitude: q0-q3 (4x4=16) + Pitch/Roll/Yaw each 5 x f32 (20 B):
+    Parse UAVXFlightPacket (Tag=13) — f16 telemetry format
+    Based on telem.c SendFlightPacket(). Display-grade values ship as
+    IEEE-754 binary16 (extract_half), the filter estimates and pressure
+    keep f32 precision. Byte layout (body, all little-endian):
+      [0-11]    Flags (12)
+      [12]      State
+      [13-14] BatteryVolts f16   [15-16] BatteryCurrent f16
+      [17-18] mAH i16            [19-20] TimeRemaining i16
+      [21-22] DesiredThrottle f16 (fraction)
+      ShowAttitude: q0-q3 (4x2) + Pitch/Roll/Yaw each 5 x f16 (10 B):
         P.Desired, Angle(rad), Acc(m/s^2), R.Desired, Rate(rad/s)
-      [31-46] q0..q3
-      [47-66] pitch   [67-86] roll   [87-106] yaw
-      [107-110] ROC m/s          [111-114] Altitude m
-      [115-118] CruiseThr        [119-122] RF.Altitude m [123-126] DesiredAlt m
-      [127-130] Heading rad      [131-134] DesiredHeading rad
-      [135-138] TiltComp         [139-142] BattComp      [143-146] AltHoldComp
-      [147-150] AccConfidence f32 fraction 0..1
-      [151-154] BaroTemp C       [155-158] BaroPressure Pa
-      [159-162] KF.Altitude m    [163-166][167-170][171-174] KF variances
-      [175-178] MagHeading rad   [179-182] IMUTemp C
-      [183-186] RateEnergy fraction f32  [187-190] GlideOffsetRad f32
-      [191]    NavState
-      [192]    CurrMaxPWMOutputs, then RawPW[] f32 (normalized, 1.0=1000uS),
-               then drive balance f32 fraction, then mSClock(3)
+      [23-30] q0..q3
+      [31-40] pitch   [41-50] roll   [51-60] yaw
+      [61-62] ROC m/s             [63-64] Altitude m
+      [65-66] CruiseThr           [67-68] RF.Altitude m [69-70] DesiredAlt m
+      [71-72] Heading rad         [73-74] DesiredHeading rad
+      [75-76] TiltComp            [77-78] BattComp       [79-80] AltHoldComp
+      [81-82] AccConfidence f16 fraction 0..1
+      [83-84] BaroTemp C          [85-88] BaroPressure Pa f32
+      [89-92] KF.Altitude m f32   [93-96][97-100][101-104] KF variances f32
+      [105-106] MagHeading rad    [107-108] IMUTemp C
+      [109-110] RateEnergy slot (reserved, 0.0 since 2026-09-17)  [111-112] GlideOffsetRad f16
+      [113]    NavState
+      [114]    CurrMaxPWMOutputs, then RawPW[] f16 (normalized, 1.0=1000uS),
+               then drive balance[] f16 fraction, then mSClock(3)
     """
-    if len(data) < 193:
+    if len(data) < 115:
         return None
 
     f = FlightData()
@@ -439,85 +463,83 @@ def parse_flight_packet(data: bytes, voltage_trim: float = 1.0) -> Optional[Flig
 
     f.flight_state = extract_byte(data, 12)
 
-    f.battery_volts = extract_real32(data, 13) * voltage_trim
-    f.battery_current = extract_real32(data, 17)
-    f.battery_charge = extract_short(data, 21)
-    f.battery_time_remaining_sec = extract_short(data, 23)
-    f.rc_glitches = extract_short(data, 25)
+    f.battery_volts = extract_half(data, 13) * voltage_trim
+    f.battery_current = extract_half(data, 15)
+    f.battery_charge = extract_short(data, 17)
+    f.battery_time_remaining_sec = extract_short(data, 19)
 
-    f.desired_throttle = extract_real32(data, 27)
+    f.desired_throttle = extract_half(data, 21)
 
-    # Quaternion (body[31-46])
-    f.q0 = extract_real32(data, 31)
-    f.q1 = extract_real32(data, 35)
-    f.q2 = extract_real32(data, 39)
-    f.q3 = extract_real32(data, 43)
+    # Quaternion (body[23-30])
+    f.q0 = extract_half(data, 23)
+    f.q1 = extract_half(data, 25)
+    f.q2 = extract_half(data, 27)
+    f.q3 = extract_half(data, 29)
 
-    # Quaternion occupies 31..46; axis blocks follow at 47/67/87.
-    # All values arrive as raw float32 in FC-native units
+    # Quaternion occupies 23..30; axis blocks follow at 31/41/51.
+    # All values arrive as f16 in FC-native units
     # (radians, rad/s, m/s^2) - no scaling applied.
-    att = 47
-    f.desired_pitch = extract_real32(data, att)
-    f.angle_pitch = extract_real32(data, att + 4)
-    f.acc_fb = extract_real32(data, att + 8)
-    f.desired_rate_pitch = extract_real32(data, att + 12)
-    f.rate_pitch = extract_real32(data, att + 16)
+    att = 31
+    f.desired_pitch = extract_half(data, att)
+    f.angle_pitch = extract_half(data, att + 2)
+    f.acc_fb = extract_half(data, att + 4)
+    f.desired_rate_pitch = extract_half(data, att + 6)
+    f.rate_pitch = extract_half(data, att + 8)
 
-    f.desired_roll = extract_real32(data, att + 20)
-    f.angle_roll = extract_real32(data, att + 24)
-    f.acc_lr = extract_real32(data, att + 28)
-    f.desired_rate_roll = extract_real32(data, att + 32)
-    f.rate_roll = extract_real32(data, att + 36)
+    f.desired_roll = extract_half(data, att + 10)
+    f.angle_roll = extract_half(data, att + 12)
+    f.acc_lr = extract_half(data, att + 14)
+    f.desired_rate_roll = extract_half(data, att + 16)
+    f.rate_roll = extract_half(data, att + 18)
 
-    f.desired_yaw = extract_real32(data, att + 40)
-    f.angle_yaw = extract_real32(data, att + 44)
-    f.acc_du = extract_real32(data, att + 48)
-    f.desired_rate_yaw = extract_real32(data, att + 52)
-    f.rate_yaw = extract_real32(data, att + 56)
+    f.desired_yaw = extract_half(data, att + 20)
+    f.angle_yaw = extract_half(data, att + 22)
+    f.acc_du = extract_half(data, att + 24)
+    f.desired_rate_yaw = extract_half(data, att + 26)
+    f.rate_yaw = extract_half(data, att + 28)
 
-    f.roc = extract_real32(data, 107)
-    f.altitude = extract_real32(data, 111)
-    f.cruise_throttle = extract_real32(data, 115)
-    f.rangefinder_altitude = extract_real32(data, 119)
-    f.desired_altitude = extract_real32(data, 123)
+    f.roc = extract_half(data, 61)
+    f.altitude = extract_half(data, 63)
+    f.cruise_throttle = extract_half(data, 65)
+    f.rangefinder_altitude = extract_half(data, 67)
+    f.desired_altitude = extract_half(data, 69)
 
-    f.heading = extract_real32(data, 127)
-    f.desired_heading = extract_real32(data, 131)
+    f.heading = extract_half(data, 71)
+    f.desired_heading = extract_half(data, 73)
 
-    f.tilt_ff_comp = extract_real32(data, 135)
-    f.batt_ff_comp = extract_real32(data, 139)
-    f.alt_comp = extract_real32(data, 143)
+    f.tilt_ff_comp = extract_half(data, 75)
+    f.batt_ff_comp = extract_half(data, 77)
+    f.alt_comp = extract_half(data, 79)
 
-    f.acc_confidence = extract_real32(data, 147)  # fraction 0..1
+    f.acc_confidence = extract_half(data, 81)  # fraction 0..1
 
-    f.baro_temp = extract_real32(data, 151)
-    f.baro_pressure = extract_real32(data, 155) * 0.01  # Pa -> hPa
-    f.baro_altitude = extract_real32(data, 159)
-    f.baro_variance = extract_real32(data, 163)
-    f.accu_variance = extract_real32(data, 167)
-    f.accu_bias_variance = extract_real32(data, 171)
-    f.mag_heading = extract_real32(data, 175)
-    f.mpu_temp = extract_real32(data, 179)
+    f.baro_temp = extract_half(data, 83)
+    f.baro_pressure = extract_real32(data, 85) * 0.01  # Pa -> hPa
+    f.baro_altitude = extract_real32(data, 89)
+    f.baro_variance = extract_real32(data, 93)
+    f.accu_variance = extract_real32(data, 97)
+    f.accu_bias_variance = extract_real32(data, 101)
+    f.mag_heading = extract_half(data, 105)
+    f.mpu_temp = extract_half(data, 107)
 
-    f.fw_rate_energy = extract_real32(data, 183)  # fraction
-    f.fw_glide_offset = extract_real32(data, 187) * RAD_TO_DEG
+    f.fw_glide_offset = extract_half(data, 111) * RAD_TO_DEG
 
-    f.nav_state = extract_byte(data, 191)
+    f.nav_state = extract_byte(data, 113)
 
-    # Drive outputs (body[192+]) - RawPW normalized (1.0 == 1000uS),
-    # drive balance as a fraction of the fleet average
-    f.motors_and_servos = extract_byte(data, 192)
-    pwm_start = 193
+    # Drive outputs (body[114+]) - RawPW normalized (1.0 == 1000uS),
+    # drive balance as a fraction of the fleet average, both f16
+    f.motors_and_servos = extract_byte(data, 114)
+    pwm_start = 115
     for i in range(min(f.motors_and_servos, 10)):
-        if pwm_start + i * 4 + 3 < len(data):
-            f.pwm.append(extract_real32(data, pwm_start + i * 4))
+        if pwm_start + i * 2 + 1 < len(data):
+            f.pwm.append(extract_half(data, pwm_start + i * 2))
 
-    diag_start = pwm_start + f.motors_and_servos * 4
+    diag_start = pwm_start + f.motors_and_servos * 2
     for i in range(min(f.motors_and_servos, 10)):
-        if diag_start + i * 4 + 3 < len(data):
-            f.pwm_diag.append(extract_real32(data, diag_start + i * 4))
+        if diag_start + i * 2 + 1 < len(data):
+            f.pwm_diag.append(extract_half(data, diag_start + i * 2))
 
-    time_start = diag_start + f.motors_and_servos * 4
+    time_start = diag_start + f.motors_and_servos * 2
     if time_start + 2 < len(data):
         f.mission_time = extract_int24(data, time_start)
 
@@ -576,7 +598,7 @@ def parse_nav_packet(data: bytes) -> Optional[FlightData]:
 
     dT_s = extract_real32(data, 60)
     f.gps_update_rate = 1.0 / dT_s if dT_s > 0 else 0.0
-    f.gps_type = extract_byte(data, 69)
+    f.gps_type = extract_byte(data, 68)
 
     # Correction terms arrive in radians; the yaw P error is published in
     # degrees for the tuning view (legacy behaviour, now actually correct).
@@ -626,29 +648,52 @@ def parse_param_packet(data: bytes) -> Optional[ParameterData]:
 
 def parse_rc_packet(data: bytes) -> Optional[FlightData]:
     """Parse UAVXRCChannelsPacket (Tag=22)
-    Body: frameInterval(2) + numChannels(1) + N channels f32 each
-    Firmware RC[] is zero-referenced at idle: 0.0 == 1000uS,
-    0.5 == 1500uS (neutral), 1.0 == 2000uS. Convert to uS here
-    for the rest of the GCS.
+    Body: frameInterval(2) + discovered(1) + flags(1) + controls u16 uS x 4
+    (THR/ROL/PIT/YAW mapped slots) + physical RCInp[] u16 uS x discovered.
+    Older bodies are handled by length:
+      - 2026-09 format: interval(2)+discovered(1)+flags(1)+logical f32 x 12
+        + physical u16 x discovered
+      - original: interval(2)+discovered(1)+RC[] f32 x N
+    Physical RCInp[] are raw uS as received.
     """
     if len(data) < 5:
-        return None
-
-    # Parse as many 4-byte channel values as the body contains (after 3-byte header)
-    num_channels = (len(data) - 3) // 4
-    if num_channels < 1:
         return None
 
     f = FlightData()
     f.rc_channels = []
     f.rc_raw = []
+    f.discovered_channels = extract_byte(data, 2)
+    f.rc_flags = 0
+    f.rc_physical = []
 
-    for i in range(num_channels):
-        offset = 3 + i * 4
-        frac = extract_real32(data, offset)
-        us_value = round((frac + 1.0) * 1000.0)
-        f.rc_channels.append(us_value)
-        f.rc_raw.append(us_value)
+    new_len = 4 + 4 * 2 + 2 * f.discovered_channels
+    prev_len = 4 + 12 * 4 + 2 * f.discovered_channels
+    if f.discovered_channels >= 1 and len(data) == new_len:
+        f.rc_flags = extract_byte(data, 3)
+        f.rc_channels = [max(0, extract_short(data, 4 + 2 * i)) for i in range(4)]
+        base = 4 + 4 * 2
+        for i in range(f.discovered_channels):
+            f.rc_physical.append(extract_short(data, base + i * 2))
+        f.rc_raw = list(f.rc_physical)
+    elif f.discovered_channels >= 1 and len(data) == prev_len:
+        f.rc_flags = extract_byte(data, 3)
+        logical = [extract_real32(data, 4 + i * 4) for i in range(12)]
+        base = 4 + 12 * 4
+        for i in range(f.discovered_channels):
+            f.rc_physical.append(extract_short(data, base + i * 2))
+        f.rc_channels = [round((frac + 1.0) * 1000.0) for frac in logical]
+        f.rc_raw = list(f.rc_channels)
+    else:
+        # Legacy: logical-only f32, no flags, no physical channels
+        num_channels = (len(data) - 3) // 4
+        if num_channels < 1:
+            return None
+        logical = [extract_real32(data, 3 + i * 4) for i in range(num_channels)]
+        f.rc_channels = [round((frac + 1.0) * 1000.0) for frac in logical]
+        f.rc_raw = list(f.rc_channels)
+
+    if not f.rc_physical:
+        f.rc_physical = list(f.rc_channels)
 
     return f
 
@@ -839,26 +884,26 @@ def parse_ack_packet(data: bytes) -> Optional[dict]:
 
 def parse_waypoint_packet(data: bytes) -> Optional[dict]:
     """Parse UAVXWPPacket (Tag=20) - from telem.c SendWPPacket()
-    Body: wpIdx(1) + lat(4) + lon(4) + alt(2) + vel(4, float32 m/s) + loiter(2)
-          + orbitRadius(2) + orbitAlt(2) + orbitVel(4, float32 m/s) + pulseWidth(4)
-          + pulsePeriod(4) + action(1) = 34 bytes
+    Body: wpIdx(1) + lat(4) + lon(4) + alt(4, float32 m) + vel(4, float32 m/s) + loiter(4, float32 s)
+          + orbitRadius(4, float32 m) + orbitAlt(4, float32 m) + orbitVel(4, float32 m/s) + pulseWidth(4)
+          + pulsePeriod(4) + action(1) = 42 bytes
     """
-    if len(data) < 34:
+    if len(data) < 42:
         return None
     
     result = {
         'wp_index': extract_byte(data, 0),
         'wp_lat': extract_signed_int32(data, 1) * SCALE_GPS_LATLON,
         'wp_lon': extract_signed_int32(data, 5) * SCALE_GPS_LATLON,
-        'wp_alt': extract_short(data, 9),
-        'wp_velocity': extract_float32(data, 11),        # m/s
-        'wp_loiter': extract_short(data, 15),  # seconds
-        'wp_orbit_radius': extract_short(data, 17),
-        'wp_orbit_alt': extract_short(data, 19),
-        'wp_orbit_velocity': extract_float32(data, 21),  # m/s
-        'wp_pulse_width': extract_int32(data, 25),  # mS
-        'wp_pulse_period': extract_int32(data, 29),  # mS
-        'wp_action': extract_byte(data, 33),
+        'wp_alt': extract_float32(data, 9),        # m
+        'wp_velocity': extract_float32(data, 13),  # m/s
+        'wp_loiter': extract_float32(data, 17),    # s
+        'wp_orbit_radius': extract_float32(data, 21),  # m
+        'wp_orbit_alt': extract_float32(data, 25), # m
+        'wp_orbit_velocity': extract_float32(data, 29),  # m/s
+        'wp_pulse_width': extract_int32(data, 33), # mS
+        'wp_pulse_period': extract_int32(data, 37),  # mS
+        'wp_action': extract_byte(data, 41),
     }
     
     return result
@@ -926,6 +971,7 @@ def parse_execution_time(data: bytes) -> Optional[ExecTimeData]:
 def parse_tuning_packet(data: bytes) -> Optional[TuningData]:
     """Parse UAVXTuningPacket (Tag=57) - from telem.c SendTuningPacket()
     Body: flags(1) + thrByte(1) + 3 axes x (desired, actual, out) f32 = 38
+          + ident block 3 axes x (a,b,sigA,sigB f32 + n u32) = 60  [v2]
     Rates in rad/s; axis output in native mixer units."""
     if len(data) < 38:
         return None
@@ -942,15 +988,35 @@ def parse_tuning_packet(data: bytes) -> Optional[TuningData]:
     t.rate_desired_yaw = extract_real32(data, off);     off += 4
     t.rate_actual_yaw = extract_real32(data, off);      off += 4
     t.out_yaw = extract_real32(data, off);              off += 4
+
+    # v2 identify block: Roll, Pitch, Yaw order (same as gain block).
+    if len(data) >= off + 60:
+        t.has_ident = True
+        t.ident_a_roll = extract_real32(data, off);        off += 4
+        t.ident_b_roll = extract_real32(data, off);        off += 4
+        t.ident_sig_a_roll = extract_real32(data, off);    off += 4
+        t.ident_sig_b_roll = extract_real32(data, off);    off += 4
+        t.ident_n_roll = extract_int32(data, off);          off += 4
+        t.ident_a_pitch = extract_real32(data, off);       off += 4
+        t.ident_b_pitch = extract_real32(data, off);       off += 4
+        t.ident_sig_a_pitch = extract_real32(data, off);   off += 4
+        t.ident_sig_b_pitch = extract_real32(data, off);   off += 4
+        t.ident_n_pitch = extract_int32(data, off);         off += 4
+        t.ident_a_yaw = extract_real32(data, off);         off += 4
+        t.ident_b_yaw = extract_real32(data, off);         off += 4
+        t.ident_sig_a_yaw = extract_real32(data, off);     off += 4
+        t.ident_sig_b_yaw = extract_real32(data, off);     off += 4
+        t.ident_n_yaw = extract_int32(data, off);           off += 4
+
     return t
 
 def parse_calibration_packet(data: bytes) -> Optional[dict]:
     """Parse UAVXCalibrationPacket (Tag=62) - from telem.c SendCalibrationPacket()
-    Body: flags(12) + refTemp f32(4) + orientation(3)
+    Body: flags(12) + refTemp f32(4) + orientation(2)
           + 3 axes x (grad,rbias,accScale,accBias f32(16) + magLive i16(2)
           + magBias f32(4) = 22)
           + LPFs i16x5(10) + population i16x8(16) + mm i32(4) + ids(2)
-    = 117 bytes
+          + mag config regs A/B/MODE u8(3) = 119 bytes
 
     Cal values arrive as raw float32 in FC-native units:
       rate grads/biases in raw gyro counts (apply RATE_GYRO_SCALE),
@@ -958,7 +1024,7 @@ def parse_calibration_packet(data: bytes) -> Optional[dict]:
     Live mag reads stay int16 counts. Orientation = imuQuadrant/imuFlip/
     magQuadrant currently flashed on the FC.
     """
-    if len(data) < 117:
+    if len(data) < 116:
         return None
 
     result = {
@@ -972,12 +1038,11 @@ def parse_calibration_packet(data: bytes) -> Optional[dict]:
         'mag_bias': [],
     }
 
-    # Currently-flashed sensor orientation @16..18
-    result['imu_quadrant'] = data[16] & 0x03
-    result['imu_flip'] = bool(data[17] & 0x01)
-    result['mag_quadrant'] = data[18] & 0x03
+    # Currently-flashed sensor orientation @16..17
+    result['sensor_quadrant'] = data[16] & 0x03
+    result['sensor_flip'] = bool(data[17] & 0x01)
 
-    off = 19
+    off = 18
     for _ in range(3):
         result['rate_temp_grad'].append(extract_real32(data, off))
         result['rate_bias'].append(extract_real32(data, off + 4))
@@ -988,14 +1053,24 @@ def parse_calibration_packet(data: bytes) -> Optional[dict]:
         off += 22
 
     # LPF bandwidths (5 x i16) - informational only
-    result['lpf'] = [extract_short(data, 85 + 2 * i) for i in range(5)]
+    result['lpf'] = [extract_short(data, 84 + 2 * i) for i in range(5)]
 
     # Mag calibration octant population counts and total
-    result['octants'] = [extract_short(data, 95 + 2 * i) for i in range(8)]
-    result['mm'] = extract_int32(data, 111)
+    result['octants'] = [extract_short(data, 94 + 2 * i) for i in range(8)]
+    result['mm'] = extract_int32(data, 110)
 
-    result['imu_id'] = data[115]
-    result['mag_id'] = data[116]
+    result['imu_id'] = data[114]
+    result['mag_id'] = data[115]
+
+    # Optional trailing mag config registers (FC snapshot at init)
+    if len(data) >= 119:
+        result['mag_cfg_a'] = data[116]
+        result['mag_cfg_b'] = data[117]
+        result['mag_mode'] = data[118]
+    else:
+        result['mag_cfg_a'] = None
+        result['mag_cfg_b'] = None
+        result['mag_mode'] = None
 
     return result
 
@@ -1042,18 +1117,19 @@ def parse_origin_packet(data: bytes) -> Optional[OriginData]:
     """
     Parse UAVXOriginPacket (Tag=19)
     Based on telem.c SendOriginPacket()
-    Body: numWP(1) + maxVel(1) + fenceRadius(2) + homeAlt(2) + homeLat(4) + homeLon(4) = 14 bytes
+    Body: numWP(1) + maxVel(1) + fenceRadius(4, float32) + homeAlt(4, float32)
+          + homeLat(4) + homeLon(4) = 18 bytes
     """
-    if len(data) < 14:
+    if len(data) < 18:
         return None
     
     o = OriginData()
     o.num_waypoints = extract_byte(data, 0)
     o.max_velocity = extract_byte(data, 1) * 0.1
-    o.fence_radius = extract_short(data, 2)
-    o.home_altitude = extract_short(data, 4)
-    o.home_lat = extract_signed_int32(data, 6)
-    o.home_lon = extract_signed_int32(data, 10)
+    o.fence_radius = extract_float32(data, 2)
+    o.home_altitude = extract_float32(data, 6)
+    o.home_lat = extract_signed_int32(data, 10)
+    o.home_lon = extract_signed_int32(data, 14)
     
     return o
 

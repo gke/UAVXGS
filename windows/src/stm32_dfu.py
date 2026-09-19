@@ -367,6 +367,14 @@ class DfuDevice:
         """Read memory at current address pointer. Returns data or raises."""
         if not self.set_address(addr):
             raise RuntimeError(f"Set address failed (read @ 0x{addr:08X})")
+        # The STM32 ROM bootloader settles in dfuDNLOAD_IDLE after the Set
+        # Address Pointer command, but DFU_UPLOAD is only valid from
+        # dfuIDLE/dfuUPLOAD_IDLE - issuing UPLOAD from dnload-idle STALLs the
+        # first read (EPIPE). Abort back to IDLE first (writes are unaffected:
+        # continuing DNLOAD from dnload-idle is legal, which is why flashing
+        # always worked while config reads failed).
+        if not self._wait_idle(2000):
+            raise RuntimeError(f"Device did not return to IDLE before read @ 0x{addr:08X}")
 
         result = bytearray()
         remaining = length
@@ -379,6 +387,11 @@ class DfuDevice:
             block_num += 1
             if len(raw) == 0:
                 break
+        # Reads complete with the device in dfuUPLOAD_IDLE; a subsequent DNLOAD
+        # (erase/write) is illegal from that state, so return to IDLE before
+        # handing back. Mirrors the pre-read _wait_idle above.
+        if not self._wait_idle(2000):
+            raise RuntimeError(f"Device did not return to IDLE after read @ 0x{addr:08X}")
         return bytes(result)
 
     def write_block(self, addr: int, data: bytes) -> bool:
@@ -437,6 +450,10 @@ class DfuDevice:
         total = len(data)
         if total == 0:
             return True
+        # A prior read leaves the device in dfuUPLOAD_IDLE; DNLOAD (erase/write)
+        # is illegal from that state, so return to IDLE first.
+        if not self._wait_idle(2000):
+            raise RuntimeError(f"Device did not return to IDLE before write @ 0x{addr:08X}")
         page = addr & ~(SECTOR_SIZE - 1)
         end = (addr + total + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1)
         while page < end:
@@ -650,20 +667,34 @@ def flash_firmware(bin_path: str, progress_cb=None, flash_base: int = 0x08000000
                              f"{', '.join('st=%d,pt=%d,state=%d' % s for s in dfu.last_states[-5:])})"
                 return f"Failed to get DFU device into idle state{detail}"
 
-        # Step 1: Save config sector (Sector 1, 0x08004000, 16 KB)
+        # Step 1: Save config sector (Sector 1, 0x08004000, 16 KB).
+        # The save read must NEVER fail silently: for full-flash targets
+        # (flash_base 0x08000000) the config sector lies INSIDE the flashed
+        # image range and the image carries zeros there, so a flash without a
+        # verified save would wipe every stored param and the cal. A failed
+        # read is therefore surfaced as an abort; only a genuinely blank
+        # (all-0xFF) sector counts as "no config to restore".
         if progress_cb:
             progress_cb(5, 100, "Saving config sector...")
         config_data = b""
+        config_read_error = ""
         try:
             config_data = dfu.read_memory(CONFIG_ADDR, CONFIG_SIZE)
-        except (OSError, RuntimeError):
-            pass  # first flash or blank — ignore
-        have_config = len(config_data) > 0 and any(b != 0xFF for b in config_data)
+        except (OSError, RuntimeError) as e:
+            config_read_error = str(e)
         # Only preserve the config sector when it lies OUTSIDE the firmware
         # region. For boards whose app starts at 0x08004000 (e.g. SpeedyBee/iNav,
         # which keep their bootloader in sector 0), the firmware overlaps the
         # config sector, so preserving/restoring it would corrupt the firmware.
         preserve_config = flash_base < CONFIG_ADDR
+        if config_read_error:
+            if preserve_config:
+                return (f"Config save FAILED: could not read sector 1 "
+                        f"@ 0x{CONFIG_ADDR:08X} ({config_read_error}). "
+                        f"Not flashing - the image would overwrite the config "
+                        f"sector. Fix the read or clear it, then retry.")
+            config_read_error = ""
+        have_config = len(config_data) > 0 and any(b != 0xFF for b in config_data)
         if not preserve_config:
             have_config = False
 
@@ -688,6 +719,21 @@ def flash_firmware(bin_path: str, progress_cb=None, flash_base: int = 0x08000000
             if not dfu._write_blocks(CONFIG_ADDR, config_data):
                 return (f"Config restore failed: "
                         f"{dfu.last_transfer_error or 'DFU download error'}")
+            # Write-confirmation: read the sector back and compare byte-for-byte.
+            # Without this, a silent read failure on the save path or a partial
+            # restore looks identical to a successful one (mirrors the FC side
+            # IsArmFlashValid / RefreshConfig verified-truth model).
+            try:
+                verify = dfu.read_memory(CONFIG_ADDR, CONFIG_SIZE)
+            except (OSError, RuntimeError) as e:
+                return (f"Config restore NOT confirmed: read-back "
+                        f"@ 0x{CONFIG_ADDR:08X} failed ({e}). Re-flash and verify "
+                        f"params with the GCS before flying.")
+            if verify != config_data:
+                ndiff = sum(1 for a, b in zip(verify, config_data) if a != b)
+                return (f"Config restore NOT confirmed: read-back @ 0x{CONFIG_ADDR:08X} "
+                        f"differs in {ndiff} bytes. Re-flash and verify params with "
+                        f"the GCS before flying.")
         else:
             if progress_cb:
                 progress_cb(85, 100, "No config to restore")

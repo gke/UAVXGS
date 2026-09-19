@@ -31,6 +31,19 @@ AIRFRAMES_DIR = os.path.join(os.path.dirname(__file__))
 
 LINE_RE = re.compile(r'^\s*(\w+)\s*=\s*(.+?)\s*$')
 
+# Transitional bridge for .af files saved under the pre-rename 128-param
+# schema: params moved out of the param block into the FC Config struct were
+# renamed to UNUSED_NN. Their values are still meaningful in old files (e.g.
+# the sim cruise baseline), so map the old names forward instead of dropping
+# them. Pass-through only — a re-save writes them under the UNUSED_NN names.
+_LEGACY_PARAM_NAME_TO_TAG = {
+    'EST_CRUISE_THR': 19,       # → Unused20 (FC Config.CruiseThrottleFF)
+    'KF_ACC_U_BIAS_VAR': 72,    # → Unused73
+    'KF_BARO_VAR': 110,         # → Unused111
+    'KF_ACC_U_VAR': 111,        # → Unused112
+    'FW_ROLL_CONTROL_PITCH_LIMIT': 113,  # → Unused114 (Euler-era FW roll guard)
+}
+
 
 
 ENUM_MAP: Dict[str, type] = {
@@ -121,15 +134,16 @@ _LEGACY_ENUM_TOKENS = {
                           'PT1FILT': 'eF1', 'IMU_FILT_3': 'eF2', 'IMU_FILT_4': 'eF3',
                           'IMU_FILT_5': 'eF4'},
         'Config1Bits': {'USE_INVERT_MAG': 'eUseInvertMag', 'USE_RTH_DESCEND': 'eUseRTHDescend',
-                        'DISABLE_LEDS_IN_FLIGHT': 'eDisableLEDsInFlight',
+                        'DISABLE_LEDS_IN_FLIGHT': 'eUsingMag',
+                        'USE_MAG': 'eUsingMag',
                         'EMULATION_ENABLE': 'eEmulationEnable',
                         'USE_ALT_HOLD_ALARM': 'eUseAltHoldAlarm',
                         'USE_OFFSET_HOME': 'eUseOffsetHome',
-                        'USE_RAPID_DESCENT': 'eUseRapidDescent',
+                        'TEST_MISSION': 'eTestMission',
                         'ENFORCE_DRIVE_SYMMETRY': 'eEnforceDriveSymmetry'},
         'Config2Bits': {'USE_BATTERY_COMP': 'eUseBatteryComp', 'USE_FAST_START': 'eUseFastStart',
-                        'USE_ESC_PROG': 'eUseESCProg', 'USE_BLHELI': 'eUseESCProg', 'USE_HAVE_GPS': 'eUseGPS',
-                        'USE_PROP_SENSE': 'eUsePropSense', 'USE_TURN_TO_WP': 'eUseTurnToWP',
+                        'USE_ESC_PROG': 'eUnused2_2', 'USE_BLHELI': 'eUnused2_2', 'USE_HAVE_GPS': 'eUseGPS',
+                        'USE_PROP_SENSE': 'ePropsInwards', 'USE_TURN_TO_WP': 'eUseTurnToWP',
                         'USE_NAV_BEEP': 'eUseNavBeep'},
         'FailsafeAction': {'FS_RTH': 'eFsRth', 'FS_Land': 'eFsLand',
                            'FS_MOTORS_OFF': 'eFsMotorsOff'},
@@ -270,7 +284,7 @@ def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
         try:
             tag = ParamIndex[param_name].value
         except KeyError:
-            pass
+            tag = _LEGACY_PARAM_NAME_TO_TAG.get(param_name)
         if tag is None:
             continue
         if in_limits:
@@ -343,29 +357,45 @@ def format_af(name: str, values: Dict[int, float], metadata: Dict[str, Any] = No
     return '\n'.join(lines)
 
 
-def _raw_float_for_display(tag: int, display_val: float) -> float:
-    """Convert GCS display value to raw float for .af storage / FC write."""
-    mult = PARAM_DISPLAY_MULT.get(tag, 1.0)
+def _raw_float_for_display(tag: int, display_val: float,
+                           mult: Optional[float] = None) -> float:
+    """Convert GCS display value to raw float for .af storage / FC write.
+
+    `mult` is the effective display multiplier (mode-aware: the UI passes
+    the legacy `1/scale` in Legacy mode, else `PARAM_DISPLAY_MULT`). A
+    legacy-scaled spinbox value MUST be rescaled by its mode multiplier
+    before any write — these functions never assume raw == display.
+    """
+    if mult is None:
+        mult = PARAM_DISPLAY_MULT.get(tag, 1.0)
     return display_val / mult
 
 
-def _display_for_raw_float(tag: int, raw_val: float) -> float:
+def _display_for_raw_float(tag: int, raw_val: float,
+                           mult: Optional[float] = None) -> float:
     """Convert raw float to GCS display value."""
-    mult = PARAM_DISPLAY_MULT.get(tag, 1.0)
+    if mult is None:
+        mult = PARAM_DISPLAY_MULT.get(tag, 1.0)
     return raw_val * mult
 
 
 def export_af_from_widgets(name: str, params: Dict[int, object],
-                           limits: Dict[int, Tuple[float, float]] = None) -> str:
+                           limits: Dict[int, Tuple[float, float]] = None,
+                           mult_fn=None) -> str:
     """Export current widget values as .af text.
 
     Optional `limits` {tag: (lo, hi)} raw is emitted as a [LIMITS] block.
+    `mult_fn(tag) -> float` returns the effective display multiplier
+    (mode-aware). If omitted, plain PARAM_DISPLAY_MULT is used — callers in
+    Legacy mode MUST pass the legacy `1/scale` mapping or the exported
+    values will be legacy-scaled raw, not raw.
     """
     from parameter_window import QDoubleSpinBox, QComboBox
     raw_values: Dict[int, float] = {}
     for tag, widget in params.items():
         if isinstance(widget, QDoubleSpinBox):
-            raw = _raw_float_for_display(tag, widget.value())
+            mult = mult_fn(tag) if mult_fn else PARAM_DISPLAY_MULT.get(tag, 1.0)
+            raw = _raw_float_for_display(tag, widget.value(), mult)
             raw_values[tag] = raw
         elif isinstance(widget, QComboBox):
             # Reverse-resolve display name → enum value for alphabetically-sorted combos
@@ -385,7 +415,8 @@ def export_af_from_widgets(name: str, params: Dict[int, object],
     return format_af(name, raw_values, metadata={'LIMITS': limits} if limits else None)
 
 
-def import_to_widgets(name: str, af_text: str, params: Dict[int, object]) -> str:
+def import_to_widgets(name: str, af_text: str, params: Dict[int, object],
+                      mult_fn=None) -> str:
     """Parse .af text and set widget values. Returns airframe name."""
     af_name, raw_values, _meta = parse_af(af_text)
     from parameter_window import QDoubleSpinBox, QComboBox
@@ -394,7 +425,8 @@ def import_to_widgets(name: str, af_text: str, params: Dict[int, object]) -> str
             continue
         widget = params[tag]
         if isinstance(widget, QDoubleSpinBox):
-            widget.setValue(_display_for_raw_float(tag, raw_val))
+            mult = mult_fn(tag) if mult_fn else PARAM_DISPLAY_MULT.get(tag, 1.0)
+            widget.setValue(_display_for_raw_float(tag, raw_val, mult))
         elif isinstance(widget, QComboBox):
             # Resolve raw enum value → display name for alphabetically-sorted combos
             display = None

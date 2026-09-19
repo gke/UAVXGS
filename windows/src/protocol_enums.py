@@ -86,6 +86,7 @@ class MiscCommand(IntEnum):
     FORCE_DEFAULTS = 10   # Reset all params to embedded defaults
     SET_NAV_MODE = 11     # Set NavMode RC channel value: 0=Low(PIC), 1=Middle(Hold/Mission), 2=High(RTH)
     CYCLE_BB_LOG = 12     # Cycle black box log type
+    ESC_PROG = 13         # Enter ESC programming (4way/MSP runtime feed-through)
 
 
 # ============================================================================
@@ -128,14 +129,14 @@ class RCControl(IntEnum):
     eRollRC = 1
     ePitchRC = 2
     eYawRC = 3
-    eNavModeRC = 4
+    eArmingRC = 4
     eAttitudeModeRC = 5
-    eNavQualificationRC = 6
-    eAux1CamPitchRC = 7
-    eAux2RC = 8
-    eTransitionRC = 9
-    ePassThruRC = 10
-    eDiveRC = 11
+    eNavModeRC = 6
+    ePassThruRC = 7
+    eDiveRC = 8
+    eTraceRC = 9
+    eTransitionRC = 10
+    eAux1CamPitchRC = 11
     eNullRC = 12
 
 
@@ -174,6 +175,53 @@ class AirframeType(IntEnum):
 
 
 # ============================================================================
+# Airframe Category (single authority — mirror of FC ClassifyAFType())
+# ============================================================================
+# params.h AirframeCategory enum (eCatMr..eCatLand) and ClassifyAFType() are
+# the ORIGINAL truth on the FC.  Every GCS Python consumer of the AF->category
+# mapping MUST use AIRFRAME_CATEGORY / category_of() below instead of defining
+# its own map — drift between mirrors already silently misclassified
+# eAileronVTailAF as a multirotor in the sim (test_pid_sim AF_CATEGORY omitted
+# it).  Anything not listed here falls to eCatMr by construction (the FC's
+# else branch).
+class AirframeCategory(IntEnum):
+    """Matches params.h AirframeCategory enum."""
+    eCatMr = 0   # multirotor
+    eCatFw = 1   # fixed wing
+    eCatVtol = 2 # VTOL / quadplane
+    eCatLand = 3 # ground vehicles
+
+
+# AF type -> category, exactly mirroring FC ClassifyAFType() (params.c).
+AIRFRAME_CATEGORY = {
+    AirframeType.eElevonAF: AirframeCategory.eCatFw,
+    AirframeType.eDeltaAF: AirframeCategory.eCatFw,
+    AirframeType.eAileronAF: AirframeCategory.eCatFw,
+    AirframeType.eAileronSpoilerFlapsAF: AirframeCategory.eCatFw,
+    AirframeType.eAileronVTailAF: AirframeCategory.eCatFw,
+    AirframeType.eRudderElevatorAF: AirframeCategory.eCatFw,
+    AirframeType.eVTOLAF: AirframeCategory.eCatVtol,
+    AirframeType.eVTOL2AF: AirframeCategory.eCatVtol,
+    AirframeType.eTrackedAF: AirframeCategory.eCatLand,
+    AirframeType.eFourWheelAF: AirframeCategory.eCatLand,
+    AirframeType.eTwoWheelAF: AirframeCategory.eCatLand,
+}
+
+
+def category_of(af_type):
+    """Return the AirframeCategory for an AF (enum value or int).
+
+    Mirror of FC ClassifyAFType() in params.c — anything unknown/illegal is
+    eCatMr (the FC else branch), never an exception.
+    """
+    try:
+        af = AirframeType(af_type)
+    except (ValueError, TypeError):
+        return AirframeCategory.eCatMr
+    return AIRFRAME_CATEGORY.get(af, AirframeCategory.eCatMr)
+
+
+# ============================================================================
 # ESC Types (from params.h)
 # ============================================================================
 class ESCType(IntEnum):
@@ -192,7 +240,7 @@ class RxType(IntEnum):
     eFutabaSBusRx = 1
     eSpektrum1024Rx = 2
     eSpektrum2048Rx = 3
-    eCRSFRx = 4          # Crossfire/ExpressLRS
+    eCRSFRx = 4          # CRSF/ExpressLRS
     eUnknownRx = 5
 
 
@@ -391,30 +439,32 @@ class Config1Bits(IntFlag):
     """Config1 bit masks - matches params.h Config1"""
     eUseInvertMag = 0x01           # bit 0
     eUseRTHDescend = 0x02          # bit 1
-    eDisableLEDsInFlight = 0x04   # bit 2
+    eUsingMag = 0x04              # bit 2
     eEmulationEnable = 0x08         # bit 3
     eUseAltHoldAlarm = 0x10       # bit 4
     eUseOffsetHome = 0x20          # bit 5
-    eUseRapidDescent = 0x40        # bit 6
+    eTestMission = 0x40            # bit 6 — Test WP mission (4 WPs, ~150m legs, climb/descend/hard turns)
     eEnforceDriveSymmetry = 0x80   # bit 7
 
-    # Default Config1 = EmulationEnableMask | EnforceDriveSymmetryMask
-    DEFAULT = eEmulationEnable | eEnforceDriveSymmetry
+    # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm|Mag
+    DEFAULT = eUseRTHDescend | eUseAltHoldAlarm | eUsingMag
 
 
 class Config2Bits(IntFlag):
     """Config2 bit masks - matches params.h Config2"""
     eUseBatteryComp = 0x01         # bit 0
     eUseFastStart = 0x02           # bit 1
-    eUseESCProg = 0x04               # bit 2
+    eUnused2_2 = 0x04              # bit 2 — FREE (was UseESCProg). ESC-Prog is now
+                               # runtime-triggered via the GCS ESC button (miscESCProg),
+                               # so it needs no config bit. Available for a future feature.
     eUseGPS = 0x08             # bit 3
-    eUsePropSense = 0x10           # bit 4
+    ePropsInwards = 0x10           # bit 4 — SET = front two props rotate INWARDS (usual convention)
     eUseTurnToWP = 0x20           # bit 5
     eUseNavBeep = 0x40             # bit 6
-    # bit 7 unusable
+    eUnused2_7 = 0x80              # bit 7 — FREE. Available for a future feature.
 
-    # Default Config2 = UseFastStartMask
-    DEFAULT = eUseFastStart
+    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|FastStart|GPS|NavBeep
+    DEFAULT = eUseBatteryComp | eUseFastStart | eUseGPS | eUseNavBeep
 
 
 # ============================================================================
@@ -505,7 +555,7 @@ class ParamIndex(IntEnum):
     RX_THROTTLE_CH = 16        # 17
     LOW_VOLT_THRES = 17        # 18
     ROLL_CAM_KP = 18           # 19
-    EST_CRUISE_THR = 19        # 20
+    UNUSED_20 = 19            # 20 — was EST_CRUISE_THR (moved to Config.CruiseThrottleFF)
     STICK_HYSTERESIS = 20      # 21
     FW_CLIMB_THROTTLE = 21     # 22
     PERCENT_IDLE_THR = 22      # 23
@@ -531,7 +581,7 @@ class ParamIndex(IntEnum):
     RX_YAW_CH = 42             # 43
     AF_TYPE = 43               # 44
     TELEMETRY_TYPE = 44        # 45
-    MAX_DESCENT_RATE_DMP_S = 45 # 46
+    MAX_DESCENT_RATE_MP_S = 45  # 46
     DESCENT_DELAY_S = 46       # 47
     GYRO_LPF_SEL = 47          # 48
     NAV_CROSS_TRACK_KP = 48    # 49
@@ -548,7 +598,7 @@ class ParamIndex(IntEnum):
     RX_AUX4_CH = 59            # 60 - RCMap5
     NAV_POS_KI = 60            # 61
     UNUSED_GPS_PROTOCOL = 61   # 62 (auto-detected)
-    TILT_THROTTLE_FF = 62      # 63
+    NAV_POS_INT_LIM = 62       # 63
     MAX_YAW_RATE = 63          # 64
     FW_ROLL_PITCH_FF = 64      # 65
     FW_PITCH_THROTTLE_FF = 65  # 66
@@ -558,7 +608,7 @@ class ParamIndex(IntEnum):
     FW_SPOILER_DECAY_PERCENT_PS = 69  # 70
     FW_AILERON_DIFFERENTIAL = 70       # 71
     AS_SENSOR_TYPE = 71        # 72
-    KF_ACC_U_BIAS_VAR = 72     # 73
+    UNUSED_73 = 72            # 73 — was KFAccUBiasVar (tracked live in state.c)
     CONFIG2_BITS = 73          # 74
     MAX_PITCH_ANGLE = 74       # 75
     QUAT_GAIN = 75            # 76
@@ -596,10 +646,10 @@ class ParamIndex(IntEnum):
     NAV_PROX_RADIUS_M = 107    # 108
     YAW_RATE_KI = 108          # 109 — yaw rate-loop integral gain (heading hold)
     YAW_RATE_INT_LIM = 109     # 110 — yaw rate-loop integral limit
-    KF_BARO_VAR = 110          # 111
-    KF_ACC_U_VAR = 111         # 112
+    UNUSED_111 = 110          # 111 — was KFBaroVar (tracked live in state.c)
+    UNUSED_112 = 111         # 112 — was KFAccUVar (tracked live in state.c)
     FW_STICK_SCALE = 112       # 113
-    FW_ROLL_CONTROL_PITCH_LIMIT = 113  # 114
+    UNUSED_114 = 113            # 114 — was FW roll control pitch limit (Euler-era FW guard; unified quaternion loop is singularity-free)
     AH_THROTTLE_MOVING_TRIGGER = 114   # 115
     NAV_FENCE_RADIUS_M = 115   # 116
     DIVE_RECOVER_ALT = 116     # 117 — auto pull-out altitude AGL (m)
@@ -607,11 +657,11 @@ class ParamIndex(IntEnum):
     FAILSAFE_DELAY = 118          # 119 — failsafe trigger delay (seconds)
     BATTERY_ALARM_PCT = 119       # 120
     ALT_ROC_KP = 120              # 121
-    MAX_CLIMB_RATE_DMP_S = 121    # 122 — vertical-profile ascent shaping rate (m/s) (was unused slot)
+    MAX_CLIMB_RATE_MP_S = 121   # 122 — vertical-profile ascent shaping rate (m/s)
     RUDDER_MOTOR_FF = 122          # 123
     SPIRAL_DESCENT_BAND_M = 123      # 124 — residual altitude (m) that triggers MR spiral-orbit descent
     UNUSED_124 = 124     # 125 — was FS_CONFIG_BITS; VRS protection is always armed
-    UNUSED_125 = 125
+    TRACE_TYPE = 125   # trace capture selector (TraceTypes: 0=None 1=Rate 2=Attitude 3=AltHold 4=Actuator 5=IMU)
     UNUSED_126 = 126
     POWER_RESET_CAUSE = 127
 
@@ -637,10 +687,10 @@ RC_MAP_EXPECTED = [
     RCControl.eRollRC,
     RCControl.ePitchRC,
     RCControl.eYawRC,
-    RCControl.eNavModeRC,
+    RCControl.eArmingRC,
     RCControl.eAttitudeModeRC,
-    RCControl.eNavQualificationRC,
-    RCControl.eAux1CamPitchRC,
+    RCControl.eNavModeRC,
+    RCControl.ePassThruRC,
 ]
 
 # RC Mapping: param index -> function name (for display)
@@ -649,11 +699,11 @@ RC_MAPPING_NAMES = {
     ParamIndex.RX_ROLL_CH: "Roll",
     ParamIndex.RX_PITCH_CH: "Pitch",
     ParamIndex.RX_YAW_CH: "Yaw",
-    ParamIndex.RX_GEAR_CH: "Gear",
-    ParamIndex.RX_AUX1_CH: "Aux1",
-    ParamIndex.RX_AUX2_CH: "Aux2",
-    ParamIndex.RX_AUX3_CH: "Aux3",
-    ParamIndex.RX_AUX4_CH: "Aux4",
+    ParamIndex.RX_GEAR_CH: "NavMode",
+    ParamIndex.RX_AUX1_CH: "AttMode",
+    ParamIndex.RX_AUX2_CH: "Arming",
+    ParamIndex.RX_AUX3_CH: "CamPitch",
+    ParamIndex.RX_AUX4_CH: "Trace",
     ParamIndex.RX_AUX5_CH: "Aux5",
     ParamIndex.RX_AUX6_CH: "Aux6",
     ParamIndex.RX_AUX7_CH: "Aux7",
@@ -748,6 +798,18 @@ ACTIVE_AIRFRAMES = frozenset({
     if af not in REDACTED_AIRFRAMES and af != AirframeType.eAFUnknown
 })
 
+# ALL selectable airframe types — exhaustive, name-sorted (single source for the
+# GCS AF_TYPE combos). Includes REDACTED_AIRFRAMES members so that any value the
+# FC or an .af file can legitimately produce resolves via findData() — e.g.
+# generic/SkySurfer_Bixler.af uses eAileronAF (15), which is in REDACTED but
+# MUST round-trip. Without the full set, a load/readback whose findData() misses
+# fell back to treating the raw value as a positional index, landing on the
+# WRONG airframe (FW -> X Quadcopter, Elevon -> Delta). eAFUnknown stays out.
+ALL_AIRFRAMES = tuple(sorted(
+    (af for af in AirframeType if af != AirframeType.eAFUnknown),
+    key=lambda x: AIRFRAME_NAMES[x].lower(),
+))
+
 ESC_TYPE_NAMES = {
     ESCType.eESCPWM: "FastPWM",
     ESCType.eDCMotors: "DCMotors",
@@ -759,7 +821,7 @@ RX_TYPE_NAMES = {
     RxType.eFutabaSBusRx: "SBus",
     RxType.eSpektrum1024Rx: "Spektrum 1024",
     RxType.eSpektrum2048Rx: "Spektrum 2048",
-    RxType.eCRSFRx: "CRFS/ExpressLRS",
+    RxType.eCRSFRx: "CRSF/ELRS",
     RxType.eUnknownRx: "Unknown Rx",
 }
 

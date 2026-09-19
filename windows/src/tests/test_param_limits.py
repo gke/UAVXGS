@@ -47,6 +47,7 @@ ENUM_VALUES = {
     "eUAVXDJTTelemetry": 0, "eU8Telemetry": 7,
     # sensors/mpu6xxx.h
     "GYRO_LPF_SEL_MAX": 7, "ACC_LPF_SEL_MAX": 5,
+    "cGyroLpfSelMax": 7, "cAccLpfSelMax": 5,
     # ASSensorTypes
     "eMS4525D0I2C": 0, "eNoAS": 4,
     # MotorStopActions (auto.h)
@@ -57,6 +58,10 @@ ENUM_VALUES = {
     "CONFIG_BITS_MAX": 255,
     # Battery (params.h)
     "BATTERY_CAPACITY_MAH_MIN": 1500, "BATTERY_CAPACITY_MAH_MAX": 10000,
+    "cBatteryCapacityMahMin": 1500, "cBatteryCapacityMahMax": 10000,
+    # TraceTypes (trace.h)
+    "eTraceNone": 0, "eTraceRate": 1, "eTraceAttitude": 2,
+    "eTraceAltHold": 3, "eTraceActuator": 4, "eTraceIMU": 5, "eTraceEnd": 6,
 }
 
 # Comparison tolerance: the FC table stores bounds as float32 literals (e.g.
@@ -163,7 +168,13 @@ AF_TOL = 1e-4
 
 def check_airframe_file(path):
     """Validate one .af: every [LIMITS] entry within its class bounds, and
-    every stored value within its class bounds (float32/format tolerant)."""
+    every stored value within its class bounds (float32/format tolerant).
+
+    Also enforces the design invariant from migrate_limits.py::gen_limits:
+    every stored value must lie INSIDE its own file's [LIMITS] block. A
+    stale [LIMITS] lo sitting above the stored value would make the GCS
+    _apply_airframe_limits() QDoubleSpinBox.setRange() call CLAMP the value
+    UP to lo on load->save, inflating the tuning (Shadow 2026-09-06)."""
     from airframes.airframes import parse_af_file
     _name, vals, meta = parse_af_file(str(path))
     lim = meta.get("LIMITS", {})
@@ -178,6 +189,8 @@ def check_airframe_file(path):
             l, h = lim[tag]
             if not (l >= lo - AF_TOL and h <= hi + AF_TOL and l < h):
                 problems.append("bad LIMITS for tag %d: (%s,%s) class=(%s,%s)" % (tag, l, h, lo, hi))
+            if raw < l - AF_TOL or raw > h + AF_TOL:
+                problems.append("value outside own [LIMITS]: tag %d raw=%s LIMITS=(%s,%s)" % (tag, raw, l, h))
     assert not problems, "%s:\n  %s" % (path.name, "\n  ".join(problems))
 
 

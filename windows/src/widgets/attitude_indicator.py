@@ -38,7 +38,7 @@ class AttitudeIndicator(QWidget):
         """Set pitch (degrees), roll (degrees), heading (degrees)"""
         self.pitch = max(-90, min(90, pitch))
         self.roll = roll
-        self.heading = heading
+        self.heading = heading if heading == heading else 0.0  # NaN guard
         self.update()
     
     def set_exec_time(self, current_percent: float, peak_percent: float):

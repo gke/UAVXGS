@@ -16,33 +16,29 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from airframes.airframes import parse_af_file, _format_value
-from protocol_enums import ParamIndex, AirframeType
+from protocol_enums import ParamIndex
 
 GROUPS = ['original', 'user', 'generic']
 CLASS_ORDER = {'FW': 0, 'MR': 1, 'VTOL': 2, 'Land': 3, 'Sensor': 4}
 
-FW_TYPES = (AirframeType.eElevonAF, AirframeType.eDeltaAF, AirframeType.eAileronAF,
-            AirframeType.eAileronSpoilerFlapsAF, AirframeType.eAileronVTailAF,
-            AirframeType.eRudderElevatorAF)
-VTOL_TYPES = (AirframeType.eVTOLAF, AirframeType.eVTOL2AF)
-LAND_TYPES = (AirframeType.eTrackedAF, AirframeType.eTwoWheelAF, AirframeType.eFourWheelAF)
-
 
 def classify(af_type) -> str:
-    """Return 'FW'/'MR'/'VTOL'/'Land'/'Sensor' matching FC ClassifyAFType()."""
+    """Return 'FW'/'MR'/'VTOL'/'Land'/'Sensor' — delegated from the single
+    authority category_of() in protocol_enums.py (FC ClassifyAFType()
+    mirror). Keeps export-specific labels ('Land', 'Sensor', 'VTOL')."""
+    from protocol_enums import category_of, AirframeCategory, AirframeType
     try:
         af = AirframeType(int(af_type))
     except (ValueError, TypeError):
         return 'MR'
-    if af in FW_TYPES:
-        return 'FW'
-    if af in VTOL_TYPES:
-        return 'VTOL'
-    if af in LAND_TYPES:
-        return 'Land'
     if af is AirframeType.eInstrumentation:
         return 'Sensor'
-    return 'MR'
+    return {
+        AirframeCategory.eCatMr: 'MR',
+        AirframeCategory.eCatFw: 'FW',
+        AirframeCategory.eCatVtol: 'VTOL',
+        AirframeCategory.eCatLand: 'Land',
+    }.get(category_of(af), 'MR')
 
 
 def main():

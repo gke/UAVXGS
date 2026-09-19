@@ -51,6 +51,14 @@ class CalibrationWindow(QMainWindow):
         self.mag_calibration_requested = False
         self.mag_calibration_start_time = None
         self.mag_calibration_timeout = 120000  # 2 minute safety timeout
+
+        # Mag status provenance: the first calibration packet (matching the
+        # warm-up of the link) decides whether the mag is really inactive. Until
+        # one has been seen, "_mag_active stays False" (stale default) must not
+        # trip the "not active" alarm or the "no magnetometer" refusal - those
+        # are the startup-race false positives seen on the bench.
+        self._mag_status_seen = False
+        self._mag_warn_logged = False
         
         # RC calibration state
         self.rc_calibrating = False
@@ -439,7 +447,7 @@ class CalibrationWindow(QMainWindow):
 
         info = QLabel(
             "Sensor Orientation Porting\n"
-            "Determines IMUQuadrant / IMUSensorFlip for a new target board.\n"
+            "Determines SensorQuadrant / SensorFlip for a new target board.\n"
             "With the board level and still, run each probe while the FC is "
             "disarmed.\nEach probe trips when its angle (heading for yaw) "
             "moves past 30 deg; hold until it trips."
@@ -453,11 +461,9 @@ class CalibrationWindow(QMainWindow):
         cur_layout = QGridLayout()
         self.ori_cur_imu_q = QLabel("--")
         self.ori_cur_flip = QLabel("--")
-        self.ori_cur_mag_q = QLabel("--")
         for row, (name, lbl) in enumerate([
-                ("IMU Quadrant", self.ori_cur_imu_q),
-                ("IMU Sensor Flip", self.ori_cur_flip),
-                ("Mag Quadrant", self.ori_cur_mag_q)]):
+                ("Sensor Quadrant", self.ori_cur_imu_q),
+                ("Sensor Flip", self.ori_cur_flip)]):
             cur_layout.addWidget(QLabel(name), row, 0)
             lbl.setStyleSheet("font-weight: bold;")
             cur_layout.addWidget(lbl, row, 1)
@@ -558,8 +564,8 @@ class CalibrationWindow(QMainWindow):
     def _evaluate_ori_probes(self):
         """Classify observations against currently-flashed orientation"""
         cal_data = data_manager.get_calibration_data() or {}
-        q_cur = cal_data.get('imu_quadrant')
-        flip_cur = cal_data.get('imu_flip')
+        q_cur = cal_data.get('sensor_quadrant')
+        flip_cur = cal_data.get('sensor_flip')
         if q_cur is None or flip_cur is None:
             self.ori_verdict.setText(
                 "FC firmware does not stream orientation "
@@ -578,25 +584,24 @@ class CalibrationWindow(QMainWindow):
             verdict = note
         else:
             verdict = ("%s\nSuggested change from flashed values: "
-                       "IMUQuadrant %d -> %d, IMUSensorFlip %s -> %s"
+                       "SensorQuadrant %d -> %d, SensorFlip %s -> %s"
                        % (note, q_cur, q_new, flip_cur, flip_new))
         self.ori_verdict.setText(verdict)
 
         quad_names = {0: 'CW0_DEG', 1: 'CW90_DEG', 2: 'CW180_DEG',
                       3: 'CW270_DEG'}
         self.ori_inc_lines.setText(
-            "const uint8 IMUQuadrant = %d; // %s\n"
-            "const boolean IMUSensorFlip = %s;" % (
+            "const uint8 SensorQuadrant = %d; // %s\n"
+            "const boolean SensorFlip = %s;" % (
                 q_new, quad_names[q_new],
                 'true' if flip_new else 'false'))
 
     def _orientation_tick(self, cal_data, flight_data):
         """10 Hz tick: refresh current-values labels and capture probes"""
-        if cal_data and 'imu_quadrant' in cal_data:
-            self.ori_cur_imu_q.setText(str(cal_data['imu_quadrant']))
+        if cal_data and 'sensor_quadrant' in cal_data:
+            self.ori_cur_imu_q.setText(str(cal_data['sensor_quadrant']))
             self.ori_cur_flip.setText(
-                'true' if cal_data['imu_flip'] else 'false')
-            self.ori_cur_mag_q.setText(str(cal_data.get('mag_quadrant')))
+                'true' if cal_data['sensor_flip'] else 'false')
         elif cal_data:
             self.ori_cur_imu_q.setText("legacy FW")
 
@@ -682,9 +687,10 @@ class CalibrationWindow(QMainWindow):
         self.rc_max_labels = {}
         self.rc_us_labels = {}
         
-        channel_names = ["Throttle", "Roll", "Pitch", "Yaw", "Aux1", "Aux2", "Aux3", "Aux4"]
+        channel_names = ["Throttle", "Roll", "Pitch", "Yaw", "Arming", "AttMode",
+                         "NavMode", "PassThru", "Dive", "Trace", "RateGain", "CamPitch"]
         
-        for i in range(8):
+        for i in range(12):
             row = i + 1
             rc_layout.addWidget(QLabel(str(i+1)), row, 0)
             rc_layout.addWidget(QLabel(channel_names[i]), row, 1)
@@ -787,7 +793,7 @@ class CalibrationWindow(QMainWindow):
     def _imu_chip_name(v):
         if v is None or not v:
             return "IMU Chip: --"
-        names = {0x47: "ICM-42688-P", 0x42: "ICM-42605", 0x24: "BMI270"}
+        names = {0x47: "ICM-42688-P", 0x42: "ICM-42605", 0x68: "MPU6050", 0x24: "BMI270"}
         label = names.get(int(v), f"unknown (0x{int(v):02x})")
         return f"IMU Chip: {label}"
 
@@ -829,6 +835,7 @@ class CalibrationWindow(QMainWindow):
         # FC main.h Flags struct byte 5: ThrottleOpen:0, MagnetometerCalibrated:1,
         #   RCMapFail:2, NewAltitudeValue:3, IMUCal:4, FenceAlarm:5
         if len(flags) >= 6:
+            self._mag_status_seen = True
             imu_cal = bool(flags[5] & 16)   # bit 4 = IMUCal
             mag_cal = bool(flags[5] & 2)    # bit 1 = MagnetometerCalibrated
             mag_active = bool(flags[4] & 64) if len(flags) >= 5 else False  # bit 38 = MagnetometerActive
@@ -836,8 +843,10 @@ class CalibrationWindow(QMainWindow):
             self._imu_active = bool(flags[4] & 32) if len(flags) >= 5 else False  # bit 37 = IMUActive
             self._update_cal_status(self.imu_cal_status, imu_cal)
             self._update_cal_status(self.mag_cal_status, mag_cal)
-            if self.mag_calibration_requested and not mag_active:
+            if self.mag_calibration_requested and not mag_active \
+                    and not self._mag_warn_logged:
                 self._log("⚠️ Mag sensor not active - calibration cannot proceed")
+                self._mag_warn_logged = True
             self.rc_cal_status.setText("Ready")
             self.rc_cal_status.setStyleSheet("padding: 5px; background-color: #27ae60; color: white; font-weight: bold; border-radius: 4px;")
         else:
@@ -851,7 +860,13 @@ class CalibrationWindow(QMainWindow):
         if cal_data:
             self.imu_chip.setText(self._imu_chip_name(cal_data.get('imu_id')))
             self.imu_chip.setStyleSheet("color: #555; font-weight: bold;")
-            self.mag_chip.setText(self._mag_chip_name(cal_data.get('mag_id')))
+            label = self._mag_chip_name(cal_data.get('mag_id'))
+            cfg_a = cal_data.get('mag_cfg_a')
+            if cfg_a is not None:
+                label += ("  [A=0x%02x B=0x%02x MODE=0x%02x]" %
+                          (cfg_a, cal_data.get('mag_cfg_b'),
+                           cal_data.get('mag_mode')))
+            self.mag_chip.setText(label)
             self.mag_chip.setStyleSheet("color: #555; font-weight: bold;")
 
         # Orientation tab: current values + probe capture
@@ -941,7 +956,7 @@ class CalibrationWindow(QMainWindow):
         # Update RC values from telemetry
         rc_raw = getattr(flight_data, 'rc_raw', [])
         if rc_raw:
-            for i in range(min(len(rc_raw), 8)):
+            for i in range(min(len(rc_raw), 12)):
                 us = rc_raw[i] if rc_raw[i] > 0 else 0
                 self.rc_raw_labels[i].setText(str(us))
                 self.rc_us_labels[i].setText(str(us))
@@ -1039,8 +1054,10 @@ class CalibrationWindow(QMainWindow):
         
         cal_data = data_manager.get_calibration_data()
         mag_id = cal_data.get('mag_id') if cal_data else None
-        no_mag = not self._mag_active or (mag_id is not None and mag_id == 0)
-        if no_mag:
+        # Refuse only on a CONFIRMED no-mag reading. Before the first
+        # calibration packet lands (link warm-up) the flags default to
+        # inactive - that must not brand the board "no mag fitted".
+        if self._mag_status_seen and (not self._mag_active or (mag_id is not None and mag_id == 0)):
             self.mag_status.setText("This board has no magnetometer fitted - calibration is not available.")
             self.mag_status.setStyleSheet("padding: 5px; background-color: #f8d7da; color: #721c24; border-radius: 4px;")
             self.status_label.setText("No magnetometer fitted - calibration not available")
@@ -1061,6 +1078,7 @@ class CalibrationWindow(QMainWindow):
         # Send MISC command to FC to start magnetometer calibration
         self._send_misc_command(MiscCommand.CAL_MAG)
         self.mag_calibration_requested = True
+        self._mag_warn_logged = False
         self.mag_calibration_start_time = QElapsedTimer()
         self.mag_calibration_start_time.start()
         self.mag_calibration_timeout = 120000  # 2 minute safety timeout
@@ -1073,6 +1091,22 @@ class CalibrationWindow(QMainWindow):
         self.mag_status.setStyleSheet("padding: 5px; background-color: #d4edda; color: #155724; border-radius: 4px;")
         self.status_label.setText("✅ Magnetometer calibration complete!")
     
+    def on_misc_ack(self, command: int, success: bool):
+        """MISC command result (tag-52 ack). The mag-cal ack is now
+        authoritative: the FC only acks-true after a completed sweep, and
+        acks-false (keeping the previous fit) on a partial/timeout run."""
+        if command == MiscCommand.CAL_MAG and self.mag_calibration_requested:
+            if success:
+                self._finish_mag_calibration()
+            else:
+                self.mag_calibration_requested = False
+                self.mag_calibration_start_time = None
+                self.mag_start_btn.setEnabled(True)
+                self.mag_status.setText("⚠️ Mag calibration FAILED - incomplete sweep or timeout")
+                self.mag_status.setStyleSheet("padding: 5px; background-color: #f8d7da; color: #721c24; border-radius: 4px;")
+                self.status_label.setText("⚠️ Mag calibration failed - rotate fully through all 8 octants and retry")
+                self._log("⚠️ Mag calibration failed - previous calibration retained")
+
     def clear_mag_calibration(self):
         """Clear magnetometer calibration"""
         self.mag_status.setText("Calibration cleared")
@@ -1092,7 +1126,7 @@ class CalibrationWindow(QMainWindow):
         self.rc_status.setText("RC data captured from telemetry...")
         self.rc_status.setStyleSheet("padding: 5px; background-color: #fff3cd; color: #856404; border-radius: 4px;")
         
-        for i in range(min(len(rc_raw), 8)):
+        for i in range(min(len(rc_raw), 12)):
             raw = rc_raw[i]
             min_val = int(raw * 0.9)
             max_val = int(raw * 1.1)

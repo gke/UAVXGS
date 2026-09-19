@@ -1,0 +1,70 @@
+{
+  "waypoints": [
+    {
+      "index": 1,
+      "lat": -35.290289,
+      "lon": 149.110997,
+      "alt": 80,
+      "velocity": 5.0,
+      "loiter": 5,
+      "action": "Via"
+    },
+    {
+      "index": 2,
+      "lat": -35.287500,
+      "lon": 149.110997,
+      "alt": 80,
+      "velocity": 5.0,
+      "loiter": 5,
+      "action": "Via"
+    },
+    {
+      "index": 3,
+      "lat": -35.287500,
+      "lon": 149.113500,
+      "alt": 40,
+      "velocity": 3.0,
+      "loiter": 10,
+      "action": "Orbit"
+    },
+    {
+      "index": 4,
+      "lat": -35.287500,
+      "lon": 149.113500,
+      "alt": 5,
+      "velocity": 3.0,
+      "loiter": 5,
+      "action": "Via"
+    },
+    {
+      "index": 5,
+      "lat": -35.287500,
+      "lon": 149.113500,
+      "alt": 50,
+      "velocity": 5.0,
+      "loiter": 5,
+      "action": "Via"
+    },
+    {
+      "index": 6,
+      "lat": -35.290289,
+      "lon": 149.110997,
+      "alt": 50,
+      "velocity": 5.0,
+      "loiter": 10,
+      "action": "Orbit"
+    },
+    {
+      "index": 7,
+      "lat": -35.290289,
+      "lon": 149.110997,
+      "alt": 0,
+      "velocity": 2.0,
+      "loiter": 0,
+      "action": "Land"
+    }
+  ],
+  "home_lat": -35.290289,
+  "home_lon": 149.110997,
+  "timestamp": "2026-07-24T12:00:00"
+}

@@ -15,6 +15,12 @@ _TAG_NAMES = {
     68: "UNUSED", 69: "LINK",
 }
 
+# Runtime diagnostic log bound. The per-packet log grows without limit, and a
+# 5.5 GB log.txt once blocked the GitHub push (GH001 >100 MB pre-receive).
+# Rotate once past this cap so the file can never regrow into the GBs; the
+# file itself is never shipped or pushed (see scripts/sweep_logs.sh).
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+
 
 def _fmt(val: Any) -> str:
     if isinstance(val, float):
@@ -58,6 +64,11 @@ class PacketLogger:
         entry = _obj_fields(data) if data is not None else ""
         line = f"{ts} {direction} {name}  {entry}" if entry else f"{ts} {direction} {name}"
         try:
+            if os.path.getsize(self.log_file) > _LOG_MAX_BYTES:
+                try:
+                    os.remove(self.log_file)
+                except OSError:
+                    pass
             with open(self.log_file, 'a') as f:
                 f.write(line + '\n')
                 f.flush()

@@ -674,11 +674,11 @@ class NavWindow(QMainWindow):
             elif col == 2:
                 wp.lon = float(item.text())
             elif col == 3:
-                wp.alt = int(float(item.text()))
+                wp.alt = float(item.text())
             elif col == 4:
                 wp.velocity = float(item.text())
             elif col == 5:
-                wp.loiter = int(item.text())
+                wp.loiter = float(item.text())
             elif col == 6:
                 wp.action = item.text()
         except ValueError:
@@ -1287,15 +1287,15 @@ class NavWindow(QMainWindow):
         for wp in self.waypoints:
             action_val = WP_ACTION_VALUES.get(wp.action, 0)
             body = struct.pack(
-                "<BiiHHfHHHfiib",
+                "<Bii ffffffiiB",
                 wp.index - 1 if wp.index > 0 else 0,
                 int(wp.lat * 1e7),
                 int(wp.lon * 1e7),
-                int(wp.alt),
+                float(wp.alt),
                 float(wp.velocity),
-                int(wp.loiter),
-                int(getattr(wp, "orbit_radius", 0) or 0),
-                int(getattr(wp, "orbit_alt", 0) or 0),
+                float(wp.loiter),
+                float(getattr(wp, "orbit_radius", 0.0) or 0.0),
+                float(getattr(wp, "orbit_alt", 0.0) or 0.0),
                 float(getattr(wp, "orbit_velocity", 0.0) or 0.0),
                 int(getattr(wp, "pulse_width", 0) or 0),
                 int(getattr(wp, "pulse_period", 0) or 0),
@@ -1305,11 +1305,11 @@ class NavWindow(QMainWindow):
             QThread.msleep(30)
 
         origin_body = struct.pack(
-            "<Bbhhii",
+            "<Bbffii",
             n if n < 128 else 0,
             50,
-            100,
-            0,
+            100.0,
+            0.0,
             home_lat,
             home_lon,
         )

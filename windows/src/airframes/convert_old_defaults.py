@@ -72,7 +72,7 @@ OLD_SCALES = {
     # ---- Misc FLOAT params with known scales ----
     17: (0.1,         "LowVoltThres: P() * 0.1 (= volts ×10 → volts)"),
     33: (DEG_RAD * 0.1, "NavMagVar: P() * DEG_RAD * 0.1"),
-    45: (1.0,         "MaxDescentRateDmpS: direct uint8 (= m/s)"),
+    45: (1.0,         "MaxDescentRateMpS: direct uint8 (= m/s)"),
     52: (0.01,        "AccConfSD: P() * 0.01 (= 1/sdev)"),
     40: (1.0,         "NavPosIntLimit → MaxVelocity: direct uint8 (= m/s)"),
     63: (10.0,        "MaxYawRate: P() * 10 (°/s) → DEG_RAD in InitPIDStructs"),
@@ -100,7 +100,7 @@ OLD_SCALES = {
     87: (0.01,        "FWAltSpoilerFF: P() as percent → fraction"),
     102: (0.01,       "AltThrottleCompLimit: P() as percent → fraction"),
     114: (0.01,       "FWStickScale: P() as percent → fraction"),
-    113: (1.0,        "FWRollControlPitchLimit: direct deg → use DEG_RAD"),
+    113: (1.0,        "Unused114: was FWRollControlPitchLimit (retired — unified quaternion loop)"),
     115: (10.0,       "NavFenceRadiusM: P() * 10 (= metres, from old pos 108)"),
     26: (1.0,         "ServoLPFHz: direct uint8 (= Hz)"),
     30: (0.01,        "Horizon: P() → 1/FromPercent"),

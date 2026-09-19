@@ -7,6 +7,7 @@ import sys
 import os
 import struct
 import time
+import math
 from datetime import datetime
 from typing import Optional
 
@@ -21,6 +22,7 @@ from protocol_enums import PacketTag, ParamIndex, FlightState, NavState, Config1
 from packet_parser import *
 from widgets.attitude_indicator import AttitudeIndicator, ExecTimeBar
 from widgets.anomaly_box import AnomalyBox
+
 from core.data_manager import data_manager
 from core.packet_logger import packet_logger
 from core.ack_handler import ack_handler
@@ -32,11 +34,45 @@ from ui.calibration_window import CalibrationWindow
 from ui.misc_window import MiscWindow
 from ui.dfu_flasher import DfuFlasherWindow
 from core.speech import SpeechController, SpeechLevel, LEVEL_LABELS
-from logger.logger import Logger, GpsKmlLogger, AnomalyLogger, ImuStatsLogger
+from logger.logger import AnomalyLogger, ImuStatsLogger
+from logger.rawlog import RawLogWriter
+from core.frame_decoder import FrameDecoder
+from ui.replay_window import ReplayWindow
+from ui.trace_viewer import TraceViewer
+from ui.identify_window import IdentifyWindow
 
 
 FLAG_USING_GPS_ALT = 1
 FLAG_USING_RANGEFINDER_ALT = 22
+
+# Trace-type combo sync-state styling: the selector's BACKGROUND goes green when
+# the FC has confirmed the value (download readback or upload ACK), orange while
+# a locally-chosen value still awaits confirmation, default when unknown.
+_TRACE_STATE_STYLE = {
+    'neutral': (
+        "QComboBox { background-color: #ffffff; color: #101418; }"
+        "QComboBox::drop-down { border: none; background: transparent; }"
+        "QComboBox QAbstractItemView { background: #ffffff; color: #101418; "
+        "selection-background-color: #4a90d9; selection-color: #ffffff; }"),
+    'synced': (
+        "QComboBox { background-color: #27ae60; color: #0d1216; border: 1px solid #1f7a45; }"
+        "QComboBox::drop-down { border: none; background: transparent; }"
+        "QComboBox QAbstractItemView { background: #ffffff; color: #101418; "
+        "selection-background-color: #4a90d9; selection-color: #ffffff; }"),
+    'pending': (
+        "QComboBox { background-color: #e67e22; color: #0d1216; border: 1px solid #b45f1b; }"
+        "QComboBox::drop-down { border: none; background: transparent; }"
+        "QComboBox QAbstractItemView { background: #ffffff; color: #101418; "
+        "selection-background-color: #4a90d9; selection-color: #ffffff; }"),
+}
+
+# Speak a compass/distance callout only when the FC's home-relative offset puts
+# the aircraft beyond this range, and only re-speak every N seconds while far.
+# The 8-point compass is the coarse 45 deg resolution the pilot asked for.
+_DIRECTION_FAR_M = 500
+_DIRECTION_SPEAK_PERIOD_S = 10.0
+_DIRECTION_POINTS = ("North", "North-East", "East", "South-East",
+                     "South", "South-West", "West", "North-West")
 
 # Single source of truth: one entry per FC Flags bit (main.h struct order).
 # key==bit number matches flags order; (key, name, tooltip) drives both the
@@ -50,9 +86,9 @@ FLAG_BIT_DEFS = {
     5:  ('low_batt', 'LowBatt', 'Low Battery'),
     6:  ('gps_ok', 'GPS', 'GPS Valid'),
     7:  ('origin', 'Origin', 'Origin Valid'),
-    8:  ('baro_fail', 'BaroFail', 'Barometer Failure'),
+    8:  ('baro_fail', 'Baro', 'Barometer Failure'),
     9:  ('unused_imu_fail', 'unusedIMUFail', 'Reserved: F.IMUFailure never set by FC'),
-    10: ('mag_fail', 'MagFail', 'Magnetometer Failure'),
+    10: ('mag_fail', 'Mag', 'Magnetometer Failure'),
     11: ('unused_gps_fail', 'unusedGPSFail', 'Reserved: F.GPSFailure never set by FC'),
     12: ('att_hold', 'AttHold', 'Attitude Hold'),
     13: ('thr_move', 'ThrMove', 'Throttle Moving'),
@@ -65,14 +101,14 @@ FLAG_BIT_DEFS = {
     20: ('auto_land', 'AutoLand', 'RTH Auto Descend'),
     21: ('baro', 'Baro', 'Baro Active'),
     22: ('rf', 'RF', 'Rangefinder Active'),
-    23: ('use_rf', 'UseRF', 'Using Rangefinder'),
+    23: ('use_rf', 'RF', 'Using Rangefinder'),
     24: ('poi', 'POI', 'Using POI'),
     25: ('pass_thru', 'PassThru', 'Bypass'),
     26: ('angle', 'Angle', 'Angle Control'),
     27: ('emul', 'Emul', 'Emulation'),
     28: ('offset', 'Offset', 'Offset Origin Valid'),
     29: ('armed', 'Armed', 'Drives Armed'),
-    30: ('acc_z_bump', 'AccZBump', 'Acc Z Bump'),
+    30: ('acc_z_bump', 'Bump', 'Acc Z Bump'),
     31: ('unused_dc_motors', 'unusedDCMotors', 'Reserved: F.DCMotorsDetected never set by FC'),
     32: ('unused_sat', 'unusedSat', 'Reserved: F.Saturation never set by FC'),
     33: ('dump_bb', 'DumpBB', 'Dumping Black Box'),
@@ -84,32 +120,32 @@ FLAG_BIT_DEFS = {
     39: ('armed2', 'Drives', 'Drives Active'),
     40: ('thr_open', 'ThrOpen', 'Throttle Open'),
     41: ('mag_cal', 'MagCal', 'Mag Calibrated'),
-    42: ('rc_map_fail', 'RCMapFail', 'RC Map Fail'),
+    42: ('rc_map_fail', 'RCMap', 'RC Map Fail'),
     43: ('new_alt', 'NewAlt', 'New Altitude Value'),
     44: ('gyro_cal', 'IMUCal', 'IMU Calibrated'),
     45: ('fence_alarm', 'Fence', 'Fence Alarm'),
     46: ('excess_lift', 'ExLift', 'Excess Lift: throttle at floor but still climbing (lost alt control)'),
-    47: ('imu_fault_lat', 'IMUFaultLt', 'IMU Fault Latched'),
+    47: ('imu_fault_lat', 'IMU', 'IMU Fault Latched'),
     48: ('new_baro', 'NewBaro', 'New Baro Value'),
     49: ('beeper', 'Beeper', 'Beeper In Use'),
-    50: ('serial_rc', 'S-RC', 'Have Serial RC'),
+    50: ('unused50', 'unused50', 'Reserved'),
     51: ('soaring', 'Soaring', 'Soaring'),
     52: ('gps_vel', 'GPSVel', 'Valid GPS Velocity'),
-    53: ('rc_frame', 'RCFrame', 'RC Frame Received'),
+    53: ('lq', 'LQ', 'Link Quality (< 80%)'),
     54: ('unused_hover', 'unusedHover', 'Reserved: F.Hovering never set by FC'),
-    55: ('as_active', 'ASA', 'Airspeed Sensor Active'),
+    55: ('as_active', 'AirSpd', 'Airspeed Sensor Active'),
     56: ('yaw_active', 'YawActive', 'Yaw Active'),
     57: ('have_gps', 'HaveGPS', 'Have GPS'),
-    58: ('rc_new', 'RCNew', 'RC New Values'),
+    58: ('fs', 'FS', 'Failsafe (LQ < 50%)'),
     59: ('new_nav', 'NewNav', 'New Nav Update'),
     60: ('nv_mem', 'NVMem', 'Have NV Memory'),
-    61: ('rapid_desc', 'RapidDesc', 'Using Rapid Descent'),
+    61: ('rapid_desc', 'Diving', 'Using Rapid Descent'),
     62: ('turn_wp', 'TurnWP', 'Using Turn To WP'),
     63: ('glide', 'Glide', 'Gliding'),
     64: ('new_mag', 'NewMag', 'New Mag Values'),
     65: ('alt_hold_alarm', 'AHAlarm', 'Using Alt Hold Alarm'),
     66: ('new_gps_pos', 'NewGPSPos', 'New GPS Position'),
-    67: ('sio_fatal', 'sioFatal', 'Serial I/O Fatal'),
+    67: ('sio_fatal', 'SIOFatal', 'Serial I/O Fatal'),
     68: ('gps_pkt', 'GPSPkt', 'GPS Packet Received'),
     69: ('wind_est', 'WindEst', 'Wind Estimate Valid'),
     70: ('x_track', 'XTrack', 'Cross Track Active'),
@@ -117,13 +153,13 @@ FLAG_BIT_DEFS = {
     72: ('forced_landing', 'ForcedLan', 'Forced Landing'),
     73: ('unused73', 'unused73', 'Reserved'),
     74: ('drive_sym', 'DriveSym', 'Enforce Drive Symmetry'),
-    75: ('rc_frame_ok', 'RCFrameOK', 'RC Frame OK'),
-    76: ('inv_mag', 'InvMag', 'Invert Magnetometer'),
-    77: ('new_cmds', 'NewCmds', 'New Commands'),
+    75: ('rssi', 'RSSI', 'RSSI (< -90 dBm)'),
+    76: ('ext_mag', 'ExtMag', 'External Mag Detected'),
+    77: ('snr', 'SNR', 'SNR Low (< -10 dB)'),
     78: ('offset_home', 'OffsetHome', 'Using Offset Home'),
     79: ('gps_hdg', 'GPSHdg', 'Valid GPS Heading'),
     80: ('bad_bus', 'BadBus', 'Bad Bus Device Config'),
-    81: ('dive_mode', 'DiveMode', 'Dive Mode'),
+    81: ('dive_mode', 'Dive', 'Dive Mode'),
     82: ('test_active', 'TestActive', 'Test Active'),
     83: ('unused83', 'unused83', 'Reserved'),
     84: ('unused84', 'unused84', 'Reserved'),
@@ -142,35 +178,19 @@ FLAG_BIT_DEFS = {
 
 # Logical groups (name -> FC bit numbers). Covers every bit 0..95 exactly once.
 FLAG_GROUPS = [
-    ('Attitude & Control', [12, 26, 4, 56, 30, 74]),
-    ('Altitude', [0, 14, 23, 43, 21, 22, 61, 2, 46, 65]),
-    ('Navigation', [15, 71, 36, 16, 17, 18, 19, 24, 62, 70, 59]),
-    ('RTH / Landing', [20, 3, 72, 45]),
+    ('Attitude & Control', [12, 26, 4, 56]),
+    ('Altitude', [0, 14, 23, 21, 61, 2, 46, 65]),
+    ('Navigation', [15, 36, 16, 17, 18, 19, 24, 70]),
+    ('RTH / Landing', [20, 72, 45, 3, 30]),
     ('Origin / Home', [7, 28, 78]),
-    ('GPS', [6, 57, 52, 79, 68, 66]),
-    ('Sensors / Health', [8, 10, 37, 38, 44, 41, 47, 48, 64, 76, 55]),
-    ('RC & Input', [35, 53, 75, 50, 58, 13, 77, 42]),
+    ('GPS', [6, 52, 79]),
+    ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22]),
+    ('RC & Input', [35, 53, 75, 58, 77, 81]),
     ('Soaring / Glide', [51, 63, 69]),
-    ('Flight Mode / Throttle', [25, 40]),
-    ('Arming / Power', [29, 39, 27, 5]),
-    ('System / Debug', [33, 60, 67, 49, 81, 82, 80]),
+    ('Flight Mode / Throttle', [25, 40, 13]),
+    ('Arming / Power', [29, 39, 5]),
+    ('System / Debug', [33, 67, 49, 80]),
 ]
-
-# Tee stdout to a file so the assistant can read debug logs directly
-_DEBUG_LOG = None
-class _Tee:
-    def write(self, msg):
-        sys.__stdout__.write(msg)
-        sys.__stdout__.flush()
-        global _DEBUG_LOG
-        if _DEBUG_LOG is None:
-            _DEBUG_LOG = open("/tmp/uavxgs_debug.log", "w", buffering=1)
-        _DEBUG_LOG.write(msg)
-    def flush(self):
-        sys.__stdout__.flush()
-        global _DEBUG_LOG
-        if _DEBUG_LOG:
-            _DEBUG_LOG.flush()
 
 class TelemetryThread(QThread):
     """Background thread for serial telemetry"""
@@ -187,11 +207,15 @@ class TelemetryThread(QThread):
         self.serial = None
         self._is_closing = False
         self.verbose_serial = os.environ.get("UAVXGS_VERBOSE_SERIAL", "0") == "1"
+
+    # Auto-reconnect pacing after a dropped CDC link. A bench USB reset takes
+    # the port away for ~30 s (host re-enumeration); retry until it returns.
+    _RECONNECT_BACKOFF_START_S = 1.0
+    _RECONNECT_BACKOFF_MAX_S = 5.0
     
     def run(self):
         import serial
         import serial.tools.list_ports
-        import time
         
         self.running = True
         self._is_closing = False
@@ -215,79 +239,138 @@ class TelemetryThread(QThread):
                 return
 
             self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
+            # First successful open: signal the GUI connected NOW, not only on
+            # a later reopen. A reopen (line 274) exists for dropped CDC links;
+            # a stable UART adapter never drops, so without this the GUI stays
+            # stuck at "Connecting..." and never triggers the on_connected(True)
+            # param readback / rawlog start / read-lock release.
             self.connected.emit(True)
-            
-            buffer = bytearray()
-            packet = bytearray()
-            esc_flag = False
-            
-            while self.running and not self._is_closing:
-                if self.serial and self.serial.is_open and self.serial.in_waiting:
-                    try:
-                        data = self.serial.read(self.serial.in_waiting)
-                        if data and self.verbose_serial:
-                            print(f"[SERIAL] Read {len(data)} bytes: {data[:20].hex()}{'...' if len(data) > 20 else ''}")
-                        if data:
-                            self.raw_bytes.emit(bytes(data))
-                        buffer.extend(data)
-                        
-                        i = 0
-                        while i < len(buffer):
-                            ch = buffer[i]
-                            
-                            if esc_flag:
-                                packet.append(ch)
-                                esc_flag = False
-                                i += 1
-                                continue
-                            
-                            if ch == ESC:
-                                esc_flag = True
-                                i += 1
-                                continue
-                            
-                            if ch == SOH:
-                                if len(packet) > 3:
-                                    txt = bytes(packet).decode("ascii", "replace")
-                                    printable = all(32 <= b < 127 or b in (10, 13)
-                                                    for b in packet)
-                                    if printable:
-                                        print(f"[BOOT] {txt.strip()}")
-                                    else:
-                                        print(f"[SERIAL] Discarding "
-                                              f"{len(packet)} bytes before SOH")
-                                packet.clear()
-                                packet.append(ch)
-                                i += 1
-                                continue
-                            
-                            if ch == EOT:
-                                if len(packet) >= 3:
-                                    self.data_received.emit(bytes(packet))
-                                packet.clear()
-                                i += 1
-                                continue
-                            
-                            packet.append(ch)
-                            i += 1
-                        
-                        buffer.clear()
-                        
-                    except (OSError, Exception):
-                        break
-                
-                QThread.msleep(10)
-                
+            self._link_loop(serial)
+
         except Exception as e:
             if not self._is_closing:
                 self.error.emit(str(e))
         finally:
             self._close_serial()
             self.connected.emit(False)
-    
-    def _close_serial(self):
-        self._is_closing = True
-        self.running = False
+
+    def _link_loop(self, serial):
+        """Read/decode loop with automatic reconnect.
+
+        A vanished or stalled CDC device surfaces as OSError from read().
+        That is retryable: a bench USB reset takes the port away for ~30 s
+        while the host re-enumerates. We emit connected(False), close the
+        port, then keep trying to reopen with a bounded backoff until the
+        device returns (or stop()). A non-OSError exception is a decode or
+        logic bug - log it and stand down instead of hot-reopening a broken
+        loop forever. A dropped link never feeds bytes into the old rawlog:
+        the GUI's on_connected(False) already stopped it, and a successful
+        reopen starts a fresh rawlog session via on_connected(True).
+        """
+        buffer = bytearray()
+        packet = bytearray()
+        esc_flag = False
+        backoff = self._RECONNECT_BACKOFF_START_S
+
+        while self.running and not self._is_closing:
+            try:
+                if self.serial is None or not self.serial.is_open:
+                    # Port was dropped (or stop() is closing us). Try to
+                    # reopen the device; reopen failures are EXPECTED until
+                    # the USB stack re-enumerates, so they just pace the
+                    # backoff instead of killing the link.
+                    try:
+                        self.serial = serial.Serial(
+                            self.port, self.baud, timeout=0.1)
+                    except Exception:
+                        if not self._reconnect_pause(backoff):
+                            break
+                        backoff = min(backoff * 2.0,
+                                      self._RECONNECT_BACKOFF_MAX_S)
+                        continue
+                    self.connected.emit(True)
+                    backoff = self._RECONNECT_BACKOFF_START_S
+                    buffer.clear()
+                    packet.clear()
+                    esc_flag = False
+                    continue
+
+                if self.serial.in_waiting:
+                    data = self.serial.read(self.serial.in_waiting)
+                    if data and self.verbose_serial:
+                        print(f"[SERIAL] Read {len(data)} bytes: {data[:20].hex()}{'...' if len(data) > 20 else ''}")
+                    if data:
+                        self.raw_bytes.emit(bytes(data))
+                    buffer.extend(data)
+                    
+                    i = 0
+                    while i < len(buffer):
+                        ch = buffer[i]
+                        
+                        if esc_flag:
+                            packet.append(ch)
+                            esc_flag = False
+                            i += 1
+                            continue
+                        
+                        if ch == ESC:
+                            esc_flag = True
+                            i += 1
+                            continue
+                        
+                        if ch == SOH:
+                            if len(packet) > 3:
+                                txt = bytes(packet).decode("ascii", "replace")
+                                printable = all(32 <= b < 127 or b in (10, 13)
+                                                for b in packet)
+                                if printable:
+                                    print(f"[BOOT] {txt.strip()}")
+                                else:
+                                    print(f"[SERIAL] Discarding "
+                                          f"{len(packet)} bytes before SOH")
+                            packet.clear()
+                            packet.append(ch)
+                            i += 1
+                            continue
+                        
+                        if ch == EOT:
+                            if len(packet) >= 3:
+                                self.data_received.emit(bytes(packet))
+                            packet.clear()
+                            i += 1
+                            continue
+                        
+                        packet.append(ch)
+                        i += 1
+                    
+                    buffer.clear()
+                
+            except OSError as e:
+                if self._is_closing:
+                    break
+                print(f"<telem> link error: {e!r} -> reconnecting", flush=True)
+                self.connected.emit(False)
+                self._close_port()
+                # The loop top reopens (or paces the backoff if not yet back)
+                
+            except Exception as e:
+                if not self._is_closing:
+                    print(f"<telem> decode error (not reconnecting): {e!r}",
+                          flush=True)
+                    self.connected.emit(False)
+                break
+            
+            QThread.msleep(10)
+
+    def _reconnect_pause(self, seconds):
+        """Sleep up to `seconds` in small slices so stop() can interrupt."""
+        deadline = time.monotonic() + seconds
+        while self.running and not self._is_closing \
+                and time.monotonic() < deadline:
+            QThread.msleep(50)
+        return self.running and not self._is_closing
+
+    def _close_port(self):
         if self.serial:
             try:
                 if self.serial.is_open:
@@ -295,6 +378,11 @@ class TelemetryThread(QThread):
             except (OSError, Exception):
                 pass
             self.serial = None
+    
+    def _close_serial(self):
+        self._is_closing = True
+        self.running = False
+        self._close_port()
     
     def stop(self):
         self._is_closing = True
@@ -305,7 +393,6 @@ class TelemetryThread(QThread):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        sys.stdout = _Tee()
         super().__init__()
         self.flight_data: FlightData = FlightData()
         self.nav_data: Optional[FlightData] = None
@@ -314,21 +401,15 @@ class MainWindow(QMainWindow):
         self.serial_ports: Optional[dict] = None
         self.exec_time: Optional[ExecTimeData] = None
         self.i2c_errors: Optional[I2CErrorData] = None
-        self._last_census: tuple = ()
-        self._last_census_t: float = 0.0
-        self._last_spl_coef: dict = None
         self._last_reported_wdt_mark = -1
         self._last_reported_reset_cause = -1
         self._last_reported_imu_fault_code = -1
         self._last_reported_imu_fault_recoveries = -1
-        self.min_data: Optional[FlightData] = None
         self.origin_data: Optional[OriginData] = None
         self.control_data: Optional[ControlData] = None
         self.guidance_data: Optional[GuidanceData] = None
         self.telemetry: Optional[TelemetryThread] = None
         self.connected = False
-        self._motor_trace_file = None
-        self._motor_header_written = False
         self.current_flag_bits = []
         self.flag_labels = {}
         self.config_labels = []
@@ -343,14 +424,16 @@ class MainWindow(QMainWindow):
         self.calib_window: Optional[CalibrationWindow] = None
         self.misc_window: Optional[MiscWindow] = None
         self.dfu_flasher_window: Optional[DfuFlasherWindow] = None
+        self._trace_viewer = None
+        self._identify_window: Optional[IdentifyWindow] = None
         
         self.speech = SpeechController()
-        self.logger = Logger()
         self.anomaly_logger = AnomalyLogger()
         self.imu_stats_logger = ImuStatsLogger()
         self._anomaly_pending = False
-        self.gps_kml_logger = GpsKmlLogger()
-        self._last_spoken_alt = -999
+        self.raw_logger = RawLogWriter()
+        self.replaying = False
+        self.replay_window: Optional[ReplayWindow] = None
         self._last_spoken_batt = -999
         self._last_spoken_gps_ok = False
         self._last_spoken_armed = False
@@ -358,18 +441,18 @@ class MainWindow(QMainWindow):
         self._last_spoken_flight_state = -1
         self._last_spoken_alarm_state = -1
         self._last_spoken_low_batt = False
+        self._last_spoken_alt = -999999.0
+        self._last_direction_speak = -999999.0
         self._pending_flight_state = -1
         self._state_change_time = 0.0
-        self._logging_active = False
-        self._kml_auto = False
-        self.kml_path = None
-        self.csv_path = None
         self.log_dir = None
         self._bb_chunks = {}
         self._last_wp_data = None
         self._param_write_list = []
         self._param_write_port = None
         self._param_write_on_complete = None
+        self._param_write_progress = None
+        self._param_write_total = 0
         self._param_write_index = 0
         self._revision_from_afname = False
         self._pending_flash_airframe_name = None
@@ -377,6 +460,11 @@ class MainWindow(QMainWindow):
         self._last_rx_time = 0.0
         self._last_init_state = -1
         self._last_init_state_change = 0.0
+        self._log_level = "All"
+        self._flight_log_only = False  # terminal: show only FLIGHT packets
+        self._trace_combo_loading = False
+        self._trace_fc_value = None
+        self._trace_write_pending = None
 
         self.setup_ui()
         self.setup_menu()
@@ -390,18 +478,42 @@ class MainWindow(QMainWindow):
         self.status_timer.timeout.connect(self.check_connection)
         self.status_timer.start(1000)
         
+        # BB dump watchdog: finalize when chunks stop arriving. The FC ends the
+        # dump after a final chunk that is either short (<128 B, e.g. trailer
+        # tail) OR exactly TRACE_HEADER_SIZE (128 B) when there is no capture —
+        # the all-zero header fills one whole chunk. A strict "last chunk <128"
+        # test never fires for that exact-128 case, so guard with idle time.
+        self._bb_dump_timer = QTimer(self)
+        self._bb_dump_timer.setSingleShot(True)
+        self._bb_dump_timer.timeout.connect(self._finalize_bb_dump)
+
+        # Periodic tag-57 poll (~1 Hz) to keep the Identify window fresh.
+        self._identify_poll_timer = QTimer(self)
+        self._identify_poll_timer.timeout.connect(self._poll_tuning)
+        
         self.setWindowTitle("UAVX Groundstation")
         self.setMinimumSize(1320, 990)
         
         self.load_settings()
+
+        # Spoken boot greeting — lets you confirm voice feedback works before
+        # any telemetry events fire (level must be All or higher to hear it).
+        QTimer.singleShot(1500, self._speak_boot_greeting)
     
     def setup_menu(self):
         menubar = self.menuBar()
         
         file_menu = menubar.addMenu("&File")
-        log_folder_action = QAction("Set Log & KML Folder…", self)
+        log_folder_action = QAction("Set Log &KML Folder…", self)
         log_folder_action.triggered.connect(self.select_log_folder)
         file_menu.addAction(log_folder_action)
+        replay_action = QAction("&Replay Log…", self)
+        replay_action.setShortcut("Ctrl+R")
+        replay_action.triggered.connect(self.open_replay)
+        file_menu.addAction(replay_action)
+        trace_action = QAction("Open &Trace Dump…", self)
+        trace_action.triggered.connect(self.show_trace_viewer)
+        file_menu.addAction(trace_action)
         file_menu.addSeparator()
         exit_action = QAction("E&xit", self)
         exit_action.setShortcut("Ctrl+Q")
@@ -440,6 +552,10 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(flash_action)
 
         help_menu = menubar.addMenu("&Help")
+        voice_action = QAction("&Test Spoken Feedback", self)
+        voice_action.setShortcut("Ctrl+T")
+        voice_action.triggered.connect(self._speak_boot_greeting)
+        help_menu.addAction(voice_action)
         about_action = QAction("&About", self)
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
@@ -458,6 +574,48 @@ class MainWindow(QMainWindow):
         self.param_window.raise_()
         self.param_window.activateWindow()
     
+    def show_replay_window(self):
+        if self.replay_window is None:
+            self.replay_window = ReplayWindow(self)
+        self.replay_window.show()
+        self.replay_window.raise_()
+        self.replay_window.activateWindow()
+
+    def show_trace_viewer(self):
+        """File > Open Trace Dump… — open a TRAC snapshot dump off disk (e.g.
+        a synthetic sample from tests/trace_samples or a previously saved
+        dump). Live dumps arrive through _finalize_bb_dump instead."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Trace Dump", self._log_dir(),
+            "Trace Dumps (*.bin);;All Files (*)")
+        if not path:
+            return
+        with open(path, 'rb') as f:
+            data = f.read()
+        if data[:4] != b'TRAC':
+            QMessageBox.warning(
+                self, "Trace Viewer",
+                f"{path}\nis not a TRAC snapshot dump (magic != 'TRAC').")
+            return
+        try:
+            viewer = TraceViewer(data, source=os.path.basename(path))
+        except ValueError as e:
+            QMessageBox.warning(self, "Trace Viewer", str(e))
+            return
+        self._trace_viewer = viewer
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
+
+    def open_replay(self):
+        """Enter replay mode: drop the live FC connection, then open the
+        replay window. Connecting later terminates the replay immediately."""
+        if self.telemetry and self.telemetry.isRunning():
+            self.disconnect()
+        self.raw_logger.forbidden = True
+        self.replaying = True
+        self.show_replay_window()
+
     def show_nav_window(self):
         if self.nav_window is None:
             self.nav_window = NavWindow(self)
@@ -485,6 +643,14 @@ class MainWindow(QMainWindow):
         self.dfu_flasher_window.show()
         self.dfu_flasher_window.raise_()
         self.dfu_flasher_window.activateWindow()
+
+    def show_identify_window(self):
+        if self._identify_window is None:
+            self._identify_window = IdentifyWindow(self)
+        self._identify_window.show()
+        self._identify_window.raise_()
+        self._identify_window.activateWindow()
+        self._poll_tuning()
 
     def show_about(self):
         QMessageBox.about(
@@ -556,31 +722,58 @@ class MainWindow(QMainWindow):
         self.flash_btn.setStyleSheet("font-weight: bold; color: #9b59b6;")
         toolbar.addWidget(self.flash_btn)
 
-        self.kml_check = QCheckBox("KML")
-        self.kml_check.setToolTip("Generate KML track file from incoming GPS")
-        toolbar.addWidget(self.kml_check)
+        self.ident_btn = QPushButton("Identify")
+        self.ident_btn.setToolTip(
+            "Open the Plant Identification window: passive per-axis plant "
+            "identification streamed on tag 57 (~1 Hz while connected)")
+        self.ident_btn.setFixedWidth(80)
+        toolbar.addWidget(self.ident_btn)
 
-        self.kml_file_btn = QPushButton("📁")
-        self.kml_file_btn.setToolTip("Select KML output file")
-        self.kml_file_btn.setFixedWidth(32)
-        toolbar.addWidget(self.kml_file_btn)
+        self.esc_btn = QPushButton("ESC")
+        self.esc_btn.setToolTip(
+            "Enter ESC programming mode: the GCS hands the serial port to the "
+            "AM32/BLHeli App, which connects directly to the FC (10 s connect "
+            "window, countdown beeps). Only when disarmed.")
+        self.esc_btn.setFixedWidth(80)
+        self.esc_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
+        toolbar.addWidget(self.esc_btn)
 
-        self.csv_log_check = QCheckBox("Log")
-        self.csv_log_check.setToolTip("Log flight data to CSV file")
-        toolbar.addWidget(self.csv_log_check)
-
-        self.csv_file_btn = QPushButton("📁")
-        self.csv_file_btn.setToolTip("Select flight log output file")
-        self.csv_file_btn.setFixedWidth(32)
-        toolbar.addWidget(self.csv_file_btn)
-
-        self.dump_bb_check = QCheckBox("BB")
-        self.dump_bb_check.setToolTip("Dump Black Box from flight controller")
-        self.dump_bb_check.setStyleSheet("font-weight: bold;")
-        toolbar.addWidget(self.dump_bb_check)
+        # Trace/Replay buttons hidden for now (redundant)
+        self.replay_btn = QPushButton("Replay")
+        self.replay_btn.setToolTip("Replay a raw telemetry log (Ctrl+R)")
+        self.replay_btn.setFixedWidth(80)
+        self.replay_btn.setVisible(False)
+        toolbar.addWidget(self.replay_btn)
 
         toolbar.addStretch()
-        
+
+        self.trace_label = QLabel("Trace:")
+        self.trace_label.setVisible(False)
+        toolbar.addWidget(self.trace_label)
+        self.trace_type_combo = QComboBox()
+        for tt, label in ((0, 'None'), (1, 'Rate'), (2, 'Attitude'),
+                          (3, 'AltHold'), (4, 'Actuator'), (5, 'IMU')):
+            self.trace_type_combo.addItem(label, tt)
+        self.trace_type_combo.setCurrentIndex(0)  # None is the safe startup default; connect adopts the FC value
+        self.trace_type_combo.setFixedWidth(96)
+        self._trace_combo_tooltip = (
+            "Trace capture type (param 125, FC ParamTable U8 enum). "
+            "Green = value confirmed by the FC; orange = change awaiting "
+            "confirmation. Writes are sent live; flash persists on commit / "
+            "grounded config refresh.")
+        self._set_trace_combo_state('neutral')
+        self.trace_type_combo.setToolTip(self._trace_combo_tooltip)
+        self.trace_type_combo.currentIndexChanged.connect(self._on_trace_type_changed)
+        self.trace_type_combo.setVisible(False)
+        toolbar.addWidget(self.trace_type_combo)
+
+        self.dump_trace_btn = QPushButton("Dump")
+        self.dump_trace_btn.setToolTip("Dump trace / capture ring from flight controller (momentary)")
+        self.dump_trace_btn.setStyleSheet("font-weight: bold;")
+        self.dump_trace_btn.setFixedWidth(56)
+        self.dump_trace_btn.setVisible(False)
+        toolbar.addWidget(self.dump_trace_btn)
+
         self.status_label = QLabel("● Disconnected")
         self.status_label.setStyleSheet("color: red; font-weight: bold;")
         toolbar.addWidget(self.status_label)
@@ -592,21 +785,8 @@ class MainWindow(QMainWindow):
         status_bar.setSpacing(6)
 
         self.status_msg = QLabel("Ready")
-        self.status_msg.setStyleSheet("color: #888; font-size: 10px;")
+        self.status_msg.setStyleSheet("color: #888; font-size: 14px;")
         status_bar.addWidget(self.status_msg, 1)
-
-        self.packet_log_check = QCheckBox("Debug")
-        self.packet_log_check.setChecked(True)
-        self.packet_log_check.setToolTip("Show debug messages in status bar")
-        self.packet_log_check.setStyleSheet("font-size: 10px;")
-        status_bar.addWidget(self.packet_log_check)
-
-        status_bar.addWidget(QLabel("Level:"))
-        self.debug_level_combo = QComboBox()
-        self.debug_level_combo.addItems(["Info", "Warnings", "Errors", "All"])
-        self.debug_level_combo.setCurrentIndex(3)
-        self.debug_level_combo.setFixedWidth(80)
-        status_bar.addWidget(self.debug_level_combo)
 
         status_bar.addWidget(QLabel("Speech:"))
         self.speech_level_combo = QComboBox()
@@ -622,16 +802,18 @@ class MainWindow(QMainWindow):
         content = QHBoxLayout()
         content.setSpacing(10)
         
-        # ---- Left Panel: Attitude Indicator + Altitude ----
+        # ---- Left Panel: Alarm Box + Attitude Indicator + Altitude ----
         left_panel = QVBoxLayout()
         left_panel.setSpacing(5)
         left_panel.setAlignment(Qt.AlignCenter)
-        
-        # Attitude Indicator (with compass integrated) - 25% larger
+
+        # Attitude Indicator (with compass integrated) — the artificial horizon
+        # now fills the panel fully (the red flashing AlarmFlashBox was removed
+        # 2026-09-10; alarms still surface via the alarm-state label and logs).
         self.attitude = AttitudeIndicator()
-        self.attitude.setMinimumSize(375, 375)
+        self.attitude.setMinimumSize(188, 260)
         self.attitude.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        left_panel.addWidget(self.attitude, 2)
+        left_panel.addWidget(self.attitude, 3)
 
         # Execution time bargraph (between AH and Altitude)
         self.exec_bar = ExecTimeBar()
@@ -1024,34 +1206,44 @@ class MainWindow(QMainWindow):
             lbl.setStyleSheet("color: #e74c3c;")
         
         gps_layout.addWidget(QLabel("Lat:"), 0, 0)
-        gps_layout.addWidget(self.gps_lat, 0, 1, 1, 2)
-        gps_layout.addWidget(QLabel("Lon:"), 0, 3)
-        gps_layout.addWidget(self.gps_lon, 0, 4, 1, 2)
-        
+        gps_layout.addWidget(self.gps_lat, 0, 1)
+        gps_layout.addWidget(QLabel("Lon:"), 0, 2)
+        gps_layout.addWidget(self.gps_lon, 0, 3)
+
         gps_layout.addWidget(QLabel("Alt:"), 1, 0)
         gps_layout.addWidget(self.gps_alt, 1, 1)
         gps_layout.addWidget(QLabel("Vel:"), 1, 2)
         gps_layout.addWidget(self.gps_vel, 1, 3)
-        
+
         gps_layout.addWidget(QLabel("Sats:"), 2, 0)
         gps_layout.addWidget(self.gps_sats, 2, 1)
         gps_layout.addWidget(QLabel("Fix:"), 2, 2)
         gps_layout.addWidget(self.gps_fix, 2, 3)
-        gps_layout.addWidget(QLabel("hAcc:"), 2, 4)
-        gps_layout.addWidget(self.gps_hacc, 2, 5)
-        
-        gps_layout.addWidget(QLabel("vAcc:"), 3, 0)
-        gps_layout.addWidget(self.gps_vacc, 3, 1)
+
+        gps_layout.addWidget(QLabel("hAcc:"), 3, 0)
+        gps_layout.addWidget(self.gps_hacc, 3, 1)
         gps_layout.addWidget(QLabel("sAcc:"), 3, 2)
         gps_layout.addWidget(self.gps_sacc, 3, 3)
-        gps_layout.addWidget(QLabel("cAcc:"), 3, 4)
-        gps_layout.addWidget(self.gps_cacc, 3, 5)
 
-        gps_layout.addWidget(QLabel("Rate:"), 4, 0)
-        gps_layout.addWidget(self.gps_rate_label, 4, 1)
-        self.gps_rxbytes_label = QLabel("---")
-        gps_layout.addWidget(QLabel("SR:"), 4, 2)
-        gps_layout.addWidget(self.gps_rxbytes_label, 4, 3)
+        gps_layout.addWidget(QLabel("vAcc:"), 4, 0)
+        gps_layout.addWidget(self.gps_vacc, 4, 1)
+        gps_layout.addWidget(QLabel("Rate:"), 4, 2)
+        gps_layout.addWidget(self.gps_rate_label, 4, 3)
+
+        gps_layout.addWidget(QLabel("cAcc:"), 5, 0)
+        gps_layout.addWidget(self.gps_cacc, 5, 1)
+
+        fm = self.gps_lat.fontMetrics()
+        w_latlon = fm.horizontalAdvance("-123.456789") + 4
+        w_num = fm.horizontalAdvance("-12345.6") + 4
+        for lbl in (self.gps_lat, self.gps_lon):
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl.setMinimumWidth(w_latlon)
+        for lbl in (self.gps_alt, self.gps_vel, self.gps_sats, self.gps_fix,
+                    self.gps_hacc, self.gps_sacc, self.gps_vacc, self.gps_cacc,
+                    self.gps_rate_label):
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl.setMinimumWidth(w_num)
 
         gps_box.setLayout(gps_layout)
         nav_gps_row.addWidget(gps_box)
@@ -1069,9 +1261,8 @@ class MainWindow(QMainWindow):
         self.link_rssi = QLabel("--")
         self.link_losses = QLabel("--")
         self.link_failsafes = QLabel("--")
-        self.link_rxbytes = QLabel("--")
         for lbl in (self.link_lq, self.link_snr, self.link_rssi, self.link_losses,
-                    self.link_failsafes, self.link_rxbytes):
+                    self.link_failsafes):
             lbl.setStyleSheet("font-weight: bold;")
         link_layout.addWidget(QLabel("LQ:"), 0, 0)
         link_layout.addWidget(self.link_lq, 0, 1)
@@ -1083,8 +1274,6 @@ class MainWindow(QMainWindow):
         link_layout.addWidget(self.link_losses, 1, 3)
         link_layout.addWidget(QLabel("Failsafes:"), 2, 0)
         link_layout.addWidget(self.link_failsafes, 2, 1)
-        link_layout.addWidget(QLabel("SR:"), 2, 2)
-        link_layout.addWidget(self.link_rxbytes, 2, 3)
         link_box.setLayout(link_layout)
         
         # Serial Ports (side-by-side with Link Stats)
@@ -1139,7 +1328,6 @@ class MainWindow(QMainWindow):
         motors_layout.setVerticalSpacing(1)
         motors_layout.setHorizontalSpacing(4)
         self.motor_bars = []
-        self.motor_values = []
         for i in range(10):
             row = (i // 5) * 2
             col = i % 5
@@ -1156,13 +1344,9 @@ class MainWindow(QMainWindow):
             bar.setValue(0)
             bar.setTextVisible(True)
             bar.setFormat("%v")
+            bar.setFixedHeight(14)
             motors_layout.addWidget(bar, row + 1, col)
-            val_lbl = QLabel("1000")
-            val_lbl.setAlignment(Qt.AlignCenter)
-            val_lbl.setStyleSheet("font-size: 8px; color: #666;")
-            motors_layout.addWidget(val_lbl, row + 2, col)
             self.motor_bars.append(bar)
-            self.motor_values.append(val_lbl)
         motors_box.setLayout(motors_layout)
         right_panel.addWidget(motors_box)
         
@@ -1190,9 +1374,13 @@ class MainWindow(QMainWindow):
         config_layout.setContentsMargins(8, 6, 8, 6)
         
         self.config_labels = []
-        config_names = ["Ext Mag", "Autoland", "No LEDs", "Emulation", "AH Alarm", "GPS Alt", "Unused",
-                        "Batt Comp", "Fast Start", "ESC Prog", "Have GPS", "Rev Props", "Turn WP", "Beep WP"]
-        for name in config_names:
+        self.config_flags = [
+            (1, 0, "Ext Mag"), (1, 1, "Autoland"), (1, 2, "Use Mag"), (1, 3, "Emulation"),
+            (1, 4, "AH Alarm"), (1, 5, "GPS Alt"), (1, 6, "WP Test"),
+            (2, 0, "Batt Comp"), (2, 1, "Fast Start"), (2, 3, "Have GPS"), (2, 4, "Prop In"),
+            (2, 5, "Turn WP"), (2, 6, "Beep WP"),
+        ]
+        for which, bit, name in self.config_flags:
             label = QLabel(name)
             label.setMinimumWidth(70)
             label.setAlignment(Qt.AlignCenter)
@@ -1287,6 +1475,9 @@ class MainWindow(QMainWindow):
         self.flags_grid_widget = QWidget()
         self.flags_grid_widget.setLayout(grid)
         flags_layout.addWidget(self.flags_grid_widget)
+
+        # Identify window (plant-ID telemetry) — separate top-level window,
+        # created lazily on first click (CalibrationWindow pattern).
     
     def setup_connections(self):
         self.connect_btn.clicked.connect(self.toggle_connection)
@@ -1295,33 +1486,112 @@ class MainWindow(QMainWindow):
         self.calib_btn.clicked.connect(self.show_calibration_window)
         self.misc_btn.clicked.connect(self.show_misc_window)
         self.flash_btn.clicked.connect(self.show_dfu_flasher)
-        self.kml_check.toggled.connect(self._on_kml_toggled)
-        self.csv_log_check.toggled.connect(self._on_log_toggled)
-        self.kml_file_btn.clicked.connect(self.select_kml_file)
-        self.csv_file_btn.clicked.connect(self.select_csv_file)
-        self.dump_bb_check.toggled.connect(self.on_dump_bb_toggled)
+        self.ident_btn.clicked.connect(self.show_identify_window)
+        self.esc_btn.clicked.connect(self.enter_esc_programming)
+        self.dump_trace_btn.clicked.connect(self.dump_black_box)
+        self.replay_btn.clicked.connect(self.open_replay)
         self.speech_level_combo.currentIndexChanged.connect(self.speech_level_changed)
         
         for btn in [self.connect_btn]:
             btn.setProperty('original_text', btn.text())
         
     def dump_black_box(self):
+        if self._trace_fc_value in (None, 0):
+            self.log_debug(
+                "Dump requested while the FC's trace type is None — the live "
+                "ring has no snapshot. Only a previously committed flash capture "
+                "(from a non-None type) would return data; otherwise expect the "
+                "'no snapshot' result.", "Warnings")
         self._bb_chunks = {}
         self.send_request(PacketTag.MISC, MiscCommand.BB_DUMP, 0)
-        self.log_debug("📤 Sent Dump Black Box command", "Info")
+        self.log_debug("📤 Sent Dump Trace / capture ring command", "Info")
 
-    def on_dump_bb_toggled(self, checked):
-        if checked:
-            self.dump_black_box()
-            self.dump_bb_check.setChecked(False)
+    def enter_esc_programming(self):
+        if not self.connected:
+            QMessageBox.information(self, "ESC Programming",
+                                    "Connect to the FC first (Connect button).")
+            return
+        if self._in_flight:
+            QMessageBox.warning(self, "ESC Programming",
+                                "Only available while DISARMED — the FC refuses "
+                                "ESC access in flight.")
+            return
+        ret = QMessageBox.question(
+            self, "ESC Programming",
+            "Enter ESC programming mode?\n\n"
+            "The FC opens a 10 s connect window and the GCS releases the serial "
+            "port so the AM32/BLHeli App can connect directly to it.\n\n"
+            "Reconnect with the Connect button when finished.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        self.esc_btn.setEnabled(False)
+        self.esc_btn.setStyleSheet("font-weight: bold; color: #c0392b; background-color: #b03a2e;")
+        self.esc_btn.setText("ESC •")
+        self.log_debug("📤 Requesting ESC programming mode (miscESCProg)", "Info")
+        self.send_request(PacketTag.MISC, MiscCommand.ESC_PROG, 0)
+
+    def _on_esc_prog_ack(self):
+        self.esc_btn.setStyleSheet("font-weight: bold; color: #c0392b; background-color: #b03a2e;")
+        self.esc_btn.setText("ESC •")
+        self.esc_btn.setToolTip(
+            "ESC programming active: the FC is listening for the AM32/BLHeli App "
+            "(10 s window, countdown beeps). Reconnect when finished.")
+        self.log_debug(
+            "⚡ ESC programming mode confirmed — releasing the serial port in 2 s "
+            "so the AM32/BLHeli App can connect directly. Reconnect when finished.",
+            "Info")
+        QTimer.singleShot(2000, self.disconnect)
+
+    def _on_esc_prog_denied(self):
+        self.esc_btn.setEnabled(True)
+        self.esc_btn.setText("ESC")
+        self.esc_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
+        self.log_debug("❌ ESC programming refused by the FC (armed?).",
+                       "Errors")
+        QMessageBox.warning(self, "ESC Programming",
+                            "The FC refused ESC programming mode.\n\n"
+                            "Disarm the aircraft and try again.")
 
     def _finalize_bb_dump(self):
+        self._bb_dump_timer.stop()
         if not self._bb_chunks:
             return
         seqs = sorted(self._bb_chunks.keys())
         data = b''
         for s in seqs:
             data += self._bb_chunks[s]
+        self._bb_chunks = {}
+        # Trace dump with no capture: the FC streams an all-zero
+        # TRACE_HEADER_SIZE (128 B v2 / 32 B v1) header with no records. Detect
+        # any all-zero dump and report instead of offering a pointless save.
+        if not any(data) and len(data) >= 32:
+            msg = ("No trace capture on the FC.\n\n"
+                   "The FC returned an all-zero header. Possible causes:\n"
+                   "• Trace type is None (set the Trace combo to a probe type)\n"
+                   "• ch8 was never held in flight (capture needs the go-ahead)\n"
+                   "• no disarm commit since the capture\n\n"
+                   "Nothing was saved.")
+            self.log_debug(
+                "Trace dump has no capture: the FC returned the all-zero "
+                "header (trace type None on the FC, or ch8 never armed a "
+                "capture in flight, or no disarm commit). Nothing to save — "
+                "set the Trace type, fly, disarm, then dump again.", "Warnings")
+            QMessageBox.warning(self, "Trace Dump — No Capture", msg)
+            return
+        if data[:4] == b'TRAC':
+            try:
+                viewer = TraceViewer(data, source="live dump")
+            except ValueError as e:
+                QMessageBox.warning(self, "Trace Viewer", str(e))
+                return
+            self._trace_viewer = viewer
+            viewer.show()
+            viewer.raise_()
+            viewer.activateWindow()
+            self.log_debug(f"✅ TRAC snapshot ({len(data)}B) → Trace Viewer",
+                           "Info")
+            return
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Black Box Dump",
@@ -1331,7 +1601,6 @@ class MainWindow(QMainWindow):
             with open(path, 'wb') as f:
                 f.write(data)
             self.log_debug(f"✅ BB dump saved ({len(data)}B) → {path}", "Info")
-        self._bb_chunks = {}
 
     def _log_dir(self):
         """Absolute directory for logs/KML. Never relative, so files never
@@ -1342,36 +1611,6 @@ class MainWindow(QMainWindow):
         d = os.path.expanduser("~/UAVX")
         os.makedirs(d, exist_ok=True)
         return d
-
-    def _new_kml_path(self):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(self._log_dir(), f"{timestamp}_gps_track.kml")
-
-    def _start_motor_trace(self):
-        """Open the raw motor-trace capture file. The FC emits plain-text CSV
-        lines (printable ASCII, no UAVX framing) on the telemetry serial while
-        in flight; we tee those bytes here."""
-        if self._motor_trace_file is not None:
-            return
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(self._log_dir(), f"{timestamp}_motor_trace.csv")
-        try:
-            self._motor_trace_file = open(path, "w")
-            self._motor_header_written = False
-            self.log_debug(f"🔧 Motor trace → {path}", "Info")
-        except OSError as e:
-            self._motor_trace_file = None
-            self.log_debug(f"⚠️ Motor trace failed to open {path}: {e}", "Warn")
-
-    def _stop_motor_trace(self):
-        if self._motor_trace_file is not None:
-            try:
-                self._motor_trace_file.flush()
-                self._motor_trace_file.close()
-                self.log_debug("🔧 Motor trace closed", "Info")
-            except OSError:
-                pass
-            self._motor_trace_file = None
 
     # WDT trip codes must match the emum in UAVXArmQ/src/wdt.h
     _WDT_TRIP_NAMES = {
@@ -1458,146 +1697,20 @@ class MainWindow(QMainWindow):
             self._hide_fault_banner()
 
     def _on_raw_bytes(self, data: bytes):
-        """Tee raw serial bytes to the motor-trace file, keeping only the
-        printable-ASCII trace text (UAVX packets are already handled by the
-        packet parser)."""
-        if self._motor_trace_file is None:
-            return
-        printable = bytes(b for b in data if 32 <= b < 127 or b in (10, 13))
-        if printable:
-            try:
-                text = printable.decode("ascii", "replace")
-                self._write_motor_header(text)
-                self._motor_trace_file.write(text)
-            except OSError:
-                self._stop_motor_trace()
-
-    def _write_motor_header(self, text):
-        """Write a CSV header once, derived from the field count of the first
-        trace line so it stays correct for any drive count (NoOfDrives)."""
-        if getattr(self, "_motor_header_written", False):
-            return
-        fields = [f for f in text.split(",") if f.lstrip("T").strip()]
-        width = len(fields)
-        # Don't infer from a truncated partial line (< the fixed leading set).
-        if width < 27:
-            return
-        names = ["marker", "ms", "State", "DesiredThrottle",
-                 "Stick_Pitch", "Stick_Roll", "Stick_Yaw",
-                 "IntE_P_Pitch", "IntE_P_Roll", "IntE_P_Yaw",
-                 "IntE_R_Pitch", "IntE_R_Roll", "IntE_R_Yaw",
-                 "Rl", "Pl", "Yl",
-                 "q0", "q1", "q2", "q3",
-                 "Rate_Pitch", "Rate_Roll", "Rate_Yaw",
-                 "Acc_BF", "Acc_LR", "Acc_UD"]
-        # Remaining fields are pairs: RawPW[n], PWp[n].
-        n_drives = (width - len(names)) // 2
-        for i in range(n_drives):
-            names += [f"RawPW{i}", f"PWp{i}"]
-        self._motor_trace_file.write(",".join(names) + "\n")
-        self._motor_header_written = True
-
-    def _sync_loggers(self):
-        # Logs only run while connected AND in flight. The checkbox state records
-        # intent; files are started when we take off (armed) and flushed+closed
-        # when we land (disarmed) so the actual landing is captured. A fresh
-        # file is begun on the next flight if the box is still ticked.
-        if not self.connected:
-            return
-
-        # KML runs if either the KML box or the flight-log (CSV) box is checked
-        kml_wanted = self.kml_check.isChecked() or self.csv_log_check.isChecked()
-        if self._in_flight and kml_wanted and not self.gps_kml_logger.active:
-            path = os.path.abspath(self.kml_path or self._new_kml_path())
-            self.gps_kml_logger.start(path)
-            self.log_debug(f"📍 KML logging → {path}", "Info")
-        elif not kml_wanted and self.gps_kml_logger.active:
-            path = self.gps_kml_logger.stop()
-            if path:
-                self.log_debug(f"✅ KML saved → {path}", "Info")
-            else:
-                self.log_debug("ℹ️ No GPS points recorded", "Info")
-
-        # CSV flight log only when the Log box is checked and we are in flight
-        if self._in_flight and self.csv_log_check.isChecked() and self.logger.csv_writer is None:
-            path = self.logger.start_log("flight", path=self.csv_path)
-            self._logging_active = True
-            self.log_debug(f"📝 Flight log → {os.path.abspath(path)}", "Info")
-        elif not self.csv_log_check.isChecked() and self.logger.csv_writer is not None:
-            self.logger.close()
-            self._logging_active = False
-            self.log_debug("✅ Flight log closed", "Info")
-
-    def _finalize_loggers(self):
-        """Flush and close the current log files (called when we land)."""
-        if self.gps_kml_logger.active:
-            path = self.gps_kml_logger.stop()
-            if path:
-                self.log_debug(f"✅ KML saved → {path}", "Info")
-            else:
-                self.log_debug("ℹ️ No GPS points recorded", "Info")
-        if self.logger.csv_writer is not None:
-            self.logger.close()
-            self._logging_active = False
-            self.log_debug("✅ Flight log closed", "Info")
-
-    def _on_kml_toggled(self, checked):
-        if not self.kml_check.isEnabled():
-            return
-        self._kml_auto = False  # explicit user choice
-        self._sync_loggers()
-
-    def _on_log_toggled(self, checked):
-        if checked:
-            # Enabling flight log also enables KML generation
-            self.kml_check.setEnabled(False)
-            if not self.kml_check.isChecked():
-                self.kml_check.setChecked(True)
-                self._kml_auto = True
-            self._sync_loggers()
-        else:
-            self.kml_check.setEnabled(True)
-            if self._kml_auto:
-                self._kml_auto = False
-                self.kml_check.setChecked(False)
-            self._sync_loggers()
-
-    def select_kml_file(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Select KML Track File",
-            self.kml_path or os.path.join(self._log_dir(), "gps_track.kml"),
-            "KML Files (*.kml);;All Files (*)")
-        if path:
-            self.kml_path = path
-            self.log_debug(f"📁 KML file set → {path}", "Info")
-
-    def select_csv_file(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Select Flight Log File",
-            self.csv_path or os.path.join(self._log_dir(), "flight.csv"),
-            "CSV Files (*.csv);;All Files (*)")
-        if path:
-            self.csv_path = path
-            self.log_debug(f"📁 Flight log file set → {path}", "Info")
+        """Tee raw serial bytes to the always-on raw log (all bytes, binary
+        and printable alike)."""
+        if self.raw_logger.active:
+            self.raw_logger.write(data)
 
     def select_log_folder(self):
         start = self.log_dir or os.path.expanduser("~/UAVX")
-        folder = QFileDialog.getExistingDirectory(self, "Select Log & KML Folder", start)
+        folder = QFileDialog.getExistingDirectory(self, "Select Log Folder", start)
         if folder:
             self.log_dir = folder
             os.makedirs(self.log_dir, exist_ok=True)
+            self.raw_logger.log_dir = folder
             self.save_settings()
             self.log_debug(f"📂 Log folder set → {folder}", "Info")
-        self._update_log_location_indicator()
-
-    def _update_log_location_indicator(self):
-        """Colour the file buttons: orange when the save location is unknown,
-        green once a folder has been selected."""
-        known = bool(self.log_dir) and os.path.isdir(self.log_dir)
-        color = "green" if known else "orange"
-        style = f"background-color: {color}; color: white; font-weight: bold;"
-        self.kml_file_btn.setStyleSheet(style)
-        self.csv_file_btn.setStyleSheet(style)
 
     def load_settings(self):
         settings = QSettings("UAVX", "Groundstation")
@@ -1608,30 +1721,41 @@ class MainWindow(QMainWindow):
             saved_port = "auto"
         self.port_combo.setCurrentText(saved_port)
         self.baud_combo.setCurrentText(settings.value("baud", "115200"))
-        speech_level = int(settings.value("speech_level", SpeechLevel.ALL.value))
-        self.speech.level = SpeechLevel(speech_level)
-        self.speech_level_combo.setCurrentIndex(speech_level)
+        # Speech level: default is OFF (2026-09-04, Greg). The operator opts in by
+        # selecting a level from the status-bar combo; the persisted choice is
+        # honoured, but a never-chosen GCS defaults to silenced.
+        stored_level = settings.value("speech_level", None)
+        if stored_level is None:
+            speech_level = SpeechLevel.OFF
+        else:
+            try:
+                speech_level = SpeechLevel(int(stored_level))
+            except (TypeError, ValueError):
+                speech_level = SpeechLevel.OFF
+        self.speech.level = speech_level
+        self.speech_level_combo.setCurrentIndex(self.speech.level)
+        if not self.speech.available:
+            self.log_debug(
+                f"🔇 Speech unavailable: {self.speech.init_error}", "Info")
 
         # Log folder: prompt once on first run, otherwise use saved location
         self.log_dir = settings.value("log_dir", None)
         if not self.log_dir:
             default_dir = os.path.expanduser("~/UAVX")
             folder = QFileDialog.getExistingDirectory(
-                self, "Select folder for KML & flight logs", default_dir)
+                self, "Select folder for raw telemetry logs", default_dir)
             if folder:
                 self.log_dir = folder
             else:
                 self.log_dir = default_dir
             settings.setValue("log_dir", self.log_dir)
         os.makedirs(self.log_dir, exist_ok=True)
-        # Route the CSV logger's default (no explicit file chosen) to this folder
-        self.logger.base_dir = self.log_dir
+        self.raw_logger.log_dir = self.log_dir
         # Verify + confirm the active log location on every startup
         if not os.access(self.log_dir, os.W_OK):
             self.log_debug(f"⚠️ Log folder not writable: {self.log_dir}", "Errors")
         else:
             self.log_debug(f"📂 Log folder → {self.log_dir}", "Info")
-        self._update_log_location_indicator()
 
     def save_settings(self):
         settings = QSettings("UAVX", "Groundstation")
@@ -1647,8 +1771,23 @@ class MainWindow(QMainWindow):
             self.connect_telemetry()
     
     def connect_telemetry(self):
+        # Connecting while replaying a log terminates the replay immediately
+        # and returns the GCS to the live FC link.
+        if self.replaying:
+            self.replaying = False
+            self.raw_logger.forbidden = False
+            if self.replay_window is not None:
+                self.replay_window.close()
+            self.log_debug("⏹ Replay terminated by Connect", "Info")
+
         port = self.port_combo.currentText()
         baud = int(self.baud_combo.currentText())
+        
+        # A previous thread may still be auto-reconnecting after a drop; stop
+        # it first so two threads never pump the same link.
+        if self.telemetry and self.telemetry.isRunning():
+            self.telemetry.stop()
+            self.telemetry = None
         
         self.telemetry = TelemetryThread(port, baud)
         self.telemetry.data_received.connect(self.process_packet)
@@ -1665,6 +1804,11 @@ class MainWindow(QMainWindow):
         self.connect_btn.setEnabled(False)
         self.connect_btn.setText("Disconnecting...")
         self._pending_param_verification = False
+        if self.param_window is not None:
+            # Clear the write interlock so a mid-commit disconnect/reconnect
+            # doesn't leave the commit path locked forever.
+            self.param_window._flash_write_pending = False
+            self.param_window._write_in_progress = False
         
         if self.telemetry:
             self.telemetry.stop()
@@ -1672,8 +1816,10 @@ class MainWindow(QMainWindow):
         
         self.connected = False
         self._in_flight = False
-        self._finalize_loggers()
-        self._stop_motor_trace()
+        self.raw_logger.stop()
+        self._trace_fc_value = None
+        self._trace_write_pending = None
+        self._set_trace_combo_state('neutral')
         self.connect_btn.setText("Connect")
         self.connect_btn.setStyleSheet("background-color: red; color: white; font-weight: bold;")
         self.connect_btn.setEnabled(True)
@@ -1688,21 +1834,31 @@ class MainWindow(QMainWindow):
         
         if connected:
             self._in_flight = False
-            self._start_motor_trace()
+            self.esc_btn.setEnabled(True)
+            self.esc_btn.setText("ESC")
+            self.esc_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
+            self.raw_logger.log_dir = self.log_dir or os.path.expanduser("~/UAVX")
+            self.raw_logger.start()
+            self.log_debug(f"🖊️ Raw log → {os.path.abspath(self.raw_logger._path)}", "Info")
             self.connect_btn.setText("Disconnect")
             self.connect_btn.setStyleSheet("background-color: green; color: white; font-weight: bold;")
             self.status_label.setText("● Connected")
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
             self.statusBar().showMessage("Connected to UAVX")
             self.log_debug("✅ Connected to UAVX", "Info")
-            self.send_request(PacketTag.PARAM_TAGGED_READ, 255, 0, None)
+            # Skip the connect-time tag-71 when a commit's deferred verification is
+            # outstanding — _request_write_verify() (first flight packet) does that
+            # single readback once the FC is fully back. Avoids a racing double-read.
+            if not self._pending_param_verification:
+                self.send_request(PacketTag.PARAM_TAGGED_READ, 255, 0, None)
             self.send_request(PacketTag.MIN, 0, 0, None)
             self.send_request(PacketTag.AFNAME, 0, 0, None)
             self.send_request(PacketTag.TUNING, 0, 0, None)
+            self._identify_poll_timer.start(1000)
         else:
             self._in_flight = False
-            self._finalize_loggers()
-            self._stop_motor_trace()
+            self.raw_logger.stop()
+            self._identify_poll_timer.stop()
             self.connect_btn.setText("Connect")
             self.connect_btn.setStyleSheet("background-color: red; color: white; font-weight: bold;")
             self.status_label.setText("● Disconnected")
@@ -1716,23 +1872,26 @@ class MainWindow(QMainWindow):
     
     def clear_debug(self):
         self.status_msg.setText("Ready")
-        self.status_msg.setStyleSheet("color: #888; font-size: 10px;")
-        levels = ["Info", "Warnings", "Errors", "All"]
-        self.log_debug(f"🔍 Debug level: {levels[index]}", "Info")
+        self.status_msg.setStyleSheet("color: #888; font-size: 14px;")
     
     def speech_level_changed(self, index):
         level = SpeechLevel(index)
         self.speech.level = level
         label = LEVEL_LABELS.get(level, "Off")
         self.log_debug(f"🔊 Speech level: {label}", "Info")
+
+    def _speak_boot_greeting(self):
+        if self.speech.available:
+            self.speech.speak("Ready", SpeechLevel.ALL, volume=0.6)
+            self.log_debug(
+                f"🔊 Boot greeting spoken via {self.speech.backend}", "Info")
+        else:
+            self.log_debug(
+                f"🔇 Boot greeting skipped — speech unavailable: "
+                f"{self.speech.init_error}", "Info")
     
     def log_debug(self, message, level="Info"):
-        if not self.packet_log_check.isChecked() and "packet" in message.lower():
-            return
-        
-        level_idx = self.debug_level_combo.currentIndex()
-        levels = ["Info", "Warnings", "Errors", "All"]
-        current_level = levels[level_idx]
+        current_level = self._log_level
         
         if current_level == "Info" and level != "Info":
             return
@@ -1752,7 +1911,7 @@ class MainWindow(QMainWindow):
         
         html = f'<span style="color: #666;">[{timestamp}]</span> <span style="color: {color};">{level}:</span> {message}'
         self.status_msg.setText(f"[{timestamp}] {level}: {message}")
-        self.status_msg.setStyleSheet(f"color: {color}; font-size: 10px;")
+        self.status_msg.setStyleSheet(f"color: {color}; font-size: 14px;")
     
     def _build_packet_with_checksum(self, data: bytes) -> bytes:
         packet = bytearray()
@@ -1795,6 +1954,9 @@ class MainWindow(QMainWindow):
         raw_data.append(a2)
 
         packet = self._build_packet_with_checksum(raw_data)
+
+        if tag == PacketTag.MISC:
+            self._pending_misc_command = a1
 
         try:
             serial_port.write(packet)
@@ -1919,6 +2081,8 @@ class MainWindow(QMainWindow):
                 self.config1_cache = int(parsed.entries[ParamIndex.CONFIG1_BITS][1])
             if ParamIndex.CONFIG2_BITS in parsed.entries:
                 self.config2_cache = int(parsed.entries[ParamIndex.CONFIG2_BITS][1])
+            if ParamIndex.TRACE_TYPE in parsed.entries:
+                self._sync_trace_combo(parsed.entries[ParamIndex.TRACE_TYPE][1])
             if self.param_window is not None:
                 self.param_window.update_params_from_typed(parsed)
             else:
@@ -1927,6 +2091,36 @@ class MainWindow(QMainWindow):
         version = getattr(parsed, 'version_name', '')
         if version and not self._revision_from_afname:
             self.revision_label.setText(f"UAVX {version}")
+
+    def can_read_parameters(self):
+        """GCS-side gate: allowed to request a param download from the FC."""
+        if not self.connected or not self.telemetry:
+            return False, "Not connected"
+        if self.param_window is not None and self.param_window._flash_write_pending:
+            return False, "Flash write/commit outstanding"
+        return True, ""
+
+    def can_write_parameters(self):
+        """GCS-side gate: allowed to commit parameters to FC flash.
+
+        The FC hard-blocks flash erase/write in flight (RefreshConfig gates on
+        State != eInFlight), and heads towards a verify after a commit, so this
+        is defense-in-depth plus the user-facing explanation for the block.
+        """
+        if not self.connected or not self.telemetry:
+            return False, "Not connected"
+        if self._flash_write_in_progress():
+            return False, "A flash write/commit is already in progress"
+        fd = getattr(self, 'flight_data', None)
+        if fd and fd.flight_state == FlightState.eInFlight:
+            return False, "The aircraft is in flight"
+        return True, ""
+
+    def _flash_write_in_progress(self):
+        if self.param_window is not None:
+            return (self.param_window._flash_write_pending
+                    or self.param_window._write_in_progress)
+        return False
 
     def send_params_typed(self, on_complete=None, indices=None, progress_cb=None):
         """Send widget values as individual param packets.
@@ -1951,13 +2145,18 @@ class MainWindow(QMainWindow):
                 widget = self.param_window.params[i]
                 if isinstance(widget, QDoubleSpinBox):
                     display = widget.value()
-                    mult = PARAM_DISPLAY_MULT.get(i, 1.0)
+                    mult = self.param_window._display_mult(i)
                     fval = display / mult
                 elif isinstance(widget, QSpinBox):
                     fval = float(widget.value())
                 elif isinstance(widget, QComboBox):
                     data = widget.currentData()
-                    fval = float(data) if data is not None else float(widget.currentIndex())
+                    if data is None:
+                        raise ValueError(
+                            f"Combo param {i} selection has no data "
+                            f"(index {widget.currentIndex()}) — refusing to write "
+                            f"a positional index as the value")
+                    fval = float(data)
                 else:
                     fval = 0.0
             else:
@@ -2014,17 +2213,108 @@ class MainWindow(QMainWindow):
         if pcb:
             pcb(self._param_write_index, self._param_write_total)
         QTimer.singleShot(5, self._send_next_param)
-    
-    def _check_speech_events(self, f):
-        alt = int(f.altitude)
-        if abs(alt - self._last_spoken_alt) >= 10:
-            self.speech.speak_altitude(alt)
-            self._last_spoken_alt = alt
 
+    def _write_param_direct(self, idx, fval):
+        """Queue one raw (idx, fc-float) param write through the tag-17 sender."""
+        self._write_params_live([(idx, float(fval))])
+
+    def _write_params_live(self, items):
+        """Queue raw (idx, fc-float) param writes through the tag-17 sender.
+
+        Live-write path (debounced spinbox/combo changes and the trace combo):
+        writes reach the FC's RAM image immediately; flash is a separate,
+        explicit commit. If a batch is already in flight, append to its tail —
+        the pump drains the list until empty, so nothing is dropped (the GCS
+        commit path depends on every pending value landing in RAM before the
+        flash commit packs the block).
+        """
+        if not items:
+            return
+        serial_port = getattr(self.telemetry, 'serial', None)
+        if not serial_port or not serial_port.is_open:
+            return
+        if self._param_write_list:
+            self.log_debug(f"⏳ Param write in flight — appending {len(items)} live writes")
+            self._param_write_list.extend(items)
+            return
+        self._param_write_list = list(items)
+        self._param_write_port = serial_port
+        self._param_write_on_complete = None
+        self._param_write_progress = None
+        self._param_write_index = 0
+        self._param_write_total = len(items)
+        self._send_next_param()
+
+    def _set_trace_combo_state(self, state):
+        style = _TRACE_STATE_STYLE.get(state)
+        self.trace_type_combo.setStyleSheet(style or "")
+        suffix = {
+            'pending': ' — orange: awaiting FC confirmation',
+            'synced': ' — green: value confirmed by the FC',
+        }.get(state, '')
+        self.trace_type_combo.setToolTip(self._trace_combo_tooltip + suffix)
+
+    def _set_trace_combo_value(self, idx):
+        if not 0 <= idx < self.trace_type_combo.count():
+            idx = 1
+        self._trace_combo_loading = True
+        self.trace_type_combo.setCurrentIndex(idx)
+        self._trace_combo_loading = False
+
+    def _on_trace_type_changed(self, index):
+        if self._trace_combo_loading or not self.connected:
+            return
+        tt = self.trace_type_combo.itemData(index)
+        if tt is None:
+            return
+        self._trace_write_pending = int(tt)
+        self._set_trace_combo_state('pending')
+        self.log_debug(f"🎚 Trace type set to {tt}", "Info")
+        self._write_param_direct(int(ParamIndex.TRACE_TYPE), float(tt))
+
+    def _sync_trace_combo(self, fc_val):
+        f = int(round(fc_val))
+        self._trace_fc_value = f
+        cur = self.trace_type_combo.currentData()
+        if cur == f:
+            self._trace_write_pending = None
+            self._set_trace_combo_state('synced')
+        elif self._trace_write_pending is not None:
+            self._set_trace_combo_state('pending')
+        else:
+            self._set_trace_combo_value(f)
+            self._set_trace_combo_state('synced')
+
+    def _check_speech_events(self, f):
         batt = f.battery_volts
         if batt > 0 and abs(batt - self._last_spoken_batt) >= 0.5:
             self.speech.speak_battery(batt)
             self._last_spoken_batt = batt
+
+        alt = getattr(f, 'altitude', 0.0)
+        if alt >= 0:
+            # Announce on each 5 m step up (or down) so altitude is spoken
+            # without constant chatter. 5.0 is a runtime constant, not a divisor.
+            bucket = int(alt * 0.2)   # 5 m bucket from metres
+            if bucket != self._last_spoken_alt and bucket > 0:
+                self.speech.speak_altitude(bucket * 5.0)
+                self._last_spoken_alt = bucket
+
+        # Direction + distance callout. The FC computes the aircraft's home-
+        # relative range/bearing itself and ships it in the guidance packet
+        # (tag 59, SendGuidancePacket, gated on in-flight + OriginValid), so
+        # use its authoritative numbers — distance (m) and bearing (deg).
+        g = self.guidance_data
+        if g is not None and hasattr(g, 'distance') and hasattr(g, 'bearing'):
+            now = time.time()
+            if g.distance > _DIRECTION_FAR_M and now - self._last_direction_speak >= _DIRECTION_SPEAK_PERIOD_S:
+                # Round to 10 m: use the inverse (0.1) not a division.
+                rounded = int(round(g.distance * 0.1)) * 10
+                # 45 deg sectors, 8 compass points. *0.0222.. = /45.
+                idx = int(round((g.bearing % 360.0) * (1.0/45.0))) % 8
+                point = _DIRECTION_POINTS[idx]
+                self.speech.speak_direction(rounded, point)
+                self._last_direction_speak = now
 
         if hasattr(f, 'flag_bits') and f.flag_bits:
             fb = f.flag_bits
@@ -2091,7 +2381,8 @@ class MainWindow(QMainWindow):
             55: "Unused", 56: "Unused", 57: "Tuning", 58: "Unused", 59: "Guidance",
             60: "Unused", 61: "Unused", 62: "Calibration", 63: "AFName",
             64: "Wind", 65: "Unused", 66: "SerialPorts", 67: "ExecTime",
-            68: "Unused", 69: "LinkStats", 70: "InitState", 76: "I2CErrors",
+            68: "Unused", 69: "LinkStats", 70: "InitState", 71: "ParamRead",
+            76: "I2CErrors",
         }
         tag_name = TAG_NAMES.get(tag, f"Unknown({tag})")
         tag_ok = "OK" if parsed is not None else "FAIL"
@@ -2102,7 +2393,8 @@ class MainWindow(QMainWindow):
         last = getattr(self, '_rx_print_t', {})
         interval = last.get(tag, 0.0)
         if tag_ok == "FAIL" or tag > 68 or now_t - interval >= 0.8:
-            print(f"[RX] tag={tag} ({tag_name}) {tag_ok} len={len(data)}B")
+            detail = f" raw={data.hex()}" if tag_ok == "FAIL" else ""
+            print(f"[RX] tag={tag} ({tag_name}) {tag_ok} len={len(data)}B{detail}")
         last[tag] = now_t
         self._rx_print_t = last
         if self.param_window and hasattr(self.param_window, 'retry_read_if_pending'):
@@ -2118,8 +2410,11 @@ class MainWindow(QMainWindow):
             r2d = 57.2958
             pwm_str = ""
             if hasattr(parsed, 'pwm') and parsed.pwm:
-                # RawPW idle-zero-referenced (0=1000uS, 0.5=1500uS); show uS
+                # RawPW idle-zero-referenced (0=1000uS, 0.5=1500uS); show uS.
+                # Guard the round(): a non-finite FC value would raise
+                # ValueError ("cannot convert float NaN to integer").
                 pwm_vals = [f"M{i}={round((v + 1.0) * 1000):+5d}"
+                            if math.isfinite(v) else f"M{i}=  nan"
                             for i, v in enumerate(parsed.pwm)]
                 pwm_str = f" pwm={' '.join(pwm_vals)}"
             fs_name = FlightState.get_name(parsed.flight_state)
@@ -2145,8 +2440,8 @@ class MainWindow(QMainWindow):
             rc = parsed.rc_channels
             if rc:
                 def rc_name(i):
-                    return ["Thr","Rol","Pit","Yaw","Nav","Att","NQ","Cam","Aux2","Trn","PT","Dive"][i]
-                parts = [f"{rc_name(i)}={round(rc[i])}"
+                    return ["Thr","Rol","Pit","Yaw","Nav","Att","NQ","Cam","Trace","Trn","PT","Dive"][i]
+                parts = [f"{rc_name(i)}={round(rc[i]) if math.isfinite(rc[i]) else 'nan'}"
                          for i in range(min(len(rc), 12))]
                 print("[RC] " + " ".join(parts))
         elif tag == 62 and isinstance(parsed, dict) and dump_ok:
@@ -2161,8 +2456,12 @@ class MainWindow(QMainWindow):
                          f"{rb[1]*RATE_GYRO_SCALE*57.2958:.1f},"
                          f"{rb[2]*RATE_GYRO_SCALE*57.2958:.1f})") if len(rb) > 2 else ""
                 ids   = f"imu_id=0x{parsed.get('imu_id',0):02X} mag_id=0x{parsed.get('mag_id',0):02X}"
+                hx    = lambda v: f"0x{v:02X}" if isinstance(v, int) else "--"
+                cfg   = (f"mag=[A={hx(parsed.get('mag_cfg_a'))} "
+                         f"B={hx(parsed.get('mag_cfg_b'))} "
+                         f"MODE={hx(parsed.get('mag_mode'))}]")
                 print(f"[CALIB] IMU={'Y' if imu else 'N'}{'C' if imuc else '_'}"
-                      f" Mag={'Y' if mag else 'N'}{'C' if magc else '_'} {gs} {ids}")
+                      f" Mag={'Y' if mag else 'N'}{'C' if magc else '_'} {gs} {ids} {cfg}")
 
         if tag == 13:
             self.log_debug(f"📦 Flight ({len(data)}B)", "Info")
@@ -2174,6 +2473,9 @@ class MainWindow(QMainWindow):
                 if self.flight_data:
                     old_pwm = self.flight_data.pwm if hasattr(self.flight_data, 'pwm') and self.flight_data.pwm else None
                     old_rc = self.flight_data.rc_channels if hasattr(self.flight_data, 'rc_channels') and self.flight_data.rc_channels else None
+                    old_discovered = self.flight_data.discovered_channels if hasattr(self.flight_data, 'discovered_channels') and self.flight_data.discovered_channels else None
+                    old_rc_physical = getattr(self.flight_data, 'rc_physical', None)
+                    old_rc_flags = getattr(self.flight_data, 'rc_flags', None)
                     old_gps = {attr: getattr(self.flight_data, attr, 0) for attr in
                                ("gps_lat", "gps_lon", "gps_sats", "gps_fix",
                                 "gps_hacc", "gps_vacc", "gps_sacc", "gps_cacc",
@@ -2185,12 +2487,19 @@ class MainWindow(QMainWindow):
                 else:
                     old_pwm = None
                     old_rc = None
+                    old_discovered = None
                     old_gps = {}
                 self.flight_data = parsed
                 if old_pwm is not None and not self.flight_data.pwm:
                     self.flight_data.pwm = old_pwm
                 if old_rc is not None and not self.flight_data.rc_channels:
                     self.flight_data.rc_channels = old_rc
+                if old_discovered is not None and not self.flight_data.discovered_channels:
+                    self.flight_data.discovered_channels = old_discovered
+                if old_rc_physical:
+                    self.flight_data.rc_physical = old_rc_physical
+                if old_rc_flags is not None:
+                    self.flight_data.rc_flags = old_rc_flags
                 for attr, val in old_gps.items():
                     if getattr(self.flight_data, attr, None) in (None, 0, 0.0):
                         setattr(self.flight_data, attr, val)
@@ -2198,27 +2507,11 @@ class MainWindow(QMainWindow):
                 packet_logger.log_received(13, "FLIGHT", parsed)
                 if hasattr(parsed, 'flag_bits'):
                     self.current_flag_bits = parsed.flag_bits
-                if self._logging_active:
-                    self.logger.log_flight_data(parsed)
 
-                if self.gps_kml_logger.active and hasattr(parsed, 'gps_lat'):
-                    self.gps_kml_logger.add_point(
-                        parsed.gps_lat, parsed.gps_lon, parsed.gps_altitude,
-                        parsed.gps_heading if hasattr(parsed, 'gps_heading') else 0,
-                        parsed.gps_vel if hasattr(parsed, 'gps_vel') else 0,
-                        parsed.mission_time if hasattr(parsed, 'mission_time') else 0
-                    )
-
-                # Flight lifecycle: start logs on take-off (armed), flush+close
-                # on landing (disarmed) so the actual touchdown is captured.
+                # Track flight lifecycle
                 if hasattr(parsed, 'flag_bits') and len(parsed.flag_bits) > 29:
                     armed = parsed.flag_bits[29]
-                    if armed and not self._in_flight:
-                        self._in_flight = True
-                        self._sync_loggers()
-                    elif not armed and self._in_flight:
-                        self._in_flight = False
-                        self._finalize_loggers()
+                    self._in_flight = armed
 
                 self._check_speech_events(parsed)
 
@@ -2231,13 +2524,6 @@ class MainWindow(QMainWindow):
                 self.nav_data = parsed
                 data_manager.update_nav_data(parsed)
                 packet_logger.log_received(14, "NAV", parsed)
-                if self.gps_kml_logger.active and hasattr(parsed, 'gps_lat'):
-                    self.gps_kml_logger.add_point(
-                        parsed.gps_lat, parsed.gps_lon, parsed.gps_altitude,
-                        parsed.gps_heading if hasattr(parsed, 'gps_heading') else 0,
-                        parsed.gps_vel if hasattr(parsed, 'gps_vel') else 0,
-                        getattr(parsed, 'mission_time', 0)
-                    )
                 if self.flight_data:
                     for attr in ("gps_lat", "gps_lon", "gps_sats", "gps_fix",
                                  "gps_hacc", "gps_vacc", "gps_sacc", "gps_cacc",
@@ -2261,19 +2547,6 @@ class MainWindow(QMainWindow):
                         self.flight_data.pwm = parsed.pwm
                     data_manager.update_flight_data(self.flight_data)
 
-            case 18:
-                self.min_data = parsed
-                packet_logger.log_received(18, "MIN", parsed)
-                if self.flight_data:
-                    for attr in ("flight_state", "nav_state", "alarm_state",
-                                 "battery_volts", "battery_current", "battery_charge",
-                                 "angle_roll", "angle_pitch", "altitude",
-                                 "roc", "heading", "gps_lat", "gps_lon", "airframe_type"):
-                        setattr(self.flight_data, attr, getattr(parsed, attr, getattr(self.flight_data, attr)))
-                    if hasattr(parsed, 'flag_bits'):
-                        self.current_flag_bits = self.flight_data.flag_bits = parsed.flag_bits
-                    data_manager.update_flight_data(self.flight_data)
-
             case 19:
                 self.origin_data = parsed
                 packet_logger.log_received(19, "ORIGIN", parsed)
@@ -2292,6 +2565,9 @@ class MainWindow(QMainWindow):
                 if hasattr(parsed, 'rc_channels'):
                     self.flight_data.rc_channels = parsed.rc_channels
                     self.flight_data.rc_raw = getattr(parsed, 'rc_raw', [])
+                    self.flight_data.rc_physical = getattr(parsed, 'rc_physical', [])
+                    self.flight_data.rc_flags = getattr(parsed, 'rc_flags', 0)
+                    self.flight_data.discovered_channels = getattr(parsed, 'discovered_channels', 0)
                     data_manager.update_flight_data(self.flight_data)
 
             case 51:
@@ -2302,6 +2578,31 @@ class MainWindow(QMainWindow):
                     if at in (241, 223):
                         return
                     ack_handler.handle_ack(at, ok)
+
+                    cmd = getattr(self, '_pending_misc_command', None)
+                    if at == PacketTag.MISC and cmd is not None:
+                        self._pending_misc_command = None
+                        if cmd == MiscCommand.ESC_PROG:
+                            if ok:
+                                self._on_esc_prog_ack()
+                            else:
+                                self._on_esc_prog_denied()
+                        elif self.calib_window is not None:
+                            self.calib_window.on_misc_ack(cmd, ok)
+
+                    if at == PacketTag.PARAM_COMMIT:
+                        # The commit ACK reflects whether the config (+ name) is
+                        # CONFIRMED in flash (erase + program + read-back verify).
+                        # ok=False means the FC did NOT save and will NOT reboot:
+                        # surface it loudly and un-arm the deferred verification.
+                        if self.param_window is not None:
+                            self.param_window.on_param_commit_ack(ok)
+                        if ok:
+                            self.log_debug("✅ Flash commit CONFIRMED in FC",
+                                           "Info")
+                        else:
+                            self.log_debug("❌ Flash commit FAILED — params NOT saved",
+                                           "Errors")
 
             case 59:
                 self.guidance_data = parsed
@@ -2330,6 +2631,8 @@ class MainWindow(QMainWindow):
                     # Persisted airframe name from FC config flash is the single
                     # source of truth shown by the GCS (no local QSettings name).
                     af_name = parsed.get('airframe_name') or ''
+                    if self.raw_logger.active:
+                        self.raw_logger.rename(af_name)
                     if self.param_window is not None:
                         self.param_window.set_flash_airframe_name(af_name)
                     else:
@@ -2361,55 +2664,6 @@ class MainWindow(QMainWindow):
                 packet_logger.log_received(76, "I2CERR", parsed)
                 if isinstance(parsed, I2CErrorData):
                     self.i2c_errors = parsed
-                    def fmt(c, f):
-                        addrs = " ".join(f"0x{a:02X}" for a in c) or "none"
-                        return f"{addrs} (startFails={f})"
-                    b1 = fmt(parsed.bus1_census, parsed.bus1_census_fails)
-                    b2 = fmt(parsed.bus2_census, parsed.bus2_census_fails)
-                    regtxt = ""
-                    if parsed.regs:
-                        r = parsed.regs
-                        regtxt = (" | MODER={MODER:04X} OTYPER={OTYPER:04X} "
-                                  "PUPDR={PUPDR:04X} AFRH={AFRH:X} "
-                                  "CR1={CR1:04X} CCR={CCR} TRISE={TRISE}"
-                                  ).format(**r)
-                    if parsed.spl_diag >= 0:
-                        dg = parsed.spl_diag
-                        if dg & 0x01:
-                            state = "ACTIVE"
-                        elif not dg & 0x08:
-                            state = "no ack on ID read"
-                        elif parsed.spl_stage == 10:
-                            state = (f"coeff stuck (cfg="
-                                     f"{parsed.spl_coeff:#04x})")
-                        elif parsed.spl_stage >= 11:
-                            state = (f"cal pair "
-                                     f"{parsed.spl_stage - 10} failed")
-                        elif dg & 0x08:
-                            got = [n for n, b in
-                                   (("coeff", 2), ("cal", 4)) if dg & b]
-                            state = ("stuck after id: " + "+".join(got)
-                                     if got else "stuck at id")
-                        else:
-                            state = "unknown"
-                        regtxt += (f" | SPL06 id={parsed.spl_id:#04x} "
-                                   f"{state}")
-                        if parsed.spl_cfg:
-                            regtxt += (" cfg=({:#04x},{:#04x},{:#04x})"
-                                       .format(*parsed.spl_cfg))
-                    if parsed.spl_coeffs and \
-                            parsed.spl_coeffs != self._last_spl_coef:
-                        self._last_spl_coef = parsed.spl_coeffs
-                        print(("[SPL06-COEF] c0={c0} c1={c1} c00={c00} "
-                               "c10={c10} c01={c01} c11={c11} c20={c20} "
-                               "c21={c21} c30={c30}").format(
-                                   **parsed.spl_coeffs))
-                    now = time.monotonic()
-                    if ((b1, b2, regtxt) != self._last_census
-                            or (now - self._last_census_t) > 30.0):
-                        self._last_census = (b1, b2, regtxt)
-                        self._last_census_t = now
-                        print(f"[CENSUS] I2C1: {b1} | I2C2: {b2}{regtxt}")
                     if self.anomaly_box is not None:
                         self.anomaly_box.update_sio_counts(parsed)
 
@@ -2452,6 +2706,8 @@ class MainWindow(QMainWindow):
             case 57:
                 packet_logger.log_received(57, "TUNE", parsed)
                 self._last_tune = parsed
+                if self._identify_window is not None:
+                    self._identify_window._refresh(parsed)
 
             case 54:
                 packet_logger.log_received(54, "BB", parsed)
@@ -2461,6 +2717,7 @@ class MainWindow(QMainWindow):
                     self._bb_chunks[seq_no] = chunk
                     total = len(self._bb_chunks) * 128
                     self.log_debug(f"📦 BB chunk {seq_no} ({len(chunk)}B, ~{total}B total)", "Info")
+                    self._bb_dump_timer.start(500)
                     if len(chunk) < 128:
                         self._finalize_bb_dump()
 
@@ -2475,7 +2732,7 @@ class MainWindow(QMainWindow):
             case _:
                 packet_logger.log_received(tag, f"TAG{tag}", parsed)
 
-        MISC_TAGS = {15, 21, 50, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 65, 67, 68, 74}
+        MISC_TAGS = {15, 21, 50, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 65, 67, 68, 74, 76}
         if tag in MISC_TAGS and self.misc_window and self.misc_window.isVisible():
             body = data[3:3+data[2]] if len(data) > 3 and data[0] == 0x01 else data
             self.misc_window.add_packet(tag, parsed if parsed is not None else body, "R")
@@ -2505,9 +2762,8 @@ class MainWindow(QMainWindow):
         config1 = self.config1_cache
         config2 = self.config2_cache
         
-        bits = [0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6]
-        vals = [config1] * 7 + [config2] * 7
-        for i, (bit, val) in enumerate(zip(bits, vals)):
+        for i, (which, bit, name) in enumerate(self.config_flags):
+            val = config1 if which == 1 else config2
             is_set = (val & (1 << bit)) != 0
             if is_set:
                 self.config_labels[i].setStyleSheet("""
@@ -2531,22 +2787,72 @@ class MainWindow(QMainWindow):
     def update_flag_colors(self, flag_bits):
         if not flag_bits:
             return
-        
+
+        crsf_active = self.link_stats is not None
+        crsf_keys = {'lq', 'rssi', 'fs', 'snr'}
+
+        if crsf_active:
+            lq = self.link_stats.uplink_lq
+            snr = self.link_stats.uplink_snr
+            rssi = self.link_stats.uplink_rssi
+            flag_bits[53] = lq < 80       # LQ (warning)
+            flag_bits[58] = lq < 50       # FS (failsafe territory)
+            flag_bits[75] = True          # RSSI (always shown, colored by value)
+            flag_bits[77] = True          # SNR (always shown, colored by value)
+
         for flag_key, flag_data in self.flag_labels.items():
             bit = flag_data['bit']
             widget = flag_data['widget']
+
+            if flag_key in crsf_keys and not crsf_active:
+                widget.setStyleSheet("""
+                    background-color: #ddd;
+                    color: #999;
+                    font-weight: normal;
+                    border: 1px solid #bbb;
+                    border-radius: 2px;
+                    padding: 2px;
+                """)
+                continue
+
             is_active = bit < len(flag_bits) and flag_bits[bit]
             
-            if is_active:
+            # 3-state CRSF flags: always show when CRSF active, color by value
+            if flag_key in ('lq', 'rssi', 'snr') and crsf_active:
+                if flag_key == 'lq':
+                    val = self.link_stats.uplink_lq
+                    if val >= 80:
+                        color, text_color, font_weight = "#27ae60", "white", "bold"
+                    elif val >= 50:
+                        color, text_color, font_weight = "#f39c12", "white", "bold"
+                    else:
+                        color, text_color, font_weight = "#e74c3c", "white", "bold"
+                elif flag_key == 'rssi':
+                    val = self.link_stats.uplink_rssi
+                    if val >= -90:
+                        color, text_color, font_weight = "#27ae60", "white", "bold"
+                    elif val >= -100:
+                        color, text_color, font_weight = "#f39c12", "white", "bold"
+                    else:
+                        color, text_color, font_weight = "#e74c3c", "white", "bold"
+                else:  # snr
+                    val = self.link_stats.uplink_snr
+                    if val >= 6:
+                        color, text_color, font_weight = "#27ae60", "white", "bold"
+                    elif val >= 0:
+                        color, text_color, font_weight = "#f39c12", "white", "bold"
+                    else:
+                        color, text_color, font_weight = "#e74c3c", "white", "bold"
+            elif is_active:
                 if flag_key in ['level', 'att_hold']:
                     color = "#3cb371"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['low_batt', 'land_sw', 'mag_fail']:
+                elif flag_key in ['low_batt', 'land_sw', 'mag_fail', 'baro_fail', 'loss', 'fs']:
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['vrs', 'rc_map_fail', 'fence_alarm', 'excess_lift']:
+                elif flag_key in ['vrs', 'rc_map_fail', 'fence_alarm', 'excess_lift', 'snr', 'ext_mag', 'imu_fault_lat']:
                     color = "#f39c12"
                     text_color = "white"
                     font_weight = "bold"
@@ -2575,12 +2881,16 @@ class MainWindow(QMainWindow):
                     text_color = "white"
                     font_weight = "bold"
             else:
-                if flag_key in ['gps_ok', 'baro', 'rf', 'imu', 'mag']:
+                if flag_key in ['gps_ok', 'baro', 'imu', 'mag']:
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
                 elif flag_key in ['gyro_cal', 'acc_cal', 'mag_cal']:
                     color = "#f39c12"
+                    text_color = "white"
+                    font_weight = "bold"
+                elif flag_key in ['baro_fail', 'mag_fail', 'imu_fault_lat']:
+                    color = "#27ae60"
                     text_color = "white"
                     font_weight = "bold"
                 else:
@@ -2597,6 +2907,14 @@ class MainWindow(QMainWindow):
                 padding: 2px;
             """)
     
+    def _poll_tuning(self):
+        """Periodic tag-57 request (~1 Hz) so the Identify window stays fresh."""
+        if not self._identify_window or not self._identify_window.isVisible():
+            return
+        if not self.telemetry or not getattr(self.telemetry, 'serial', None):
+            return
+        self.send_request(PacketTag.TUNING, 0, 0, None)
+
     def update_ui(self):
         if not self.flight_data:
             return
@@ -2747,17 +3065,16 @@ class MainWindow(QMainWindow):
             self.gps_fix.setText(str(f.gps_fix))
             self.gps_lat.setText(f"{f.gps_lat:.6f}")
             self.gps_lon.setText(f"{f.gps_lon:.6f}")
-            self.gps_alt.setText(f"{f.gps_altitude:.1f}")
+            if hasattr(f, 'flag_bits') and len(f.flag_bits) > 6:
+                gps_valid = f.flag_bits[6]
+            else:
+                gps_valid = (f.gps_fix >= 3 and f.gps_sats >= 6)
+            self.gps_alt.setText(f"{f.gps_altitude:.1f}" if gps_valid else "---")
             self.gps_vel.setText(f"{f.gps_vel:.1f}")
             self.gps_hacc.setText(f"{f.gps_hacc:.1f}")
             self.gps_vacc.setText(f"{f.gps_vacc:.1f}")
             self.gps_sacc.setText(f"{f.gps_sacc:.1f}")
             self.gps_cacc.setText(f"{f.gps_cacc:.1f}")
-
-            if hasattr(f, 'flag_bits') and len(f.flag_bits) > 6:
-                gps_valid = f.flag_bits[6]
-            else:
-                gps_valid = (f.gps_fix >= 3 and f.gps_sats >= 6)
             color = "#27ae60" if gps_valid else "#e74c3c"
             self.gps_lat.setStyleSheet(f"color: {color}; font-weight: bold;")
             self.gps_lon.setStyleSheet(f"color: {color}; font-weight: bold;")
@@ -2869,17 +3186,21 @@ class MainWindow(QMainWindow):
         if not self.link_stats:
             return
         s = self.link_stats
+
+        bold = "font-weight: bold; color:"
         self.link_lq.setText(f"{s.uplink_lq}%")
-        self.link_snr.setText(f"{s.uplink_snr}")
+        lq_c = "#22cc22" if s.uplink_lq >= 80 else "#ff8800" if s.uplink_lq >= 50 else "#e74c3c"
+        self.link_lq.setStyleSheet(f"{bold} {lq_c};")
         self.link_rssi.setText(f"{s.uplink_rssi}")
+        rssi_c = "#22cc22" if s.uplink_rssi >= -90 else "#ff8800" if s.uplink_rssi >= -100 else "#e74c3c"
+        self.link_rssi.setStyleSheet(f"{bold} {rssi_c};")
+        self.link_snr.setText(f"{s.uplink_snr}")
+        snr_c = "#22cc22" if s.uplink_snr >= 6 else "#ff8800" if s.uplink_snr >= 0 else "#e74c3c"
+        self.link_snr.setStyleSheet(f"{bold} {snr_c};")
         self.link_losses.setText(f"{s.rc_signal_losses}")
         self.link_failsafes.setText(f"{s.rc_failsafes}")
-        sr = s.usart1_sr
-        flags = "+".join(
-            name for i, name in enumerate(
-                ["PE", "FE", "NF", "ORE", "IDLE", "RXNE", "TC", "TXE"])
-            if sr & (1 << i)) or "idle"
-        self.link_rxbytes.setText(flags)
+        fs_c = "#22cc22" if s.rc_failsafes == 0 else "#e74c3c"
+        self.link_failsafes.setStyleSheet(f"{bold} {fs_c};")
 
     def update_motors_display(self, f):
         throttle = getattr(f, 'desired_throttle', 0.0)
@@ -2889,20 +3210,19 @@ class MainWindow(QMainWindow):
                 # RawPW idle-zero-referenced: 0=1000uS, 0.5=1500uS,
                 # 1.0=2000uS -> bar 0..1000 = percent above idle
                 us = (pwm[i] + 1.0) * 1000.0
-                raw = max(0, min(1000, int(us - 1000)))
+                # Guard NaN (graceful degradation) - never crash the whole GCS
+                # on a broken telemetry float.
+                raw = int(us - 1000) if math.isfinite(us) else 0
+                raw = max(0, min(1000, raw))
                 self.motor_bars[i].setValue(raw)
-                self.motor_values[i].setText(f"{raw:+5d}")
         elif throttle > 0.01:
-            val = max(0, min(1000, int(throttle * 1000)))
+            val = int(throttle * 1000) if math.isfinite(throttle) else 0
+            val = max(0, min(1000, val))
             for bar in self.motor_bars:
                 bar.setValue(val)
-            for lbl in self.motor_values:
-                lbl.setText(f"{val:+5d}")
         else:
             for bar in self.motor_bars:
                 bar.setValue(0)
-            for lbl in self.motor_values:
-                lbl.setText(f"{0:+5d}")
 
     def update_controls_display(self, f):
         if hasattr(f, 'rc_channels') and len(f.rc_channels) >= 4:
@@ -2941,16 +3261,6 @@ class MainWindow(QMainWindow):
         _set('gps', self.ser_gps_tx, self.ser_gps_rx, self.ser_gps_ov)
         _set('softserial', self.ser_soft_tx, self.ser_soft_rx, self.ser_soft_ov)
 
-        sr = self.serial_ports.get('uart4_sr')
-        if sr is not None:
-            flags = "+".join(
-                name for i, name in enumerate(
-                    ["PE", "FE", "NF", "ORE", "IDLE", "RXNE", "TC", "TXE"])
-                if sr & (1 << i)) or "idle"
-            self.gps_rxbytes_label.setText(flags)
-        else:
-            self.gps_rxbytes_label.setText("--")
-    
     def check_connection(self):
         now = time.monotonic()
         if hasattr(self, '_last_rx_time') and self._last_rx_time > 0:
@@ -2965,6 +3275,7 @@ class MainWindow(QMainWindow):
         self.save_settings()
         self.anomaly_logger.close()
         self.imu_stats_logger.close()
+        self.raw_logger.stop()
         
         if self.param_window:
             self.param_window.close()
@@ -2974,6 +3285,8 @@ class MainWindow(QMainWindow):
             self.calib_window.close()
         if self.misc_window:
             self.misc_window.close()
+        if self.replay_window:
+            self.replay_window.close()
         
         if self.telemetry:
             self.telemetry.stop()

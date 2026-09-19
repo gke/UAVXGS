@@ -6,7 +6,7 @@ Unit fixes applied to shipped frames:
   - tag 30  HORIZON: clamp to FC ceiling (50)
   - tag 53  BATTERY_CAPACITY: clamp to [1500, 10000]
   - tag 74/76 MAX_PITCH/ROLL_ANGLE: clamp to exact 60 deg radian value
-  - tag 113 FW_ROLL_CONTROL_PITCH_LIMIT: degrees (>1.3) -> radians
+  - tag 113 FW_ROLL_CONTROL_PITCH_LIMIT: degrees (>1.3) -> radians (tag now Unused114)
   - tag 119 BATTERY_ALARM_PCT: percent (>1.0) -> fraction
 
 [LIMITS] blocks are generated for every FLOAT param present in the file,
@@ -22,7 +22,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from protocol_enums import AirframeType, ParamIndex
+from protocol_enums import ParamIndex
 from airframes import airframes
 from parameters import PARAM_LIMITS, PARAM_TYPES
 
@@ -39,18 +39,12 @@ REF_FW_WINGSPAN_MM = 1800
 
 
 def category_for_af(af_type):
-    """Return 'MR'/'FW' for an AF type value — mirrors _category_for_af()."""
-    FW_TYPES = (AirframeType.eElevonAF, AirframeType.eDeltaAF, AirframeType.eAileronAF,
-                AirframeType.eAileronSpoilerFlapsAF, AirframeType.eAileronVTailAF,
-                AirframeType.eRudderElevatorAF)
-    try:
-        af = AirframeType(af_type)
-        if af in FW_TYPES:
-            return 'FW'
-        if af in (AirframeType.eVTOLAF, AirframeType.eVTOL2AF):
-            return 'FW'
-    except (TypeError, ValueError):
-        pass
+    """Return 'MR'/'FW' for limit-ceiling purposes — FW and VTOL both use the
+    FW ceiling class.  Category itself is delegated to the single authority
+    category_of() in protocol_enums.py (FC ClassifyAFType() mirror)."""
+    from protocol_enums import category_of, AirframeCategory
+    if category_of(af_type) in (AirframeCategory.eCatFw, AirframeCategory.eCatVtol):
+        return 'FW'
     return 'MR'
 
 
@@ -142,7 +136,7 @@ def fix_value(tag, raw, cells):
         return min(max(raw, 1500.0), 10000.0)
     if tag in (74, 76):                # MAX_PITCH/ROLL_ANGLE (60 deg exact)
         return min(raw, RAD_60)
-    if tag == 113:                     # FW_ROLL_CONTROL_PITCH_LIMIT (deg -> rad)
+    if tag == 113:                     # FW_ROLL_CONTROL_PITCH_LIMIT (deg -> rad); tag now Unused114 (see _LEGACY_PARAM_NAME_TO_TAG)
         if raw > 1.3:
             raw = raw * DEG2RAD
         return raw
