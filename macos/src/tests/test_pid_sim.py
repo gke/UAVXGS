@@ -861,6 +861,23 @@ FW_MAX_RATES = [
     (2.5, 1.2, 1.5),   # 6 VTOLAF
 ]
 
+# Model cruise throttle per FW model (mirrors emu.c EmuModels[].CruiseThrottle
+# for MODEL_ELEVON..MODEL_VTOL — the value InitEmulation seeds into
+# Config.CruiseThrottleFF on every emu boot). The AH sim uses this as the
+# DoMotors-mirror baseline instead of the legacy static UNUSED_20 (=0.5) seed,
+# so climb/descent authority reflects the airframe's real cruise setting.
+# 2026-09-24: seeded sims previously assumed 0.5 for every frame (the .af
+# legacy default) while the emu/flight baseline is per-model.
+FW_CRUISE_THR = [
+    0.45,   # 0 ElevonAF
+    0.35,   # 1 AileronAF (SkySurfer)
+    0.50,   # 2 DeltaAF
+    0.35,   # 3 AileronSpoilerFlapsAF
+    0.40,   # 4 AileronVTailAF
+    0.35,   # 5 RudderElevatorAF
+    0.50,   # 6 VTOLAF
+]
+
 AXIS_NAMES = {"Roll": 0, "Pitch": 1, "Yaw": 2}
 
 # ── Common constants (matching emu.h / emu.c) ──
@@ -1351,12 +1368,19 @@ def simulate_rate_disturbance(pid: PIDStruct, dT: float = CONTROL_DT,
 
 def simulate_alt_hold_mr(params: dict, step_m: float = 5.0,
                          dT: float = CONTROL_DT,
-                         af_filename: str = None) -> StepMetrics:
+                         af_filename: str = None,
+                         descend: bool = False) -> StepMetrics:
     """Simulate MR altitude hold step response.
 
     step_m: altitude step in meters (default 5m)
     Physics: mass-thrust model with quadratic drag.
     Uses per-airframe PHYS_ params when available.
+    descend=True runs the reverse leg: hold at +step_m, command 0 m, and
+    score the descent-progress series (step_m - alt), so the same criteria
+    apply to "how fast can it come down". Exercises the comp's NEGATIVE
+    throttle authority bound (DesiredThrottle can't go below 0 — a real
+    rotor spins down, it can't push) — the too-fast-descent flip side of the
+    climb ceiling.
     """
     kp = float(params.get("ALT_POS_KP", 0.0))
     ki = float(params.get("ALT_POS_KI", 0.0))
@@ -1383,7 +1407,7 @@ def simulate_alt_hold_mr(params: dict, step_m: float = 5.0,
         max_thrust = EM_MASS / EM_THR_CRUISE * GRAVITY
         hover_thr = EM_THR_CRUISE
 
-    alt = 0.0
+    alt = step_m if descend else 0.0
     vel = 0.0
     int_e_pos = 0.0
     int_e_vel = 0.0
@@ -1393,10 +1417,11 @@ def simulate_alt_hold_mr(params: dict, step_m: float = 5.0,
     max_int = 0.0
     atimes = []
     alts = []
+    target = 0.0 if descend else step_m
 
     for i in range(n):
         t = i * dT
-        err = step_m - alt
+        err = target - alt
 
         # Position PI -> ROC setpoint
         p_term = kp * err
@@ -1419,17 +1444,20 @@ def simulate_alt_hold_mr(params: dict, step_m: float = 5.0,
 
         vel += accel * dT
         alt += vel * dT
+        # Descent tracks progress (step_m - alt) so the same 0->step_m
+        # series drives the shared rise/settle metrics.
+        track = step_m - alt if descend else alt
 
         max_int = max(max_int, abs(int_e_pos), abs(int_e_vel))
-        peak_alt = max(peak_alt, alt)
+        peak_alt = max(peak_alt, track)
         atimes.append(t)
-        alts.append(alt)
+        alts.append(track)
 
-    final_err = abs(alt - step_m)
+    final_err = abs(alt - target)
     rise_time, overshoot, settling = step_metrics_persist(atimes, alts, step_m, dt=dT)
 
     return StepMetrics(
-        axis_name="Altitude (MR)",
+        axis_name="Altitude (MR)" + (" descent" if descend else ""),
         rise_time_s=round(rise_time, 4),
         overshoot_pct=round(overshoot, 1),
         settling_time_s=round(settling, 4),
@@ -1449,13 +1477,21 @@ def simulate_alt_hold_mr(params: dict, step_m: float = 5.0,
 # climb_angle controlled by PI with time constant ~2s (servo + aero lag)
 
 def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13.0,
-                         dT: float = CONTROL_DT) -> StepMetrics:
+                         dT: float = CONTROL_DT, descend: bool = False,
+                         cruise_thr: float = None) -> StepMetrics:
     """Simulate FW altitude hold step response.
 
     step_m: altitude step in meters (default 5m)
     Physics: pitch-to-climb model with airspeed coupling.
     FW climbs by pitching up (controlled by AH), which bleeds airspeed.
     Much slower than MR — time constant ~2-3s.
+    descend=True: hold at +step_m, command 0 m, score descent-progress
+    (step_m - alt). FW descends by throttling back and letting the wing
+    glide down — the descent-rate authority is the THROTTLE floor (negative
+    compensation bound −min(thr_lim, cruise_thr)), not the +climb ceiling.
+    cruise_thr: model cruise throttle baseline (FW_CRUISE_THR[fw_mid]),
+    mirroring the emu's Config.CruiseThrottleFF seed. None → legacy static
+    UNUSED_20 (=0.5) fallback.
     """
     kp = float(params.get("ALT_POS_KP", 0.0))
     ki = float(params.get("ALT_POS_KI", 0.0))
@@ -1466,12 +1502,13 @@ def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13
 
     # DoMotors mirror: TotalThrottle = DesiredThrottle + AltHoldThrComp
     #   + pFWPitchThrottleFFFrac*Abs(Pl), capped at pFWClimbThrottleFrac.
-    cruise_thr = float(params.get("UNUSED_20", 0.5))
+    if cruise_thr is None:
+        cruise_thr = float(params.get("UNUSED_20", 0.5))
     climb_cap = float(params.get("FW_CLIMB_THROTTLE", 0.7))
     ff_pt = float(params.get("FW_PITCH_THROTTLE_FF", 0.0))
     climb_margin = max(0.0, climb_cap - cruise_thr)
 
-    alt = 0.0
+    alt = step_m if descend else 0.0
     vel_vert = 0.0
     int_e_pos = 0.0
     int_e_vel = 0.0
@@ -1481,6 +1518,7 @@ def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13
     max_int = 0.0
     atimes = []
     alts = []
+    target = 0.0 if descend else step_m
 
     # FW climb dynamics: Position PI -> ROC setpoint -> Velocity PI -> climb
     # Actual climb rate follows with time constant (servo + aero lag)
@@ -1489,7 +1527,7 @@ def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13
 
     for i in range(n):
         t = i * dT
-        err = step_m - alt
+        err = target - alt
 
         # Position PI -> ROC setpoint
         p_term = kp * err
@@ -1519,17 +1557,19 @@ def simulate_alt_hold_fw(params: dict, step_m: float = 5.0, cruise_v: float = 13
 
         # Airspeed bleed during climb (energy trade)
         alt += vel_vert * dT
+        # Descent tracks progress (step_m - alt); rise == commanded -x m leg.
+        track = step_m - alt if descend else alt
 
         max_int = max(max_int, abs(int_e_pos), abs(int_e_vel))
-        peak_alt = max(peak_alt, alt)
+        peak_alt = max(peak_alt, track)
         atimes.append(t)
-        alts.append(alt)
+        alts.append(track)
 
-    final_err = abs(alt - step_m)
+    final_err = abs(alt - target)
     rise_time, overshoot, settling = step_metrics_persist(atimes, alts, step_m, dt=dT)
 
     return StepMetrics(
-        axis_name="Altitude (FW)",
+        axis_name="Altitude (FW)" + (" descent" if descend else ""),
         rise_time_s=round(rise_time, 4),
         overshoot_pct=round(overshoot, 1),
         settling_time_s=round(settling, 4),
@@ -3072,13 +3112,36 @@ def run_tests_for_af(af_filename: str, slider_pct: float = None) -> Tuple[bool, 
         cruise_v = 13.0
         if get_fw_descriptor(af_filename):
             cruise_v = get_fw_descriptor(af_filename).get("cruise_speed", 13.0)
-        ah_m = simulate_alt_hold_fw(params, step_m=5.0, cruise_v=cruise_v)
+        cruise_thr = FW_CRUISE_THR[fw_mid] if fw_mid >= 0 else None
+        ah_m = simulate_alt_hold_fw(params, step_m=5.0, cruise_v=cruise_v,
+                                    cruise_thr=cruise_thr)
         ah_crit = AH_CRITERIA_FW
     else:
         ah_m = simulate_alt_hold_mr(params, step_m=5.0, af_filename=af_filename)
         ah_crit = AH_CRITERIA_MR
 
     lines, ok = critique_linear(ah_m, ah_crit, "Alt Hold 5m")
+    all_output.extend(lines)
+    if not ok:
+        all_pass = False
+
+    # Descent leg: hold at +5 m, command 0 m. FW and MR both come down by
+    # throttling back -> the descent rate is bound by the NEGATIVE comp
+    # authority (-thr_lim, floor at -min(thr_lim, cruise_thr)), the
+    # counterpart of the +climb ceiling. Same Criteria, scored on
+    # descent-progress so the shared rise/settle metrics apply.
+    all_output.append(f"\n{B}{'='*60}{N}")
+    all_output.append(f"{B}  Altitude Hold (5m descent){N}")
+    all_output.append(f"{B}{'='*60}{N}")
+
+    if is_fw:
+        ah_d = simulate_alt_hold_fw(params, step_m=5.0, cruise_v=cruise_v,
+                                    descend=True, cruise_thr=cruise_thr)
+    else:
+        ah_d = simulate_alt_hold_mr(params, step_m=5.0, af_filename=af_filename,
+                                    descend=True)
+
+    lines, ok = critique_linear(ah_d, ah_crit, "Alt Descent 5m")
     all_output.extend(lines)
     if not ok:
         all_pass = False

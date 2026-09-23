@@ -3720,13 +3720,17 @@ class ParameterWindow(QMainWindow):
         config1_bits = [
             ("Ext Mag", 0), ("Autoland", 1), ("Use Mag", 2),
             ("Emulation", 3), ("AH Alarm", 4), ("GPS Alt", 5),
-            ("WP Test", 6), ("Clamp", 7),
+            ("Unused 1-6", 6, True), ("Clamp", 7),
         ]
         for i, item in enumerate(config1_bits):
             name, bit = item[0], item[1]
+            unused = len(item) > 2 and item[2]
             cb = QCheckBox(name)
             cb.setProperty("bit", bit)
             cb.stateChanged.connect(lambda s, b=bit: self.bit_changed(ParamIndex.CONFIG1_BITS, b, s))
+            if unused:
+                cb.setEnabled(False)
+                cb.setToolTip("Unused — free config bit (Config1 bit 6). Emulation now implies the 4-WP test mission.")
             layout.addWidget(cb, i // 2, (i % 2) + 1)
             self.config1_checks.append(cb)
 

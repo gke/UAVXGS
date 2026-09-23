@@ -443,8 +443,13 @@ class Config1Bits(IntFlag):
     eEmulationEnable = 0x08         # bit 3
     eUseAltHoldAlarm = 0x10       # bit 4
     eUseOffsetHome = 0x20          # bit 5
-    eTestMission = 0x40            # bit 6 — Test WP mission (4 WPs, ~150m legs, climb/descend/hard turns)
     eEnforceDriveSymmetry = 0x80   # bit 7
+
+    # bit 6 — FREE (was Test WP mission, folded into emulation 2026-09-23:
+    #   F.Emulation implies the 4-WP test mission). eTestMission kept as an
+    #   alias so legacy .af files still load without clobbering the bit.
+    eUnused1_6 = 0x40
+    eTestMission = eUnused1_6      # legacy .af token — do not re-use
 
     # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm|Mag
     DEFAULT = eUseRTHDescend | eUseAltHoldAlarm | eUsingMag

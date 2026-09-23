@@ -139,7 +139,7 @@ _LEGACY_ENUM_TOKENS = {
                         'EMULATION_ENABLE': 'eEmulationEnable',
                         'USE_ALT_HOLD_ALARM': 'eUseAltHoldAlarm',
                         'USE_OFFSET_HOME': 'eUseOffsetHome',
-                        'TEST_MISSION': 'eTestMission',
+                        'TEST_MISSION': 'eUnused1_6',
                         'ENFORCE_DRIVE_SYMMETRY': 'eEnforceDriveSymmetry'},
         'Config2Bits': {'USE_BATTERY_COMP': 'eUseBatteryComp', 'USE_FAST_START': 'eUseFastStart',
                         'USE_ESC_PROG': 'eUnused2_2', 'USE_BLHELI': 'eUnused2_2', 'USE_HAVE_GPS': 'eUseGPS',

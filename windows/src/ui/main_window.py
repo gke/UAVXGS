@@ -1376,7 +1376,7 @@ class MainWindow(QMainWindow):
         self.config_labels = []
         self.config_flags = [
             (1, 0, "Ext Mag"), (1, 1, "Autoland"), (1, 2, "Use Mag"), (1, 3, "Emulation"),
-            (1, 4, "AH Alarm"), (1, 5, "GPS Alt"), (1, 6, "WP Test"),
+            (1, 4, "AH Alarm"), (1, 5, "GPS Alt"), (1, 7, "Clamp"),
             (2, 0, "Batt Comp"), (2, 1, "Fast Start"), (2, 3, "Have GPS"), (2, 4, "Prop In"),
             (2, 5, "Turn WP"), (2, 6, "Beep WP"),
         ]
