@@ -1,9 +1,9 @@
 # widgets/anomaly_box.py
 """
-Anomalies box — IMU/WDT health + per-device SIO error counts.
+Anomalies box — IMU health + per-device SIO error counts.
 
-IMU rejects and the WDT trip mark come from the execution-time packet
-(Tag=67); per-device SIO error counts come from UAVXI2CErrorsPacket (Tag=76).
+IMU rejects and exec timings come from the execution-time packet (Tag=67);
+per-device SIO error counts come from UAVXI2CErrorsPacket (Tag=76).
 """
 
 from PyQt5.QtCore import Qt
@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import QGroupBox, QGridLayout, QLabel
 
 
 class AnomalyBox(QGroupBox):
-    """Compact read-only box: IMU rejects, WDT, SIO error counts."""
+    """Compact read-only box: IMU rejects, SIO error counts."""
 
     def __init__(self, parent=None):
         super().__init__("I2C/SPI Anomalies", parent)
@@ -29,17 +29,12 @@ class AnomalyBox(QGroupBox):
         lay.setColumnMinimumWidth(2, 50)
         lay.setColumnMinimumWidth(3, 50)
 
-        # ── IMU rejects / WDT / Exec Time (Tag=67) ──
+        # ── IMU rejects / Exec Time (Tag=67) ──
         lay.addWidget(QLabel("IMU Rej"), 0, 0)
         self.imu_rejects = QLabel("0")
         self.imu_rejects.setStyleSheet("font-weight: bold;")
         self.imu_rejects.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         lay.addWidget(self.imu_rejects, 0, 1)
-        lay.addWidget(QLabel("WDT"), 0, 2)
-        self.wdt_mark = QLabel("0")
-        self.wdt_mark.setStyleSheet("font-weight: bold;")
-        self.wdt_mark.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        lay.addWidget(self.wdt_mark, 0, 3)
 
         lay.addWidget(QLabel("Avg Exec µs"), 1, 0)
         self.exec_avg = QLabel("0µs")
@@ -82,10 +77,9 @@ class AnomalyBox(QGroupBox):
         self.setLayout(lay)
         self._alert = False
 
-    def update_exec(self, imu_rejects: int, wdt_mark: int, exec_avg_us: int = 0, exec_peak_us: int = 0):
-        """Refresh the IMU-reject / WDT / exec time fields from the execution-time packet."""
+    def update_exec(self, imu_rejects: int, exec_avg_us: int = 0, exec_peak_us: int = 0):
+        """Refresh the IMU-reject / exec time fields from the execution-time packet."""
         self.imu_rejects.setText(str(imu_rejects))
-        self.wdt_mark.setText(str(wdt_mark))
         self.exec_avg.setText(f"{exec_avg_us}µs")
         self.exec_peak.setText(f"{exec_peak_us}µs")
 

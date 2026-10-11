@@ -81,7 +81,7 @@ PARAMETER_DEFS: Dict[int, Parameter] = {
     64: Parameter("FWRollPitchFF", "FW roll-pitch feedforward"),
     65: Parameter("FWPitchThrottleFF", "FW pitch-throttle feedforward"),
     66: Parameter("UnusedAltVelIntLimit", "[unused] AltVelIntLimit"),
-    67: Parameter("FWMaxClimbAngle", "FW max climb angle"),
+    67: Parameter("FWThrCut", "FW throttle cut threshold"),
     68: Parameter("NavMaxAngle", "Nav max bank angle"),
     69: Parameter("FWSpoilerDecayPercentPS", "FW spoiler decay (%/s)"),
     70: Parameter("FWAileronDifferential", "FW aileron differential"),
@@ -89,7 +89,7 @@ PARAMETER_DEFS: Dict[int, Parameter] = {
     72: Parameter("Unused73", "Unused -- was KFAccUBiasVar (tracked live in state.c)"),
     73: Parameter("Config2Bits", "Config 2 bitfield"),
     74: Parameter("MaxPitchAngle", "Max pitch angle"),
-    75: Parameter("Unused76", "Unused"),
+    75: Parameter("FWRollAuthority", "Stabilised FW roll output authority (%)"),
     76: Parameter("MaxRollAngle", "Max roll angle"),
     77: Parameter("YawLPFHz", "Yaw LPF Hz"),
     78: Parameter("NavHeadingTurnout", "Nav heading turnout"),
@@ -126,8 +126,8 @@ PARAMETER_DEFS: Dict[int, Parameter] = {
      109: Parameter("YawRateIntLim", "Yaw rate loop integral limit (windup)"),
 110: Parameter("Unused111", "Unused -- was KFBaroVar (tracked live in state.c)"),
      111: Parameter("Unused112", "Unused -- was KFAccUVar (tracked live in state.c)"),
-    112: Parameter("FWStickScale", "FW stick scale"),
-    113: Parameter("Unused114", "Unused -- was FW roll control pitch limit"),
+    112: Parameter("FWThrRampPS", "FW throttle re-open ramp (%/s)"),
+    113: Parameter("FWThrHystBand", "FW throttle-cut re-open hysteresis band"),
     114: Parameter("AHThrottleMovingTrigger", "AH throttle moving trigger"),
     115: Parameter("NavFenceRadiusM", "Nav fence radius (m)"),
     116: Parameter("DiveROC", "Dive ROC (m/s)"),
@@ -138,9 +138,9 @@ PARAMETER_DEFS: Dict[int, Parameter] = {
 121: Parameter("MaxClimbRateMpS", "Max climb rate (m/s) — vertical-profile ascent shaping"),
      122: Parameter("RudderMotorFF", "Rudder Motor Feedforward (%)"),
      123: Parameter("SpiralDescentBandM", "Spiral descent trigger band (m) — residual altitude that engages MR spiral-orbit descent"),
-    124: Parameter("Unused125", "Unused"),
+    124: Parameter("FWPitchAuthority", "Stabilised FW pitch output authority (%)"),
     125: Parameter("TraceType", "Trace capture selector (U8, TraceTypes enum): 0=None 1=Rate 2=Attitude 3=AltHold 4=Actuator 5=IMU"),
-    126: Parameter("Unused127", "Unused"),
+    126: Parameter("FWYawAuthority", "Stabilised FW yaw output authority (%)"),
     127: Parameter("PowerResetCause", "Reset cause"),
 }
 
@@ -167,7 +167,7 @@ PARAM_DEFAULTS: Dict[int, float] = {
     18: 1.0,
     19: 0.55,
     20: 0.02,
-    21: 0.0,
+    21: 0.6,
     22: 0.05,
     23: 0.0125,
     24: 0.0125,
@@ -213,15 +213,15 @@ PARAM_DEFAULTS: Dict[int, float] = {
     64: 0.0,
     65: 0.0,
     66: 0.5,
-    67: 1.0471975511965976,
+    67: 0.2,
     68: 0.4363323129985824,
     69: 0.01,
-    70: 0.0,
+    70: 0.4,
     71: 4.0,
     72: 0.0001,
     73: 1.0,
     74: 0.5235987755982988,
-    75: 0.0,
+    75: 0.25,
     76: 0.5235987755982988,
     77: 50.0,
     78: 0.3490658503988659,
@@ -259,8 +259,8 @@ PARAM_DEFAULTS: Dict[int, float] = {
     109: 0.03,
     110: 0.04,
     111: 2.0,
-    112: 0.4,
-    113: 0.0,
+    112: 0.33,
+    113: 0.03,
     114: 0.02,
     115: 200.0,
     116: -3.0,
@@ -272,9 +272,9 @@ PARAM_DEFAULTS: Dict[int, float] = {
     121: 3.0,
     122: 0.0,
     123: 3.0,
-124: 0.0,
+124: 0.25,
      125: 1.0,
-     126: 0.0,
+     126: 0.25,
     127: 0.0,
 }
 
@@ -348,7 +348,7 @@ PARAM_DISPLAY_MULT: Dict[int, float] = {
     64: 1.0,
     65: 100.0,
     66: 1.0,
-    67: 57.29577951308232,
+    67: 100.0,
     68: 57.29577951308232,
     69: 1000.0,
     70: 100.0,
@@ -356,7 +356,7 @@ PARAM_DISPLAY_MULT: Dict[int, float] = {
     72: 1.0,
     73: 1.0,
     74: 57.29577951308232,
-    75: 1.0,
+    75: 100.0,
     76: 57.29577951308232,
     77: 1.0,
     78: 57.29577951308232,
@@ -394,7 +394,7 @@ PARAM_DISPLAY_MULT: Dict[int, float] = {
     110: 1.0,
     111: 1.0,
     112: 100.0,
-    113: 1.0,
+    113: 100.0,
     114: 100.0,
     115: 1.0,
     116: 1.0,
@@ -405,9 +405,9 @@ PARAM_DISPLAY_MULT: Dict[int, float] = {
     121: 1.0,
     122: 100.0,
     123: 1.0,
-    124: 1.0,
+    124: 100.0,
     125: 1.0,
-    126: 1.0,
+    126: 100.0,
     127: 1.0,
 }
 
@@ -436,10 +436,10 @@ PARAM_CLASS_BOUNDS: Dict[str, Tuple[float, float]] = {
     "eClassRateIntLim":  (0.0, 30.0),          # rad/s integral clamps
     "eClassAngle":         (0.0, 1.047198),   # rad — 60 deg (FC ParamTable literal)
     "eClassAngleBipolar": (-0.349066, 0.349066),  # rad — +/-20 deg (FC ParamTable literal)
-    "eClassRate":          (0.0, 10.471976),   # rad/s — 600 deg/s (FC ParamTable literal)
+    "eClassRate":          (0.1, 10.471976),   # rad/s. lo 0.1, not 0: Limit1(x,0)==0 silently kills rate authority
     "eClassPct":           (0.0, 1.0),           # fraction — 100%
     "eClassPctS":         (0.0, 0.5),           # fraction/s — 50%/s
-    "eClassHz":            (0.0, 255.0),         # Hz
+    "eClassHz":            (1.0, 255.0),         # Hz — lo is 1, not 0: 0 Hz gives LPF K=0 (filter holds output forever)
     "eClassVolts":             (0.0, 255.0),         # V
     "eClassAmps":             (0.0, 255.0),         # A
     "eClassMetres":             (0.0, 1000.0),        # m
@@ -463,7 +463,7 @@ PARAM_CLASS_OF: Dict[int, str] = {
     30: "eClassExplicit", 31: "eClassExplicit", 32: "eClassExplicit",
     33: "eClassAngle", 34: "eClassExplicit", 35: "eClassExplicit",
     36: "eClassExplicit", 37: "eClassExplicit", 38: "eClassExplicit",
-    39: "eClassPct", 40: "eClassGainNav", 41: "eClassExplicit",
+    39: "eClassPct", 40: "eClassExplicit", 41: "eClassExplicit",
     42: "eClassExplicit", 43: "eClassExplicit", 44: "eClassExplicit",
     45: "eClassExplicit", 46: "eClassExplicit", 47: "eClassExplicit",
     48: "eClassGainNav", 49: "eClassExplicit", 50: "eClassExplicit",
@@ -472,10 +472,10 @@ PARAM_CLASS_OF: Dict[int, str] = {
     57: "eClassExplicit", 58: "eClassExplicit", 59: "eClassExplicit",
     60: "eClassGainNav", 61: "eClassExplicit", 62: "eClassGainNav",
     63: "eClassRate", 64: "eClassPct", 65: "eClassPct",
-    66: "eClassExplicit", 67: "eClassAngle", 68: "eClassAngle",
+    66: "eClassExplicit",     67: "eClassPct", 68: "eClassAngle",
     69: "eClassPctS", 70: "eClassPct", 71: "eClassExplicit",
-    72: "eClassExplicit", 73: "eClassExplicit", 74: "eClassAngle",
-    75: "eClassExplicit", 76: "eClassAngle", 77: "eClassExplicit",
+    72: "eClassExplicit", 73: "eClassExplicit", 74: "eClassExplicit",
+    75: "eClassExplicit", 76: "eClassExplicit", 77: "eClassExplicit",
     78: "eClassAngle", 79: "eClassExplicit", 80: "eClassPct",
     81: "eClassAngleBipolar", 82: "eClassRate", 83: "eClassRate",
     84: "eClassAmps", 85: "eClassVolts", 86: "eClassPct",
@@ -487,7 +487,7 @@ PARAM_CLASS_OF: Dict[int, str] = {
     102: "eClassExplicit", 103: "eClassExplicit", 104: "eClassExplicit",
     105: "eClassExplicit", 106: "eClassExplicit", 107: "eClassExplicit",
     108: "eClassGainRateI", 109: "eClassExplicit", 110: "eClassExplicit",
-    111: "eClassExplicit", 112: "eClassExplicit", 113: "eClassExplicit",
+    111: "eClassExplicit", 112: "eClassPctS", 113: "eClassPct",
     114: "eClassPct", 115: "eClassExplicit", 116: "eClassExplicit",
     117: "eClassExplicit", 118: "eClassExplicit", 119: "eClassExplicit",
     120: "eClassGainAlt", 121: "eClassExplicit", 122: "eClassExplicit",
@@ -518,6 +518,9 @@ PARAM_EXPLICIT_LIMITS: Dict[int, Tuple[float, float]] = {
     16: (0.0, 15.0),          # RxThrottleCh
     17: (9.0, 20.0),          # LowVoltThres
     19: (0.0, 255.0),         # Unused20 (was EstCruiseThr — moved to FC Config.CruiseThrottleFF)
+    40: (0.1, 15.0),          # NavMaxVelocity (GCS key is the legacy NAV_POS_INT_LIMIT). lo 0.1: divides in WPDistanceTimeout()
+    74: (0.01, 1.047198),     # PitchAngleMax — per-tag: eClassAngle also holds pMagVariation, where 0 is legitimate
+    76: (0.01, 1.047198),     # RollAngleMax — same reason as tag 74
     30: (0.2, 0.5),          # Horizon (stick fraction)
     31: (0.0, 0.55),          # MadgwickKpMag
     32: (0.0, 30.0),          # NavRTHAlt
@@ -547,7 +550,7 @@ PARAM_EXPLICIT_LIMITS: Dict[int, Tuple[float, float]] = {
     71: (0.0, 4.0),           # ASSensorType MS4525D0I2C..noAS
     72: (0.0, 255.0),         # Unused73 (was KFAccUBiasVar — tracked live in state.c)
     73: (0.0, 255.0),         # Config2Bits (bits 0..7)
-    75: (0.0, 255.0),         # Unused76
+    75: (0.25, 1.25),         # FWRollAuthority
     77: (25.0, 255.0),        # YawLPFHz
     79: (0.0, 0.2),           # AltHoldThrCompDecayPercentPS
     89: (0.0, 5.0),           # AccLPFSel 0..ACC_LPF_SEL_MAX
@@ -559,7 +562,7 @@ PARAM_EXPLICIT_LIMITS: Dict[int, Tuple[float, float]] = {
     95: (0.0, 15.0),          # RxAux7Ch
     100: (0.0, 4.0),          # MotorStopSel landNoStop..landDescentRateAndAccU
     102: (0.0, 0.25),         # MaxAltHoldThrComp
-    103: (-3.0, 0.0),        # VRSROC — crown consensus descent 1.5
+    103: (-3.0, -0.1),       # VRSROC. hi -0.1, not 0: Alt.P.Max = -pVRSROCMPS divides unguarded (control.c:285)
     104: (0.0, 255.0),        # Unused105 (was BootDiag — moved to FC Config.BootDiag)
     105: (0.0, 30.0),         # AHROCWindowMPS
     106: (0.0, 10.0),         # NavProxAltM
@@ -567,8 +570,6 @@ PARAM_EXPLICIT_LIMITS: Dict[int, Tuple[float, float]] = {
     109: (0.0, 2.0),          # YawRateIntLim
     110: (0.0, 255.0),        # Unused111 (was KFBaroVar — tracked live in state.c)
     111: (0.0, 255.0),        # Unused112 (was KFAccUVar — tracked live in state.c)
-    112: (0.15, 1.0),         # FWStickScaleFrac
-    113: (0.0, 255.0),         # Unused114 (was FWRollControlPitchLimit)
     115: (0.0, 1000.0),       # NavFenceRadiusM
     116: (0.0, 25.0),       # DiveRecoverAlt (0 = disabled/not commissioned; active range 10..25)
     117: (0.0, 2.0),          # FailsafeAction eFsRth..eFsMotorsOff
@@ -577,9 +578,9 @@ PARAM_EXPLICIT_LIMITS: Dict[int, Tuple[float, float]] = {
     121: (0.0, 50.0),        # MaxClimbRateMpS
     122: (0.0, 20.0),         # RudderMotorFF
 123: (0.0, 15.0),        # SpiralDescentBandM (0 = spiral for any residual)
-124: (0.0, 255.0),        # Unused124
+124: (0.25, 1.25),        # FWPitchAuthority
 	125: (0.0, 5.0),        # TraceType (U8, eTraceNone..eTraceIMU — mirrors FC ParamTable U8 enum bounds)
-    126: (0.0, 255.0),        # Unused126
+    126: (0.25, 1.25),        # FWYawAuthority
     127: (0.0, 7.0),          # PowerResetCause UNKNOWN..BROWNOUT
 }
 
@@ -668,7 +669,7 @@ PARAM_TYPES: Dict[int, str] = {
     72: 'FLOAT',
     73: 'U8',
     74: 'FLOAT',
-    75: 'U8',
+    75: 'FLOAT',      # Unused76 — FC ParamTable FLOAT (was DC offset scale)
     76: 'FLOAT',
     77: 'FLOAT',
     78: 'FLOAT',
@@ -712,14 +713,14 @@ PARAM_TYPES: Dict[int, str] = {
     116: 'FLOAT',
     117: 'U8',
     118: 'U8',
-    119: 'U8',
-     120: 'FLOAT',
+119: 'FLOAT',     # BatteryAlarmPct — FC ParamTable FLOAT(% fraction, e.g. 0.15 = 15%)
+    120: 'FLOAT',
 121: 'FLOAT',
      122: 'FLOAT',
      123: 'FLOAT',
-    124: 'U8',
+    124: 'FLOAT',
     125: 'U8',
-    126: 'U8',
+    126: 'FLOAT',
     127: 'U8',
 }
 
@@ -800,7 +801,7 @@ PARAM_SCALES: Dict[int, float] = {
     64: 1,
     65: 0.01,
     66: 0.05,
-    67: 0.017453292519943295,
+    67: 0.01,
     68: 0.017453292519943295,
     69: 0.001,
     70: 0.01,
@@ -808,7 +809,7 @@ PARAM_SCALES: Dict[int, float] = {
     72: 1.0,
     73: 1,
     74: 0.017453292519943295,
-    75: 1,
+    75: 0.01,
     76: 0.017453292519943295,
     77: 1,
     78: 0.017453292519943295,
@@ -846,7 +847,7 @@ PARAM_SCALES: Dict[int, float] = {
     110: 1.0,
     111: 1.0,
     112: 0.01,
-    113: 1,
+    113: 0.01,
     114: 0.01,
     115: 1,
     116: 1,
@@ -857,9 +858,9 @@ PARAM_SCALES: Dict[int, float] = {
     121: 1,
     122: 0,
     123: 1,
-    124: 1,
+    124: 0.01,
     125: 1,
-    126: 1,
+    126: 0.01,
     127: 1,
 }
 

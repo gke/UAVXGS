@@ -1,6 +1,8 @@
 # ui/main_window.py - Fixed with continuous polling and all packet types
 """
 UAVX Groundstation - Main Window
+
+Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 import sys
@@ -8,6 +10,7 @@ import os
 import struct
 import time
 import math
+import zlib
 from datetime import datetime
 from typing import Optional
 
@@ -18,7 +21,7 @@ from PyQt5.QtGui import *
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol_constants import *
-from protocol_enums import PacketTag, ParamIndex, FlightState, NavState, Config1Bits, Config2Bits, MiscCommand
+from protocol_enums import PacketTag, ParamIndex, FlightState, NavState, Config1Bits, Config2Bits, MiscCommand, AirframeType
 from packet_parser import *
 from widgets.attitude_indicator import AttitudeIndicator, ExecTimeBar
 from widgets.anomaly_box import AnomalyBox
@@ -29,12 +32,13 @@ from core.ack_handler import ack_handler
 
 from ui.parameter_window import ParameterWindow
 from parameters import PARAM_DISPLAY_MULT, PARAM_TYPES
+import workspace
 from ui.nav_window import NavWindow
 from ui.calibration_window import CalibrationWindow
 from ui.misc_window import MiscWindow
 from ui.dfu_flasher import DfuFlasherWindow
 from core.speech import SpeechController, SpeechLevel, LEVEL_LABELS
-from logger.logger import AnomalyLogger, ImuStatsLogger
+from logger.logger import AnomalyLogger
 from logger.rawlog import RawLogWriter
 from core.frame_decoder import FrameDecoder
 from ui.replay_window import ReplayWindow
@@ -74,6 +78,26 @@ _DIRECTION_SPEAK_PERIOD_S = 10.0
 _DIRECTION_POINTS = ("North", "North-East", "East", "South-East",
                      "South", "South-West", "West", "North-West")
 
+# Per-param echo budget for the tag-17 ACK-driven transport.
+#
+# The 2026-09-29 first attempt set this to 400 ms, justified as "~20x the 20 ms
+# telemetry cadence". That was the wrong reference: telemetry cadence says
+# nothing about the FC's command turn-around, and it was sized far below the
+# real one. It is a backstop against a genuinely dropped echo, not a normal-case
+# deadline — correctness does NOT depend on it, because _on_param_write_echo
+# reconciles an echo by INDEX rather than by strict lockstep (see there). So it
+# is deliberately generous: too long costs a few seconds on a real fault, too
+# short costs correctness. Re-size from a measured turn-around distribution once
+# a clean bench run gives one; do not shrink it "because telemetry is 20 ms".
+PARAM_WRITE_ECHO_TIMEOUT_MS = 6000.0
+
+# After the last param is sent, hold the batch open this long for stragglers
+# before declaring the remainder unconfirmed. This is what lets an echo that
+# arrives after its own timeout still rescue its index.
+PARAM_WRITE_DRAIN_MS = 5000.0
+PARAM_WRITE_CHUNK_DELAY_MS = 15.0  # gap between chunks of param writes
+PARAM_WRITE_CHUNK_SIZE = 25
+
 # Single source of truth: one entry per FC Flags bit (main.h struct order).
 # key==bit number matches flags order; (key, name, tooltip) drives both the
 # compact curated view and the "Show all flags" grid so they never drift.
@@ -112,7 +136,7 @@ FLAG_BIT_DEFS = {
     31: ('unused_dc_motors', 'unusedDCMotors', 'Reserved: F.DCMotorsDetected never set by FC'),
     32: ('unused_sat', 'unusedSat', 'Reserved: F.Saturation never set by FC'),
     33: ('dump_bb', 'DumpBB', 'Dumping Black Box'),
-    34: ('unused_param', 'unusedParam', 'Reserved: F.ParametersValid never set by FC'),
+    34: ('cfg_pend', 'CfgPend', 'Config uncommitted on FC (ConfigChanged set, not yet flashed)'),
     35: ('signal', 'Signal', 'Signal'),
     36: ('wp_nav', 'WPNav', 'WP Navigation'),
     37: ('imu', 'IMU', 'IMU Active'),
@@ -122,7 +146,8 @@ FLAG_BIT_DEFS = {
     41: ('mag_cal', 'MagCal', 'Mag Calibrated'),
     42: ('rc_map_fail', 'RCMap', 'RC Map Fail'),
     43: ('new_alt', 'NewAlt', 'New Altitude Value'),
-    44: ('gyro_cal', 'IMUCal', 'IMU Calibrated'),
+    # 44 is the ACCELEROMETER cal flag; ErectRateGyros() never sets it. Was mislabelled gyro_cal.
+    44: ('acc_cal', 'IMUCal', 'Accel Calibrated'),
     45: ('fence_alarm', 'Fence', 'Fence Alarm'),
     46: ('excess_lift', 'ExLift', 'Excess Lift: throttle at floor but still climbing (lost alt control)'),
     47: ('imu_fault_lat', 'IMU', 'IMU Fault Latched'),
@@ -189,8 +214,20 @@ FLAG_GROUPS = [
     ('Soaring / Glide', [51, 63, 69]),
     ('Flight Mode / Throttle', [25, 40, 13]),
     ('Arming / Power', [29, 39, 5]),
-    ('System / Debug', [33, 67, 49, 80]),
+    ('System / Debug', [33, 34, 67, 49, 80]),
 ]
+
+# The neutral look of a flag label: name shown, no state asserted. Defined
+# once and shared by the builder and the reset so "unknown" cannot drift
+# between the two.
+_FLAG_NEUTRAL_QSS = """
+    background-color: #ddd;
+    color: #666;
+    font-weight: normal;
+    border: 1px solid #999;
+    border-radius: 3px;
+    padding: 3px 6px;
+"""
 
 class TelemetryThread(QThread):
     """Background thread for serial telemetry"""
@@ -391,6 +428,31 @@ class TelemetryThread(QThread):
         self.wait()
 
 
+# ============================================================================
+# Preflight term labels (bit order mirrors FC alarms.h PfTerms). Keyed by bit
+# index to match the FC flag-bit table above. A set bit = term BLOCKING.
+# ============================================================================
+PF_TERM_DEFS = {
+    0: ('signal', 'Signal', 'No RC signal'),
+    1: ('rc_map', 'RCMap', 'RC map is invalid'),
+    2: ('rc_start', 'RCStart', 'RC start stick is not centred'),
+    3: ('armed', 'Armed', 'Armed on the first pass'),
+    4: ('throttle', 'ThrOpen', 'Throttle is not at idle'),
+    5: ('navsw', 'NavSw', 'Nav switch is not in LOW'),
+    6: ('imu', 'IMU', 'IMU not active'),
+    7: ('acc_cal', 'IMUCal', 'Accelerometer not calibrated'),
+    8: ('baro', 'Baro', 'Baro not active'),
+    9: ('mag', 'Mag', 'Mag in use but not calibrated/active'),
+    10: ('batt', 'Batt/Nav', 'Low battery, serial fatal, RTH or navigation active'),
+}
+
+
+def pf_term_labels(mask):
+    """Names of the preflight terms blocking, FC-side bit order."""
+    return [PF_TERM_DEFS[b][2] for b in sorted(PF_TERM_DEFS)
+            if mask & (1 << b)]
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -401,10 +463,10 @@ class MainWindow(QMainWindow):
         self.serial_ports: Optional[dict] = None
         self.exec_time: Optional[ExecTimeData] = None
         self.i2c_errors: Optional[I2CErrorData] = None
-        self._last_reported_wdt_mark = -1
         self._last_reported_reset_cause = -1
+        self._last_reported_boot_diag = -1
         self._last_reported_imu_fault_code = -1
-        self._last_reported_imu_fault_recoveries = -1
+        self._last_reported_imu_fault_detections = -1
         self.origin_data: Optional[OriginData] = None
         self.control_data: Optional[ControlData] = None
         self.guidance_data: Optional[GuidanceData] = None
@@ -429,7 +491,6 @@ class MainWindow(QMainWindow):
         
         self.speech = SpeechController()
         self.anomaly_logger = AnomalyLogger()
-        self.imu_stats_logger = ImuStatsLogger()
         self._anomaly_pending = False
         self.raw_logger = RawLogWriter()
         self.replaying = False
@@ -448,18 +509,39 @@ class MainWindow(QMainWindow):
         self.log_dir = None
         self._bb_chunks = {}
         self._last_wp_data = None
+        self._mag_live: Optional[list] = None
         self._param_write_list = []
         self._param_write_port = None
         self._param_write_on_complete = None
         self._param_write_progress = None
         self._param_write_total = 0
         self._param_write_index = 0
+        # ACK-driven tag-17 transport (2026-09-29). The pump used to schedule the
+        # next param on a fixed 5 ms timer and never waited for the FC, so
+        # on_complete - and therefore the tag-72 flash commit that depends on it
+        # - fired the moment the last byte hit the wire, while the FC was still
+        # working through the queue. That let the commit pack a partially
+        # applied RAM image. _param_write_await_idx is the single index in
+        # flight; it clears only on its own echo, or on the watchdog recording it
+        # as unconfirmed so the caller can refuse to commit.
+        self._param_write_await_idx = None
+        self._param_write_await_value = None
+        self._param_write_await_sent_ms = 0.0
+        # Every index SENT and not yet echoed, idx -> value we sent. The
+        # authoritative "unconfirmed" set: it is derived from this, not
+        # appended to as timeouts happen, so an echo arriving late can still
+        # rescue its index instead of being discarded.
+        self._param_write_sent_pending = {}
+        self._param_write_drain_until_ms = 0.0
+        self._param_write_ack_timer = QTimer(self)
+        self._param_write_ack_timer.setInterval(20)
+        self._param_write_ack_timer.timeout.connect(self._check_param_write_ack)
         self._revision_from_afname = False
         self._pending_flash_airframe_name = None
+        self._pending_configuration_required = None
         self._last_tune = None
         self._last_rx_time = 0.0
-        self._last_init_state = -1
-        self._last_init_state_change = 0.0
+        self._pf_term_mask = 0
         self._log_level = "All"
         self._flight_log_only = False  # terminal: show only FLIGHT packets
         self._trace_combo_loading = False
@@ -504,8 +586,8 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         
         file_menu = menubar.addMenu("&File")
-        log_folder_action = QAction("Set Log &KML Folder…", self)
-        log_folder_action.triggered.connect(self.select_log_folder)
+        log_folder_action = QAction("Set UAVX &Workspace Folder…", self)
+        log_folder_action.triggered.connect(self.select_workspace_folder)
         file_menu.addAction(log_folder_action)
         replay_action = QAction("&Replay Log…", self)
         replay_action.setShortcut("Ctrl+R")
@@ -570,6 +652,13 @@ class MainWindow(QMainWindow):
             if self._pending_flash_airframe_name is not None:
                 self.param_window.set_flash_airframe_name(self._pending_flash_airframe_name)
                 self._pending_flash_airframe_name = None
+            if self._pending_configuration_required is not None:
+                self.param_window.set_configuration_required(
+                    self._pending_configuration_required)
+                self._pending_configuration_required = None
+
+        self._pending_configuration_required = None
+
         self.param_window.show()
         self.param_window.raise_()
         self.param_window.activateWindow()
@@ -939,6 +1028,11 @@ class MainWindow(QMainWindow):
         state_layout.addWidget(self.curr_wp_label, 1, 1)
         state_layout.addWidget(QLabel("Alarm:"), 1, 2)
         state_layout.addWidget(self.alarm_state_label, 1, 3)
+        self.pf_block_label = QLabel("")
+        self.pf_block_label.setWordWrap(True)
+        self.pf_block_label.setStyleSheet("color: #cc0000; font-weight: bold;")
+        self.pf_block_label.setVisible(False)
+        state_layout.addWidget(self.pf_block_label, 2, 0, 1, 4)
         state_box.setLayout(state_layout)
         state_batt_row.addWidget(state_box)
         
@@ -1067,24 +1161,38 @@ class MainWindow(QMainWindow):
         imu_layout.addWidget(QLabel("D/U:"), 4, 5)
         imu_layout.addWidget(self.slew_acc_yaw, 4, 6)
 
-        imu_layout.addWidget(QLabel("IMU Temp:"), 5, 0)
-        self.mpu_temp = QLabel("0.0°C")
-        self.mpu_temp.setStyleSheet("font-weight: bold;")
-        self.mpu_temp.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        imu_layout.addWidget(self.mpu_temp, 5, 1, 1, 2)
+        imu_layout.addWidget(QLabel("Mag:"), 5, 0)
+        self.mag_x = QLabel("0")
+        self.mag_y = QLabel("0")
+        self.mag_z = QLabel("0")
+        for lbl in (self.mag_x, self.mag_y, self.mag_z):
+            lbl.setStyleSheet("font-weight: bold;")
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        imu_layout.addWidget(QLabel("Mx:"), 5, 1)
+        imu_layout.addWidget(self.mag_x, 5, 2)
+        imu_layout.addWidget(QLabel("My:"), 5, 3)
+        imu_layout.addWidget(self.mag_y, 5, 4)
+        imu_layout.addWidget(QLabel("Mz:"), 5, 5)
+        imu_layout.addWidget(self.mag_z, 5, 6)
 
-        imu_layout.addWidget(QLabel("Acc Conf:"), 5, 3)
+        imu_layout.addWidget(QLabel("Mag Hdg:"), 6, 0)
+        self.mag_heading = QLabel("0.0°")
+        self.mag_heading.setStyleSheet("font-weight: bold;")
+        self.mag_heading.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        imu_layout.addWidget(self.mag_heading, 6, 1, 1, 2)
+
+        imu_layout.addWidget(QLabel("Acc Conf:"), 6, 3)
         self.acc_confidence = QLabel("0")
         self.acc_confidence.setStyleSheet("font-weight: bold;")
         self.acc_confidence.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        imu_layout.addWidget(self.acc_confidence, 5, 4)
+        imu_layout.addWidget(self.acc_confidence, 6, 4)
 
         imu_box.setLayout(imu_layout)
         # Pin the IMU box width once at natural size +20% so numeric label
         # growth (e.g. "0.0" -> "-0.00") never reflows/resizes the box.
         imu_box.setFixedWidth(int(imu_box.sizeHint().width() * 1.2))
 
-        # Anomalies box to the right of IMU: IMU/WDT health + per-device
+        # Anomalies box to the right of IMU: IMU health + per-device
         # I2C error counters (Tag=76). The pair shares one row so the IMU
         # box can be kept narrow and the health data is right beside it.
         imu_anom_row = QHBoxLayout()
@@ -1377,7 +1485,7 @@ class MainWindow(QMainWindow):
         self.config_flags = [
             (1, 0, "Ext Mag"), (1, 1, "Autoland"), (1, 2, "Use Mag"), (1, 3, "Emulation"),
             (1, 4, "AH Alarm"), (1, 5, "GPS Alt"), (1, 7, "Clamp"),
-            (2, 0, "Batt Comp"), (2, 1, "Fast Start"), (2, 3, "Have GPS"), (2, 4, "Prop In"),
+            (2, 0, "Batt Comp"), (2, 3, "Have GPS"), (2, 4, "Prop In"),
             (2, 5, "Turn WP"), (2, 6, "Beep WP"),
         ]
         for which, bit, name in self.config_flags:
@@ -1394,6 +1502,18 @@ class MainWindow(QMainWindow):
             """)
             config_layout.addWidget(label)
             self.config_labels.append(label)
+        
+        emul_label = self.config_labels[self.config_flags.index((1, 3, "Emulation"))]
+        emul_label.setToolTip("Unavailable — emulation disabled; commissioning is real flight only.")
+        emul_label.setStyleSheet("""
+            background-color: #f0f0f0;
+            color: #c0c0c0;
+            font-weight: normal;
+            font-style: italic;
+            border: 1px dashed #ccc;
+            border-radius: 3px;
+            padding: 3px 6px;
+        """)
         config_layout.addStretch()
         
         self.config_box.setLayout(config_layout)
@@ -1416,7 +1536,43 @@ class MainWindow(QMainWindow):
         self.flags_box.setLayout(flags_layout)
         main_layout.addWidget(self.flags_box)
         
+        self.reset_flight_readouts()
         self.statusBar().showMessage("Ready")
+    
+    # Readouts that carry a value measured by the FC. They are shown as "---"
+    # until a packet actually supplies the field, because a hard-coded 0.0
+    # reads as "measured zero" and survives across sessions, so a stale value
+    # from a previously connected board is indistinguishable from a live one.
+    # Updates are unconditional once data arrives: this never masks a value the
+    # FC reported, including NaN.
+    _FLIGHT_READOUTS = (
+        'roc_label', 'altitude_label', 'flight_state_label', 'nav_state_label',
+        'curr_wp_label', 'alarm_state_label', 'batt_volts', 'batt_current',
+        'batt_charge', 'batt_remain', 'angle_roll', 'angle_pitch',
+        'angle_yaw', 'gyro_roll', 'gyro_pitch', 'gyro_yaw',
+        'acc_lr', 'acc_fb', 'acc_du',
+        'slew_gyro_roll', 'slew_gyro_pitch', 'slew_gyro_yaw',
+        'slew_acc_roll', 'slew_acc_pitch', 'slew_acc_yaw',
+        'mag_heading', 'mag_x', 'mag_y', 'mag_z', 'acc_confidence', 'wp_bearing', 'distance_to_wp',
+        'cross_track', 'guidance_distance', 'guidance_bearing',
+        'guidance_elevation', 'guidance_hint',
+    )
+
+    def reset_flight_readouts(self):
+        for name in self._FLIGHT_READOUTS:
+            label = getattr(self, name, None)
+            if hasattr(label, 'setText'):
+                label.setText("---")
+        # A flag label's text is its NAME, set once at build; its state lives
+        # in the stylesheet. Resetting to "---" would erase the name and
+        # nothing puts it back (update_flag_colors only restyles), so the
+        # unknown state is the neutral colour instead.
+        self._reset_flag_colors()
+
+    def _reset_flag_colors(self):
+        """Put every flag label back to the neutral, no-state-reported look."""
+        for flag_data in getattr(self, 'flag_labels', {}).values():
+            flag_data['widget'].setStyleSheet(_FLAG_NEUTRAL_QSS)
     
     def _build_flag_groups(self, flags_layout):
         """Build the logical flag group boxes showing every assigned FC
@@ -1437,14 +1593,7 @@ class MainWindow(QMainWindow):
             h = fm.height() + 8               # 3px pad x2 + 1px border x2
             w = fm.horizontalAdvance('7') * 7 + 14
             label.setFixedSize(w, h)
-            label.setStyleSheet("""
-                background-color: #ddd;
-                color: #666;
-                font-weight: normal;
-                border: 1px solid #999;
-                border-radius: 3px;
-                padding: 3px 6px;
-            """)
+            label.setStyleSheet(_FLAG_NEUTRAL_QSS)
             return label
 
         for gi, (group_name, bits) in enumerate(FLAG_GROUPS):
@@ -1608,18 +1757,9 @@ class MainWindow(QMainWindow):
         a home-dir fallback if DocumentsLocation is unavailable."""
         if self.log_dir:
             return self.log_dir
-        d = os.path.expanduser("~/UAVX")
+        d = workspace.logs_dir()
         os.makedirs(d, exist_ok=True)
         return d
-
-    # WDT trip codes must match the emum in UAVXArmQ/src/wdt.h
-    _WDT_TRIP_NAMES = {
-        1: "boot", 2: "init", 10: "loop-top", 11: "poll-diag",
-        12: "inertial", 13: "control", 14: "housekeeping", 15: "nav-state",
-        16: "state", 30: "i2c-er-start-wait", 31: "i2c-er-stop-wait",
-        32: "i2c-ev-start-wait", 33: "i2c-rd-stop-wait", 34: "i2c-wr-stop-wait",
-        40: "serial-tx-wait", 41: "flash-wait",
-    }
 
     # IMU integrity fault codes must match the enum in UAVXArmQ/src/inertial.h
     _IMU_FAULT_NAMES = {
@@ -1638,11 +1778,25 @@ class MainWindow(QMainWindow):
         6: "external-pin", 7: "brownout",
     }
 
+    # Config.BootDiag must match the BootDiag enum in UAVXArmQ/src/params.h.
+    # Every non-restored outcome routes through UseDefaultParametersClearCal()
+    # in the FC, so they all mean the same actionable thing: the config is
+    # gone, the calibration with it, and the pilot must re-commit and
+    # re-calibrate. There is no "calibration preserved" case to advertise.
+    _BOOT_DIAG_NAMES = {
+        0: "not reported (FC predates this field)",
+        1: "config restored from flash",
+        2: "config not written by this build (blank/DFU-padded/foreign magic)",
+        3: "parameter table changed since the config was written",
+        4: "ConfigStruct layout changed (firmware updated)",
+        5: "config flash blank - nothing has ever been committed",
+    }
+
     def _report_reset_cause(self, parsed):
-        """Report the FC's persisted last-reset cause once per change. This is
-        the real discriminator when a self-reboot produced no WDT marker: the
-        WDT path only records an IWDG trip, while param 127 survives any
-        meaningful reset (brownout, external pin, window-watchdog, ...)."""
+        """Report the FC's persisted last-reset cause once per change. Param 127
+        survives any meaningful reset (brownout, external pin, window-watchdog,
+        independent watchdog, ...), so this is the single discriminator for why
+        the FC last restarted."""
         entries = getattr(parsed, "entries", None)
         if not entries or ParamIndex.POWER_RESET_CAUSE not in entries:
             return
@@ -1658,43 +1812,140 @@ class MainWindow(QMainWindow):
             print("[RST] no meaningful reset recorded (unknown/power-on)")
             self.log_debug("No meaningful reset cause on last boot", "Info")
 
-    def _report_wdt_trip(self, parsed):
-        """Report a watchdog trip once per change: the exec bar shows only
-        'WDT <num>' but the trip must survive to the terminal log for later
-        correlation against the flight trace."""
-        mark = getattr(parsed, "wdt_mark", 0)
-        if mark == self._last_reported_wdt_mark:
+    def _report_boot_diag(self, parsed):
+        """Report how the FC's last boot obtained its config block, once per
+        change. Config.BootDiag arrives in the tag-67 offset-12 hole.
+
+        This exists because the fallback is otherwise invisible. When the magic,
+        the ParamTable CRC or the layout stamp does not match, IsFlashClean()
+        routes the board to UseDefaultParametersClearCal() - compiled defaults,
+        no airframe, and a wiped calibration - and the pilot's first clue is
+        the arming gate refusing because Config.IMUCal.Calibrated is not 1.
+        Nothing says why, and the stock remedy (calibrate) silently redoes the
+        work every boot without fixing the cause.
+
+        Deliberately log-only, NOT a banner. The flashing AlarmFlashBox was
+        retired 2026-09-10 and must not be resurrected; alarm reporting lives
+        in the non-flashing alarm_state_label. This reporter additionally has
+        no banner path of its own to share, so a banner here could only ever be
+        an inconsistency between the two reporters on the same tag-67 packet.
+        """
+        code = getattr(parsed, "boot_diag", 0)
+        if code == self._last_reported_boot_diag:
             return
-        self._last_reported_wdt_mark = mark
-        if mark:
-            name = self._WDT_TRIP_NAMES.get(mark, "unknown")
-            print(f"[WDT] watchdog trip MARK={mark} ({name}) on last reset")
-            self.log_debug(f"Watchdog trip marker {mark} ({name}) on last reset", "Warnings")
+        self._last_reported_boot_diag = code
+        name = self._BOOT_DIAG_NAMES.get(code, "unknown")
+        if code in (0, 1):
+            print(f"[BOOT] config load: {code} ({name})")
+            self.log_debug(f"FC config load outcome {code}: {name}", "Info")
         else:
-            print("[WDT] last boot was NOT a watchdog trip")
-            self.log_debug("No watchdog trip on last boot", "Info")
+            msg = (f"FC reverted to compiled defaults on last boot - {name}. "
+                   f"Config, airframe and calibration are gone; load an "
+                   f"airframe, Apply & Reboot, then re-calibrate IMU and mag")
+            print(f"[BOOT] {msg}")
+            self.log_debug(msg, "Warnings")
+
+    def _verify_post_commit_config(self, parsed):
+        """Gate the deferred post-commit readback on the FC's own reboot report.
+
+        The tag-72 ACK is the FC's verified truth: RefreshConfig() returns true
+        only after erase + program + byte-for-byte read-back, and the FC reboots
+        only on a confirmed commit. What the ACK cannot show is whether flash
+        holds the values the GCS intended, so an independent tag-71 comparison
+        against what was written is still required.
+
+        That readback must be served by the FC that came back AFTER the reset.
+        This used to gate on a tag-70 flight_state of eStepNav, which could
+        never arrive twice over: TxState() emits unframed debug text the
+        FrameDecoder cannot read as a packet, and InitNavigation() re-runs on
+        every arming, so it is neither machine-readable nor reboot-specific.
+        Tag 68 (SendRebootInfoPacket, one call at the end of InitHarness) is
+        the replacement - an explicit boot edge carrying the reason.
+        """
+        if not self._pending_param_verification or not self.param_window:
+            return
+
+        self._pending_param_verification = False
+
+        # The FC has reported, so the reconnect watchdog has served its purpose
+        # either way - a late arrival still needs releasing.
+        wd = getattr(self.param_window, '_reconnect_watchdog_timer', None)
+        if wd is not None:
+            wd.stop()
+            self.param_window._reconnect_watchdog_timer = None
+
+        cause = getattr(parsed, "reset_cause", 0)
+        code = getattr(parsed, "boot_diag", 0)
+        name = self._BOOT_DIAG_NAMES.get(code, "unknown")
+        cause_name = self._RESET_CAUSE_NAMES.get(cause, "unknown")
+        reason = f"reset cause {cause} ({cause_name}), config load {code} ({name})"
+
+        # The cause is recorded but NOT used as a gate. Readback is the authority
+        # whatever the cause: a brownout or power-off inside the commit window
+        # leaves flash in an unknown state that only the comparison can settle,
+        # and a watchdog reset may still have committed cleanly. Log it so an
+        # unexpected cause is visible, and let the readback decide.
+        self.log_debug(f"FC rebooted after commit: {reason}", "Info")
+
+        # Code 1 is the only value that positively asserts the config block was
+        # restored from flash. 2-5 mean the FC reverted to compiled defaults, so
+        # the block the commit wrote is not the block now in flash and a readback
+        # would compare against reverted values - fail loudly instead. 0 is an
+        # FC predating the field: fall through to the readback, which is itself
+        # sufficient proof (it compares flash against the snapshot), so refusing
+        # here would only lose verification on older firmware.
+        if code not in (0, 1):
+            msg = (f"Commit verification FAILED - FC reports {reason}. The "
+                   f"config block was not restored from flash, so the commit "
+                   f"did not persist. Load an airframe, Apply & Reboot.")
+            print(f"[COMMIT] {msg}")
+            self.log_debug(msg, "Errors")
+            return
+
+        # Re-pull the config packet (tag-63) too. The airframe name rides the
+        # config block and survives the reboot in flash, but the connect handler
+        # only asks for it on a port reopen - which a UART link does not see
+        # across the commit reboot.
+        self.send_request(PacketTag.AFNAME, 0, 0, None)
+
+        self.param_window._request_write_verify()
 
     def _report_imu_fault(self, parsed):
-        """Report an attitude-integrity (NaN/Inf) recovery from the FC once per
+        """Report an attitude-integrity (NaN/Inf) DETECTION from the FC once per
         change. The FC latches F.IMUFaultLatched (flag idx 47) and streams the
-        fault code + cumulative recovery count via tag 67. A recovered value
-        means the FC discarded the bad sample and keeps flying, but the
-        incident must be called out loudly on the ground station."""
+        fault code + cumulative detection count via tag 67.
+
+        The wording matters: the FC does NOT recover the attitude. It is a
+        report-only tripwire (inertial.c), because reverting to a held attitude
+        is "hold last setting" - and with the gyro still live the angle loop
+        would fly the aircraft back to an attitude that is no longer true. Bad
+        SENSOR samples are discarded upstream in PostFilterAccAndRate(); a
+        non-finite ATTITUDE means an unguarded source escaped, which is a bug
+        to investigate. So never say "recovered" here: that tells the pilot the
+        FC handled something it deliberately does not attempt to handle.
+
+        Report-only, with no banner of any kind. This branch used to call
+        _raise_fault_banner()/_hide_fault_banner(), neither of which has ever
+        existed in this tree (not even in the imported baseline) - the function
+        was dead code with no call site, so the dead reference was harmless.
+        Giving it a call site at the tag-67 case made the FC's FIRST ExecTime
+        packet raise AttributeError in a Qt slot, which PyQt5 turns into
+        qFatal and kills the whole GCS. Do not reintroduce a banner: the
+        flashing AlarmFlashBox was retired 2026-09-10 and the tracing/console
+        output is the intended reporting path."""
         code = getattr(parsed, "imu_fault_code", 0)
-        rec = getattr(parsed, "imu_fault_recoveries", 0)
+        rec = getattr(parsed, "imu_fault_detections", 0)
         if code == self._last_reported_imu_fault_code \
-                and rec == self._last_reported_imu_fault_recoveries:
+                and rec == self._last_reported_imu_fault_detections:
             return
         self._last_reported_imu_fault_code = code
-        self._last_reported_imu_fault_recoveries = rec
+        self._last_reported_imu_fault_detections = rec
         if code:
             name = self._IMU_FAULT_NAMES.get(code, "unknown")
-            msg = f"IMU integrity fault code={code} ({name}); recovered {rec}x"
+            msg = (f"IMU integrity fault code={code} ({name}); detected {rec}x "
+                   f"- NOT recovered (report-only), investigate the sensor path")
             print(f"[IMU] {msg}")
             self.log_debug(msg, "Errors")
-            self._raise_fault_banner(msg)
-        else:
-            self._hide_fault_banner()
 
     def _on_raw_bytes(self, data: bytes):
         """Tee raw serial bytes to the always-on raw log (all bytes, binary
@@ -1702,15 +1953,16 @@ class MainWindow(QMainWindow):
         if self.raw_logger.active:
             self.raw_logger.write(data)
 
-    def select_log_folder(self):
-        start = self.log_dir or os.path.expanduser("~/UAVX")
-        folder = QFileDialog.getExistingDirectory(self, "Select Log Folder", start)
+    def select_workspace_folder(self):
+        start = self.log_dir or workspace.workspace_dir()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select UAVX workspace folder (saved airframes + logs)", start)
         if folder:
-            self.log_dir = folder
-            os.makedirs(self.log_dir, exist_ok=True)
-            self.raw_logger.log_dir = folder
+            workspace.set_workspace_dir(folder)
+            _air, self.log_dir = workspace.ensure_dirs()
+            self.raw_logger.log_dir = self.log_dir
             self.save_settings()
-            self.log_debug(f"📂 Log folder set → {folder}", "Info")
+            self.log_debug(f"📂 Workspace folder set → {folder}", "Info")
 
     def load_settings(self):
         settings = QSettings("UAVX", "Groundstation")
@@ -1738,31 +1990,28 @@ class MainWindow(QMainWindow):
             self.log_debug(
                 f"🔇 Speech unavailable: {self.speech.init_error}", "Info")
 
-        # Log folder: prompt once on first run, otherwise use saved location
-        self.log_dir = settings.value("log_dir", None)
-        if not self.log_dir:
-            default_dir = os.path.expanduser("~/UAVX")
+        # Workspace folder: prompt once on first run, else use the saved root.
+        # Saved airframes and telemetry logs both live under it.
+        if not workspace.has_workspace_dir():
             folder = QFileDialog.getExistingDirectory(
-                self, "Select folder for raw telemetry logs", default_dir)
+                self, "Select your UAVX workspace folder (airframes + logs)",
+                workspace.default_workspace_dir())
             if folder:
-                self.log_dir = folder
-            else:
-                self.log_dir = default_dir
-            settings.setValue("log_dir", self.log_dir)
-        os.makedirs(self.log_dir, exist_ok=True)
+                workspace.set_workspace_dir(folder)
+        _air, self.log_dir = workspace.ensure_dirs()
         self.raw_logger.log_dir = self.log_dir
-        # Verify + confirm the active log location on every startup
+        # Verify + confirm the active workspace on every startup
         if not os.access(self.log_dir, os.W_OK):
-            self.log_debug(f"⚠️ Log folder not writable: {self.log_dir}", "Errors")
+            self.log_debug(f"⚠️ Workspace not writable: {self.log_dir}", "Errors")
         else:
-            self.log_debug(f"📂 Log folder → {self.log_dir}", "Info")
+            self.log_debug(f"📂 Workspace → {self.log_dir}", "Info")
 
     def save_settings(self):
         settings = QSettings("UAVX", "Groundstation")
         settings.setValue("port", self.port_combo.currentText())
         settings.setValue("baud", self.baud_combo.currentText())
         settings.setValue("speech_level", str(self.speech.level.value))
-        settings.setValue("log_dir", self.log_dir)
+        settings.setValue("workspace_dir", workspace.workspace_dir())
     
     def toggle_connection(self):
         if self.telemetry and self.telemetry.isRunning():
@@ -1771,6 +2020,7 @@ class MainWindow(QMainWindow):
             self.connect_telemetry()
     
     def connect_telemetry(self):
+        self.reset_flight_readouts()
         # Connecting while replaying a log terminates the replay immediately
         # and returns the GCS to the live FC link.
         if self.replaying:
@@ -1809,6 +2059,10 @@ class MainWindow(QMainWindow):
             # doesn't leave the commit path locked forever.
             self.param_window._flash_write_pending = False
             self.param_window._write_in_progress = False
+            self.param_window._apply_retry_pending = False
+            if getattr(self.param_window, '_reconnect_watchdog_timer', None) is not None:
+                self.param_window._reconnect_watchdog_timer.stop()
+                self.param_window._reconnect_watchdog_timer = None
         
         if self.telemetry:
             self.telemetry.stop()
@@ -1823,6 +2077,7 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Connect")
         self.connect_btn.setStyleSheet("background-color: red; color: white; font-weight: bold;")
         self.connect_btn.setEnabled(True)
+        self.reset_flight_readouts()
         self.status_label.setText("● Disconnected")
         self.status_label.setStyleSheet("color: red; font-weight: bold;")
         self.statusBar().showMessage("Disconnected")
@@ -1837,7 +2092,7 @@ class MainWindow(QMainWindow):
             self.esc_btn.setEnabled(True)
             self.esc_btn.setText("ESC")
             self.esc_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
-            self.raw_logger.log_dir = self.log_dir or os.path.expanduser("~/UAVX")
+            self.raw_logger.log_dir = self.log_dir or workspace.logs_dir()
             self.raw_logger.start()
             self.log_debug(f"🖊️ Raw log → {os.path.abspath(self.raw_logger._path)}", "Info")
             self.connect_btn.setText("Disconnect")
@@ -1846,10 +2101,17 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
             self.statusBar().showMessage("Connected to UAVX")
             self.log_debug("✅ Connected to UAVX", "Info")
-            # Skip the connect-time tag-71 when a commit's deferred verification is
-            # outstanding — _request_write_verify() (first flight packet) does that
-            # single readback once the FC is fully back. Avoids a racing double-read.
-            if not self._pending_param_verification:
+            # Skip the connect-time tag-71 when a commit's verification is
+            # outstanding - _verify_post_commit_config() issues that single
+            # readback once the first post-reconnect tag-67 reports the config
+            # block is valid. Avoids a racing double-read.
+            if self._pending_param_verification:
+                # The FC sends tag 68 once at the end of InitHarness(), which is
+                # buffered and drained on either link - but on USB the host may
+                # still be mid-reopen backoff, so ask for it again. Free when
+                # nothing is pending verification.
+                self.send_request(PacketTag.REQUEST, PacketTag.REBOOT_INFO, 0)
+            else:
                 self.send_request(PacketTag.PARAM_TAGGED_READ, 255, 0, None)
             self.send_request(PacketTag.MIN, 0, 0, None)
             self.send_request(PacketTag.AFNAME, 0, 0, None)
@@ -1912,7 +2174,14 @@ class MainWindow(QMainWindow):
         html = f'<span style="color: #666;">[{timestamp}]</span> <span style="color: {color};">{level}:</span> {message}'
         self.status_msg.setText(f"[{timestamp}] {level}: {message}")
         self.status_msg.setStyleSheet(f"color: {color}; font-size: 14px;")
-    
+
+    def _trace(self, message, level="Info"):
+        """Commit-path diagnostic: the status bar is transient, so commit
+        send/verify outcomes are also printed to the console (stdout) where
+        they survive for post-mortem alongside the rawlog."""
+        self.log_debug(message, level)
+        print(message)
+
     def _build_packet_with_checksum(self, data: bytes) -> bytes:
         packet = bytearray()
         packet.append(0xFF)
@@ -2038,14 +2307,14 @@ class MainWindow(QMainWindow):
         airframe the GCS displays after restart.
         """
         if not self.connected or not self.telemetry:
-            self.log_debug("❌ Cannot send AFName - not connected", "Errors")
+            self._trace("❌ [commit] Cannot send AFName - not connected", "Errors")
             return
         serial_port = getattr(self.telemetry, 'serial', None)
         if not serial_port or not serial_port.is_open:
-            self.log_debug("❌ Serial port not open - cannot send AFName", "Errors")
+            self._trace("❌ [commit] Serial port not open - cannot send AFName", "Errors")
             return
         if not name:
-            self.log_debug("  ℹ️ No airframe name to persist — skipping AFName write", "Info")
+            self._trace("  ℹ️ [commit] No airframe name to persist — skipping AFName write", "Info")
             return
         body = name.encode('ascii', errors='replace')
         if len(body) > 31:
@@ -2056,10 +2325,10 @@ class MainWindow(QMainWindow):
         raw_data.extend(body)
         packet = self._build_packet_with_checksum(raw_data)
         try:
-            serial_port.write(packet)
-            self.log_debug(f"📤 Sent AFName: {body.decode('ascii')}", "Info")
+            n = serial_port.write(packet)
+            self._trace(f"📤 [commit] Sent AFName: {body.decode('ascii')!r} ({len(packet)} B wired, write()={n})", "Info")
         except Exception as e:
-            self.log_debug(f"❌ Failed to send AFName: {e}", "Errors")
+            self._trace(f"❌ [commit] Failed to send AFName: {e}", "Errors")
 
     def send_param_commit(self):
         """Tell FC to save current params to flash."""
@@ -2073,6 +2342,59 @@ class MainWindow(QMainWindow):
                 self.log_debug("📤 Sent param commit")
             except Exception as e:
                 self.log_debug(f"❌ Failed to send commit: {e}", "Errors")
+
+    def send_param_image(self):
+        """Send the complete 128-value parameter image as tag 77 (512 B + CRC32).
+
+        The FC verifies the CRC, stages the image, clamps and copies it into the
+        active Config mirror, writes the whole config to flash in one blocking
+        erase+program, conditions it via LoadParameters(), ACKs, and reboots.
+        This is the bulk replacement for the per-parameter tag-17 batch + tag-72
+        commit. The image is built by the parameter window, which fills params it
+        has no widget for from the last full tag-71 readback so a block write can
+        never zero a parameter the GCS does not manage.
+        """
+        if not self.param_window:
+            self._trace("❌ [commit] Cannot send param image - no parameter window", "Errors")
+            return
+        serial_port = getattr(self.telemetry, 'serial', None)
+        if not serial_port or not serial_port.is_open:
+            self._trace("❌ [commit] Serial port not open - cannot send param image", "Errors")
+            return
+        try:
+            image = self.param_window.build_raw_image()
+        except Exception as e:
+            self._trace(f"❌ [commit] Failed to build param image: {e}", "Errors")
+            return
+        body = struct.pack('<%df' % len(image), *image)
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        raw_data = bytearray([PacketTag.PARAM_IMAGE])
+        raw_data.extend(struct.pack('<H', len(body) + 4))
+        raw_data.extend(body)
+        raw_data.extend(struct.pack('<I', crc))
+        packet = self._build_packet_with_checksum(raw_data)
+        try:
+            n = serial_port.write(packet)
+            self._trace(
+                f"📤 [commit] Sent param image ({len(body)} B + CRC 0x{crc:08X}, "
+                f"{len(packet)} B wired, write()={n})")
+        except Exception as e:
+            self._trace(f"❌ [commit] Failed to send param image: {e}", "Errors")
+
+    def abort_param_writes(self):
+        """Stop an in-flight tag-17 batch without reporting completion.
+
+        Used before a tag-77 block send: the block carries the full widget image,
+        so any queued/awaited per-parameter write is superseded and must not be
+        left racing the 516-byte block onto the wire.
+        """
+        self._param_write_ack_timer.stop()
+        self._param_write_list = []
+        self._param_write_sent_pending = {}
+        self._param_write_await_idx = None
+        self._param_write_await_value = None
+        self._param_write_drain_until_ms = 0.0
+        self._param_write_on_complete = None
 
     def _handle_param_packet(self, parsed):
         """Shared handler for tag 17 and tag 71 param packets"""
@@ -2123,45 +2445,75 @@ class MainWindow(QMainWindow):
         return False
 
     def send_params_typed(self, on_complete=None, indices=None, progress_cb=None):
-        """Send widget values as individual param packets.
+        """Send widget values as individual param packets, ACK-driven.
+
         If indices is provided, only those param indices are sent.
         progress_cb(sent, total) is called after each packet is written.
+
+        on_complete(unconfirmed) is called once the last param has been
+        WRITTEN *and* confirmed by a tag-17 echo (or recorded as unconfirmed by
+        the echo watchdog). unconfirmed is the list of indices the FC never
+        acknowledged, so a caller about to commit a flash block can refuse
+        rather than pack a partially applied image.
         """
         if not self.connected or not self.telemetry:
-            on_complete and on_complete()
+            on_complete and on_complete([])
             return
         if not self.param_window:
-            on_complete and on_complete()
+            on_complete and on_complete([])
             return
         serial_port = getattr(self.telemetry, 'serial', None)
         if not serial_port or not serial_port.is_open:
-            on_complete and on_complete()
+            on_complete and on_complete([])
             return
 
         param_range = indices if indices is not None else range(128)
         params = []
+        skipped = []
         for i in param_range:
-            if i in self.param_window.params:
-                widget = self.param_window.params[i]
-                if isinstance(widget, QDoubleSpinBox):
-                    display = widget.value()
-                    mult = self.param_window._display_mult(i)
-                    fval = display / mult
-                elif isinstance(widget, QSpinBox):
-                    fval = float(widget.value())
-                elif isinstance(widget, QComboBox):
-                    data = widget.currentData()
-                    if data is None:
-                        raise ValueError(
-                            f"Combo param {i} selection has no data "
-                            f"(index {widget.currentIndex()}) — refusing to write "
-                            f"a positional index as the value")
-                    fval = float(data)
-                else:
-                    fval = 0.0
+            # param_widget() falls back to the Setup group, so a setup-only
+            # parameter (AF_TYPE et al) is sent with its real value instead of
+            # being written to the FC as a silent 0.0.
+            widget = self.param_window.param_widget(i)
+            if widget is None:
+                # No widget means no value to assert. Writing 0.0 here (the
+                # previous behaviour) silently CLOBBERED the FC's stored value
+                # for every parameter the GCS has no widget for - a live way to
+                # zero a parameter the user never touched. Skip instead: the FC
+                # keeps whatever it already holds, and the omission is reported
+                # rather than written.
+                skipped.append(i)
+                continue
+            if isinstance(widget, QDoubleSpinBox):
+                display = widget.value()
+                mult = self.param_window._display_mult(i)
+                fval = display / mult
+            elif isinstance(widget, QSpinBox):
+                fval = float(widget.value())
+            elif isinstance(widget, QComboBox):
+                data = widget.currentData()
+                if data is None:
+                    raise ValueError(
+                        f"Combo param {i} selection has no data "
+                        f"(index={widget.currentIndex()}) — refusing to write "
+                        f"a positional index as the value")
+                fval = float(data)
             else:
-                fval = 0.0
+                skipped.append(i)
+                continue
             params.append((i, fval))
+
+        if skipped:
+            self.log_debug(
+                f"⚠️ Skipped {len(skipped)} param(s) with no widget — FC values "
+                f"left untouched: {skipped}", "Warnings")
+        if not params:
+            if skipped:
+                self.log_debug(
+                    f"❌ Nothing to send: all {len(skipped)} param(s) had no "
+                    f"widget", "Errors")
+            on_complete and on_complete(skipped)
+            return
 
         self._param_write_list = params
         self._param_write_port = serial_port
@@ -2169,27 +2521,61 @@ class MainWindow(QMainWindow):
         self._param_write_progress = progress_cb
         self._param_write_total = len(params)
         self._param_write_index = 0
+        self._param_write_sent_pending = {}
+        self._param_write_drain_until_ms = 0.0
+        self._param_write_chunk_sent = 0
+        # Clear any dangling await from a previous cycle. _finish_param_write
+        # already does this on the normal exit; doing it here too means a
+        # re-entrant call (e.g. the commit path's flush) can never inherit a
+        # stale await and stall the new batch before it sends a single byte.
+        self._param_write_await_idx = None
+        self._param_write_await_value = None
+        self._param_write_ack_timer.start()
         self._send_next_param()
 
+    def _finish_param_write(self, unconfirmed):
+        """Close out the sender and hand the unconfirmed list to the caller.
+
+        on_complete is called WITH the list of indices the FC never echoed, so
+        a caller that is about to commit a flash block can refuse rather than
+        pack a partially applied image.
+        """
+        self._param_write_ack_timer.stop()
+        self._param_write_await_idx = None
+        self._param_write_await_value = None
+        self._param_write_drain_until_ms = 0.0
+        self._param_write_sent_pending = {}
+        cb = self._param_write_on_complete
+        self._param_write_on_complete = None
+        self._param_write_progress = None
+        self._param_write_port = None
+        cb and cb(unconfirmed)
+
     def _send_next_param(self):
+        # One index in flight at a time: the next param is not sent until the
+        # FC has echoed the current one (or the watchdog gives up on it).
+        if self._param_write_await_idx is not None:
+            return
         if not self._param_write_list:
-            self.log_debug("✅ All param packets sent")
-            cb = self._param_write_on_complete
-            self._param_write_on_complete = None
-            self._param_write_progress = None
-            self._param_write_port = None
-            cb and cb()
+            if not self._param_write_sent_pending:
+                self.log_debug("✅ All param packets confirmed by FC")
+                self._finish_param_write([])
+                return
+            # List is empty but echoes are still outstanding: hold the batch
+            # open for stragglers instead of declaring them lost immediately.
+            if self._param_write_drain_until_ms <= 0.0:
+                self._param_write_drain_until_ms = (time.monotonic() * 1000.0
+                                                    + PARAM_WRITE_DRAIN_MS)
+                self.log_debug(
+                    f"⏳ Draining {len(self._param_write_sent_pending)} "
+                    f"outstanding echo(s)…")
             return
         idx, fval = self._param_write_list.pop(0)
         serial_port = self._param_write_port
         if not serial_port or not serial_port.is_open:
             self.log_debug("❌ Serial port closed during param send", "Errors")
             self._param_write_list = []
-            cb = self._param_write_on_complete
-            self._param_write_on_complete = None
-            self._param_write_progress = None
-            self._param_write_port = None
-            cb and cb()
+            self._finish_param_write(list(range(idx, 128)))
             return
         try:
             raw_data = bytearray([PacketTag.PARAM])
@@ -2201,18 +2587,108 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log_debug(f"❌ Failed to send param {idx}: {e}", "Errors")
             self._param_write_list = []
-            cb = self._param_write_on_complete
-            self._param_write_on_complete = None
-            self._param_write_progress = None
-            self._param_write_port = None
-            cb and cb()
+            self._finish_param_write([idx])
             return
         self._param_write_index += 1
-        self.log_debug(f"📤 Sent param {idx} = {fval}")
+        self._param_write_sent_pending[idx] = fval
+        # Any send makes the batch active again, so drop a drain deadline left
+        # over from a previous quiet period — it must be re-armed fresh when the
+        # batch next goes quiet, not inherited and expire under the new param.
+        self._param_write_drain_until_ms = 0.0
+        self._param_write_await_idx = idx
+        self._param_write_await_value = fval
+        self._param_write_await_sent_ms = time.monotonic() * 1000.0
+        self.log_debug(f"📤 Sent param {idx} = {fval} (awaiting echo)")
         pcb = self._param_write_progress
         if pcb:
             pcb(self._param_write_index, self._param_write_total)
-        QTimer.singleShot(5, self._send_next_param)
+
+    def _on_param_write_echo(self, parsed):
+        """Tag-17 echo hook: reconcile an echo BY INDEX, then release the sender.
+
+        Called only from the tag-17 dispatch, so a tag-71 bulk readback (same
+        handler, different tag) can never be mistaken for a single-param ACK.
+
+        WHY index-reconciliation and not strict lockstep (2026-09-29): the first
+        version required `base_idx == _param_write_await_idx` and discarded every
+        other echo. Combined with an echo timeout shorter than the FC's real
+        turn-around, that desynchronised the sender by one index and then kept
+        it one ahead permanently — one late echo made EVERY subsequent param
+        report unconfirmed (15 confirmed, 113 unconfirmed), even though the FC
+        had applied all 128 writes correctly. The data was fine; the
+        confirmations were being thrown away.
+
+        Now any echo for an index in _param_write_sent_pending confirms THAT
+        index, whether or not it is the one currently awaited. A late echo
+        therefore rescues its own index instead of poisoning the rest of the
+        batch, and the timeout degrades to a reporting speed rather than a
+        correctness dependency.
+        """
+        idx = getattr(parsed, 'base_idx', None)
+        if idx is None or idx not in self._param_write_sent_pending:
+            return          # not ours, or already confirmed — a stale echo
+        sent_value = self._param_write_sent_pending.pop(idx)
+        awaited = self._param_write_await_idx
+        entries = getattr(parsed, 'entries', None) or {}
+        echoed = entries[idx][1] if idx in entries else None
+        # Float compare with a small tolerance: the value round-trips through
+        # float32 on the wire, so an exact == would miss legitimate echoes.
+        if echoed is not None and abs(float(echoed) - sent_value) > 1e-6:
+            self.log_debug(
+                f"❌ Echo mismatch for param {idx}: sent "
+                f"{sent_value}, FC returned {echoed}", "Errors")
+        elif idx == awaited:
+            self.log_debug(f"✅ Param {idx} confirmed by FC ({echoed})")
+        else:
+            # Late echo for an index the watchdog already gave up on. It
+            # arrived, so it is confirmed — this is the case the old code threw
+            # away, and it is the common case whenever the timeout is tight.
+            self.log_debug(
+                f"✅ Param {idx} confirmed by late echo ({echoed}) "
+                f"— was timed out, now reconciled")
+        if idx == awaited:
+            self._param_write_await_idx = None
+            self._param_write_await_value = None
+        # A no-op if something is still awaited; otherwise pumps the next param
+        # or opens the drain window.
+        QTimer.singleShot(0, self._send_next_param)
+
+    def _check_param_write_ack(self):
+        """Watchdog: stop waiting on a param the FC has not echoed yet, and
+        close the batch out once the straggler drain window expires.
+
+        A timeout here no longer records the index as failed. It only stops
+        WAITING: the index stays in _param_write_sent_pending, so its echo can
+        still arrive and confirm it (see _on_param_write_echo). The
+        authoritative unconfirmed set is whatever is still pending when the
+        drain window closes, and it is reported through on_complete so the
+        flash commit can be REFUSED rather than packing a partially applied RAM
+        image.
+        """
+        now = time.monotonic() * 1000.0
+        idx = self._param_write_await_idx
+        if idx is not None:
+            elapsed = now - self._param_write_await_sent_ms
+            if elapsed < PARAM_WRITE_ECHO_TIMEOUT_MS:
+                return
+            self.log_debug(
+                f"⏱ No echo for param {idx} after {elapsed:.0f} ms — "
+                f"moving on (echo may still arrive and confirm it)", "Warnings")
+            self._param_write_await_idx = None
+            self._param_write_await_value = None
+            QTimer.singleShot(0, self._send_next_param)
+            return
+        if self._param_write_drain_until_ms <= 0.0:
+            return
+        if now < self._param_write_drain_until_ms:
+            return
+        self._param_write_drain_until_ms = 0.0
+        missing = sorted(self._param_write_sent_pending)
+        if missing:
+            self.log_debug(
+                f"⚠️ Param write finished with {len(missing)} unconfirmed: "
+                f"{missing}", "Warnings")
+        self._finish_param_write(missing)
 
     def _write_param_direct(self, idx, fval):
         """Queue one raw (idx, fc-float) param write through the tag-17 sender."""
@@ -2233,9 +2709,21 @@ class MainWindow(QMainWindow):
         serial_port = getattr(self.telemetry, 'serial', None)
         if not serial_port or not serial_port.is_open:
             return
-        if self._param_write_list:
+        if (self._param_write_list or self._param_write_await_idx is not None
+                or self._param_write_sent_pending):
+            # A param is "in flight" while its list entry is still queued, while
+            # the last one is waiting on its echo, OR while any sent param is
+            # still unconfirmed (which includes the straggler-drain window) —
+            # the list empties before the echo arrives, so testing the list
+            # alone would restart the sender and orphan the in-flight awaits
+            # (losing their echoes).
             self.log_debug(f"⏳ Param write in flight — appending {len(items)} live writes")
             self._param_write_list.extend(items)
+            # Re-pump in case the in-flight state is the drain window (await is
+            # None, list was empty): without this the appended live write would
+            # sit unsent until the drain closed out and then be dropped by
+            # _finish_param_write. A no-op when something is already awaited.
+            QTimer.singleShot(0, self._send_next_param)
             return
         self._param_write_list = list(items)
         self._param_write_port = serial_port
@@ -2243,6 +2731,12 @@ class MainWindow(QMainWindow):
         self._param_write_progress = None
         self._param_write_index = 0
         self._param_write_total = len(items)
+        self._param_write_sent_pending = {}
+        self._param_write_drain_until_ms = 0.0
+        self._param_write_chunk_sent = 0
+        self._param_write_await_idx = None
+        self._param_write_await_value = None
+        self._param_write_ack_timer.start()
         self._send_next_param()
 
     def _set_trace_combo_state(self, state):
@@ -2382,7 +2876,7 @@ class MainWindow(QMainWindow):
             60: "Unused", 61: "Unused", 62: "Calibration", 63: "AFName",
             64: "Wind", 65: "Unused", 66: "SerialPorts", 67: "ExecTime",
             68: "Unused", 69: "LinkStats", 70: "InitState", 71: "ParamRead",
-            76: "I2CErrors",
+            76: "I2CErrors", 77: "ParamImage",
         }
         tag_name = TAG_NAMES.get(tag, f"Unknown({tag})")
         tag_ok = "OK" if parsed is not None else "FAIL"
@@ -2515,11 +3009,6 @@ class MainWindow(QMainWindow):
 
                 self._check_speech_events(parsed)
 
-                # Trigger deferred param verification after FC reboot from commit
-                if self._pending_param_verification and self.param_window:
-                    self._pending_param_verification = False
-                    self.param_window._request_write_verify()
-
             case 14:
                 self.nav_data = parsed
                 data_manager.update_nav_data(parsed)
@@ -2577,7 +3066,14 @@ class MainWindow(QMainWindow):
                     packet_logger.log_received(51, "ACK", parsed)
                     if at in (241, 223):
                         return
-                    ack_handler.handle_ack(at, ok)
+                    # PARAM_COMMIT and PARAM_IMAGE are never registered with
+                    # ack_handler (the Read/Write buttons they serve are gone),
+                    # so handle_ack can only report "No pending request" for
+                    # them. That is noise, and it printed a red ❌ immediately
+                    # before a correct ✅. Both ACKs are handled on the dedicated
+                    # path below.
+                    if at not in (PacketTag.PARAM_COMMIT, PacketTag.PARAM_IMAGE):
+                        ack_handler.handle_ack(at, ok)
 
                     cmd = getattr(self, '_pending_misc_command', None)
                     if at == PacketTag.MISC and cmd is not None:
@@ -2590,11 +3086,13 @@ class MainWindow(QMainWindow):
                         elif self.calib_window is not None:
                             self.calib_window.on_misc_ack(cmd, ok)
 
-                    if at == PacketTag.PARAM_COMMIT:
-                        # The commit ACK reflects whether the config (+ name) is
-                        # CONFIRMED in flash (erase + program + read-back verify).
-                        # ok=False means the FC did NOT save and will NOT reboot:
-                        # surface it loudly and un-arm the deferred verification.
+                    if at in (PacketTag.PARAM_COMMIT, PacketTag.PARAM_IMAGE):
+                        # The ACK reflects whether the config (+ name) is
+                        # CONFIRMED in flash (erase + program + read-back
+                        # verify). ok=False means the FC did NOT save and will
+                        # NOT reboot: surface it loudly and un-arm the deferred
+                        # verification. PARAM_IMAGE ACKs on the same path — the
+                        # FC writes flash and reboots exactly as tag-72 did.
                         if self.param_window is not None:
                             self.param_window.on_param_commit_ack(ok)
                         if ok:
@@ -2616,6 +3114,9 @@ class MainWindow(QMainWindow):
                     self.log_debug("  CALIB: packet too short (<80) - firmware without chip-ID telemetry?", "Info")
                 elif isinstance(parsed, dict):
                     data_manager.update_calibration_data(parsed)
+                    mag_live = parsed.get('mag_live')
+                    if mag_live and len(mag_live) == 3:
+                        self._mag_live = mag_live
                     imu_id = parsed.get('imu_id')
                     mag_id = parsed.get('mag_id')
                     if imu_id is not None or mag_id is not None:
@@ -2625,7 +3126,9 @@ class MainWindow(QMainWindow):
                 if isinstance(parsed, dict) and 'revision' in parsed:
                     rev = parsed['revision']
                     packet_logger.log_received(63, "CONFIG", parsed)
-                    self.log_debug(f"  FW: {rev}, AFType: {parsed.get('af_type', '?')}, AFName: {parsed.get('airframe_name', '')}", "Info")
+                    af_type = parsed.get('af_type')
+                    self.log_debug(f"  FW: {rev}, AFType: {af_type if af_type is not None else '?'}, "
+                                   f"AFName: {parsed.get('airframe_name', '')}", "Info")
                     self.revision_label.setText(rev)
                     self._revision_from_afname = True
                     # Persisted airframe name from FC config flash is the single
@@ -2633,10 +3136,42 @@ class MainWindow(QMainWindow):
                     af_name = parsed.get('airframe_name') or ''
                     if self.raw_logger.active:
                         self.raw_logger.rename(af_name)
+                    # The tag-63 AFType byte is the single authoritative signal
+                    # for "an airframe is configured". While the FC runs on the
+                    # compiled ParamTable defaults it holds Config.Empty, and
+                    # SendConfigPacket() reports that as eAFUnknown in this byte;
+                    # once a real airframe commit clears Config.Empty the byte
+                    # carries the true pAFType. Config.Empty is the FC-owned,
+                    # persisted record ("this config is the ParamTable default,
+                    # no airframe loaded"); the GCS only reads it.
+                    #
+                    # It must NOT key on the airframe NAME: a cal-cleared or
+                    # never-configured board has AirframeName[0]==0, but the name
+                    # is a display string and the round-trip through tag-75/tag-77
+                    # is not what marks the FC's state. It must NOT key on the raw
+                    # pAFType value either — the ParamTable default is eQuadXAF,
+                    # so a blank FC would otherwise look configured. Nor on
+                    # ConfigChanged, which the FC raises in normal flight.
+                    # (Greg 2026-09-25; re-keyed on the Empty sentinel 2026-10-11.)
+                    #
+                    # Only gate once the FC has actually answered, so working
+                    # offline with .af files is unaffected.
+                    config_required = None
+                    if af_type is not None:
+                        config_required = (af_type == AirframeType.eAFUnknown)
+                        if config_required:
+                            self.log_debug(
+                                "  ⚠️ FC has no airframe configured "
+                                "(eAFUnknown / Config.Empty) — params page gated "
+                                "until a generic .af is loaded.", "Warning")
                     if self.param_window is not None:
                         self.param_window.set_flash_airframe_name(af_name)
+                        if config_required is not None:
+                            self.param_window.set_configuration_required(
+                                config_required)
                     else:
                         self._pending_flash_airframe_name = af_name
+                        self._pending_configuration_required = config_required
 
             case 66:
                 packet_logger.log_received(66, "SERIAL", parsed)
@@ -2644,15 +3179,36 @@ class MainWindow(QMainWindow):
                     self.serial_ports = parsed
                     self.update_serial_ports_display()
 
+            case 70:
+                # One function only: the uint16 preflight term mask. The packet
+                # arrives only on change, so this is a latched fault set. It is
+                # latched unconditionally - gating it on a flight_state the
+                # packet no longer carries silently dropped every term. Boot-edge
+                # detection (post-commit verification) is tag 68's job.
+                if parsed is not None and hasattr(parsed, 'pf_terms'):
+                    self._pf_term_mask = parsed.pf_terms or 0
+
             case 67:
                 packet_logger.log_received(67, "EXEC", parsed)
                 self.exec_time = parsed
-                self._report_wdt_trip(parsed)
+                # Both reporters are edge-triggered (once per change), so
+                # calling them on every tag-67 frame is cheap. _report_imu_fault
+                # used to have no call site at all: it was written, documented
+                # and initialised, but nothing invoked it, so an IMU integrity
+                # fault was parsed and then silently dropped.
+                self._report_imu_fault(parsed)
+                self._report_boot_diag(parsed)
 
             case 64:
                 packet_logger.log_received(64, "WIND", parsed)
                 if isinstance(parsed, WindData):
                     self.wind_data = parsed
+
+            case 68:
+                packet_logger.log_received(68, "REBOOT", parsed)
+                # Only meaningful as the boot edge after our own commit; see
+                # _verify_post_commit_config().
+                self._verify_post_commit_config(parsed)
 
             case 69:
                 packet_logger.log_received(69, "LINK", parsed)
@@ -2672,15 +3228,6 @@ class MainWindow(QMainWindow):
                 if hasattr(parsed, 'phase'):
                     if getattr(parsed, 'test_id', 0) == 0xff:
                         self.handle_anomaly(parsed)
-                    elif getattr(parsed, 'test_id', 0) == 2:
-                        # IMU Stats benchmark: log every burst packet live.
-                        self.imu_stats_logger.log(
-                            parsed.phase, parsed.data or [0] * 16)
-                        self.log_debug(
-                            f"🧪 IMU stats t{parsed.test_id} "
-                            f"p{parsed.phase} run="
-                            f"{(parsed.data or [0]*16)[1]}",
-                            "Info")
                     elif parsed.phase == 255:
                         # Test finished (done marker). Auto-restart regardless
                         # of the Misc window's visibility so unattended loops
@@ -2724,6 +3271,10 @@ class MainWindow(QMainWindow):
             case 17:
                 packet_logger.log_received(17, "PARAM", parsed)
                 self._handle_param_packet(parsed)
+                # Same tag as the bulk readback's sibling path but a 5-byte
+                # single-param echo - this is the only place the sender can
+                # safely learn that the FC received a value.
+                self._on_param_write_echo(parsed)
 
             case 71:
                 packet_logger.log_received(71, "PARAM_TAGGED", parsed)
@@ -2763,6 +3314,8 @@ class MainWindow(QMainWindow):
         config2 = self.config2_cache
         
         for i, (which, bit, name) in enumerate(self.config_flags):
+            if name == "Emulation":
+                continue
             val = config1 if which == 1 else config2
             is_set = (val & (1 << bit)) != 0
             if is_set:
@@ -2790,6 +3343,11 @@ class MainWindow(QMainWindow):
 
         crsf_active = self.link_stats is not None
         crsf_keys = {'lq', 'rssi', 'fs', 'snr'}
+
+        if self.param_window is not None and len(flag_bits) > 34:
+            # bit 34 = cfg_pend: the FC's own ConfigChanged, set by a captured
+            # calibration (acc/mag/gyro) that no local widget edit reflects.
+            self.param_window.on_fc_config_uncommitted(bool(flag_bits[34]))
 
         if crsf_active:
             lq = self.link_stats.uplink_lq
@@ -2852,7 +3410,7 @@ class MainWindow(QMainWindow):
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['vrs', 'rc_map_fail', 'fence_alarm', 'excess_lift', 'snr', 'ext_mag', 'imu_fault_lat']:
+                elif flag_key in ['vrs', 'rc_map_fail', 'fence_alarm', 'excess_lift', 'snr', 'ext_mag', 'imu_fault_lat', 'cfg_pend']:
                     color = "#f39c12"
                     text_color = "white"
                     font_weight = "bold"
@@ -2872,10 +3430,6 @@ class MainWindow(QMainWindow):
                     color = "#27ae60"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['param']:
-                    color = "#27ae60"
-                    text_color = "white"
-                    font_weight = "bold"
                 else:
                     color = "#27ae60"
                     text_color = "white"
@@ -2885,7 +3439,7 @@ class MainWindow(QMainWindow):
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['gyro_cal', 'acc_cal', 'mag_cal']:
+                elif flag_key in ['acc_cal', 'mag_cal']:
                     color = "#f39c12"
                     text_color = "white"
                     font_weight = "bold"
@@ -2934,7 +3488,6 @@ class MainWindow(QMainWindow):
             if self.anomaly_box is not None:
                 self.anomaly_box.update_exec(
                     self.exec_time.imu_rejects,
-                    self.exec_time.wdt_mark,
                     self.exec_time.exec_us,
                     self.exec_time.exec_peak_us
                 )
@@ -2998,8 +3551,15 @@ class MainWindow(QMainWindow):
         self.acc_fb.setText(f"{f.acc_fb:.2f}")
         self.acc_du.setText(f"{f.acc_du:.2f}")
         
-        self.mpu_temp.setText(f"{f.mpu_temp:.1f}°C")
+        self.mag_heading.setText(f"{f.mag_heading * 57.2958:.1f}°")
         self.acc_confidence.setText(f"{f.acc_confidence * 100:.0f}%")
+        if self._mag_live and len(self._mag_live) == 3:
+            mx, my, mz = self._mag_live
+            norm = math.sqrt(mx * mx + my * my + mz * mz)
+            if norm > 0:
+                self.mag_x.setText(f"{mx / norm:.2f}")
+                self.mag_y.setText(f"{my / norm:.2f}")
+                self.mag_z.setText(f"{mz / norm:.2f}")
 
         # Newtonian slew-window peaks (tag 67): gyro rad/s -> deg/s,
         # accel arrives as m/s^2 - displayed as-is.
@@ -3023,6 +3583,17 @@ class MainWindow(QMainWindow):
         self.alt_accu_bias_var.setText(f"{f.accu_bias_variance:.6f}")
         if hasattr(f, 'flight_state'):
             state_name = FlightState.get_name(f.flight_state)
+            pf_mask = self._pf_term_mask
+            pf_blocked = (pf_mask
+                          and f.flight_state in (FlightState.ePreflight,
+                                                 FlightState.eLivePreflight))
+            if pf_blocked:
+                self.pf_block_label.setText("Blocking preflight: %s"
+                                            % ", ".join(pf_term_labels(pf_mask)))
+                self.pf_block_label.setVisible(True)
+                state_name = "%s - BLOCKED" % state_name
+            else:
+                self.pf_block_label.setVisible(False)
             self.flight_state_label.setText(state_name)
             state_colors = {
                 FlightState.eStarting: "#add8e6",
@@ -3038,10 +3609,12 @@ class MainWindow(QMainWindow):
                 FlightState.eErectingGyros: "#ff0000",
                 FlightState.eMonitorInstruments: "#c0c0c0",
                 FlightState.eInitialisingGPS: "#87ceeb",
-                FlightState.eStepClocks: "#87ceeb",
-                FlightState.eStepMisc: "#87ceeb",
-                FlightState.eStepParams: "#87ceeb",
-                FlightState.eStepHarness: "#87ceeb",
+                FlightState.eStepSerial: "#87ceeb",
+                FlightState.eStepTarget: "#87ceeb",
+                FlightState.eStepDrives: "#87ceeb",
+                FlightState.eStepRC: "#87ceeb",
+                FlightState.eStepBuses: "#87ceeb",
+                FlightState.eStepAnalog: "#87ceeb",
                 FlightState.eStepOLED: "#87ceeb",
                 FlightState.eStepBattery: "#87ceeb",
                 FlightState.eStepLEDs: "#87ceeb",
@@ -3055,7 +3628,23 @@ class MainWindow(QMainWindow):
                 FlightState.eStepNav: "#87ceeb",
                 FlightState.eStepEmu: "#87ceeb",
                 FlightState.eStepSPI: "#87ceeb",
-                FlightState.eStepESCProg: "#87ceeb",
+                FlightState.eStepInertFlt: "#87ceeb",
+                FlightState.eStepIMUDrv: "#87ceeb",
+                FlightState.eStepBaro: "#87ceeb",
+                FlightState.eStepBaroDrv: "#87ceeb",
+                FlightState.eStepGPS: "#87ceeb",
+                FlightState.eStepIdentify: "#87ceeb",
+                FlightState.eLivePreflight: "#2e8b57",
+                FlightState.eLiveReady: "#2e8b57",
+                FlightState.eLiveStarting: "#2e8b57",
+                FlightState.eLiveErectingGyros: "#2e8b57",
+                FlightState.eLiveWarmup: "#2e8b57",
+                FlightState.eLiveMonitorInstruments: "#2e8b57",
+                FlightState.eLiveInitialisingGPS: "#2e8b57",
+                FlightState.eLiveThrottleOpenCheck: "#2e8b57",
+                FlightState.eLiveLanded: "#2e8b57",
+                FlightState.eLiveLanding: "#2e8b57",
+                FlightState.eLiveShutdown: "#2e8b57",
             }
             color = state_colors.get(f.flight_state, "#ffffff")
             self.flight_state_label.setStyleSheet(f"font-weight: bold; background-color: {color}; padding: 2px 4px; border-radius: 2px;")
@@ -3069,7 +3658,8 @@ class MainWindow(QMainWindow):
                 gps_valid = f.flag_bits[6]
             else:
                 gps_valid = (f.gps_fix >= 3 and f.gps_sats >= 6)
-            self.gps_alt.setText(f"{f.gps_altitude:.1f}" if gps_valid else "---")
+            gps_alt_display = (f.gps_fix >= 3)
+            self.gps_alt.setText(f"{f.gps_altitude:.1f}" if gps_alt_display else "---")
             self.gps_vel.setText(f"{f.gps_vel:.1f}")
             self.gps_hacc.setText(f"{f.gps_hacc:.1f}")
             self.gps_vacc.setText(f"{f.gps_vacc:.1f}")
@@ -3274,7 +3864,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.save_settings()
         self.anomaly_logger.close()
-        self.imu_stats_logger.close()
         self.raw_logger.stop()
         
         if self.param_window:

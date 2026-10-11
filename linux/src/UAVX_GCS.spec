@@ -9,10 +9,19 @@
 # windows/build.bat inline arguments so all three platform builds ship the
 # same dependency closure (PyQt5 WebEngine, pyserial, folium, pyttsx3).
 
+import os
 import sys
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
+
+# Ship only the runtime airframe support: the loader modules are collected as
+# Python modules, and these are the shipped .af folders. The canonical src/
+# tree also holds dev tooling, CSV mirrors and original/proposed airframes;
+# scripts/helper/kit_manifest.txt keeps the kit tree clean, and these explicit
+# datas keep the frozen bundle clean even when built from a full tree.
+datas = [(d, d) for d in ('airframes/generic', 'airframes/contributed')
+         if os.path.isdir(d)]
 
 hidden_imports = (
     ['PyQt5.QtWebEngineWidgets',
@@ -33,7 +42,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('airframes', 'airframes')],
+    datas=datas,
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},

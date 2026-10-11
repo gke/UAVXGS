@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 
 from core.frame_decoder import FrameDecoder
+import workspace
 
 
 RAWLOG_MAGIC = b"UAVXRAW\x01"
@@ -157,7 +158,7 @@ class ReplayWindow(QMainWindow):
         m.addAction(close_action)
 
     def _default_log_dir(self):
-        return getattr(self.main, "log_dir", None) or os.path.expanduser("~/UAVX")
+        return getattr(self.main, "log_dir", None) or workspace.logs_dir()
 
     def _refresh_file_list(self):
         self._file_combo.clear()

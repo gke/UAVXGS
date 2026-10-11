@@ -3,6 +3,8 @@
 UAVX Packet Parser
 Based on telem.c and FormMain.cs
 All ESC bytes are removed before this parser receives data!
+
+Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 from dataclasses import dataclass, field
@@ -217,9 +219,12 @@ class ExecTimeData:
     exec_peak_us: int = 0
     revision: int = 0
     imu_rejects: int = 0
-    wdt_mark: int = 0
+    # How the FC's last boot obtained its config block (FC BootDiag enum).
+    # 0 = not reported (an FC predating the field). See _BOOT_DIAG_NAMES in
+    # main_window for the meaning of each value.
+    boot_diag: int = 0
     imu_fault_code: int = 0
-    imu_fault_recoveries: int = 0
+    imu_fault_detections: int = 0
     # Newtonian slew-window peaks per axis, order Roll/Pitch/Yaw,
     # FC-native units:
     rate_slew_max_rs: tuple = (0.0, 0.0, 0.0)     # rad/s
@@ -229,6 +234,26 @@ class ExecTimeData:
     imu_rej_free_fall: int = 0
     imu_rej_gyro_slew: int = 0
     imu_rej_acc_slew: int = 0
+
+
+@dataclass
+class RebootInfoData:
+    """Tag 68 — reboot reason, sent once at the end of InitHarness().
+
+    The earliest point the FC can transmit (the telemetry port is configured by
+    InitTarget() -> InitSerialPort(), and the harness settle has run). Gives the
+    GCS an unambiguous post-reboot boot edge to gate its deferred post-commit
+    readback on — a periodic packet cannot, because the FC streams 10 Hz for
+    500 ms after its commit ACK and only then resets, so periodic packets
+    arriving after the ACK are still the OLD boot. Also re-requestable via
+    tag 50 so a missed emission costs nothing.
+    """
+    # FC ResetCause enum: 1=power, 2=pin, 3=software, 4=IWDG, 5=WWDG,
+    # 6=low-power, 7=option-byte. 0 = not reported.
+    reset_cause: int = 0
+    # How this boot obtained its config block (FC BootDiag enum): 0=not
+    # reported, 1=restored, 2=foreign magic, 3=table CRC, 4=layout, 5=blank.
+    boot_diag: int = 0
 
 
 @dataclass
@@ -840,6 +865,22 @@ def _spl_verify(d: I2CErrorData) -> None:
         + tr * (c["c01"] + p_lin * (c["c11"] + p_lin * c["c21"])))
 
 
+def parse_reboot_info(data: bytes) -> Optional[RebootInfoData]:
+    """Parse UAVXRebootInfoPacket (Tag=68) — telem.c SendRebootInfoPacket().
+    Body: resetCause u8(1) + bootDiag u8(1) = 2 bytes.
+    resetCause is the ResetCauses enum in main.h: 0 unknown, 1 low-power,
+    2 window-watchdog, 3 independent-watchdog, 4 SOFTWARE (NVIC_SystemReset),
+    5 power-on/power-down, 6 external pin, 7 brownout.
+    """
+    if len(data) < 2:
+        return None
+
+    r = RebootInfoData()
+    r.reset_cause = data[0]
+    r.boot_diag = data[1]
+    return r
+
+
 def parse_link_stats(data: bytes) -> LinkStatsData:
     """Parse UAVXLinkStatsPacket (Tag=69)
     Body: lq(1) + snr(1) + rssi(2) + signalLosses(2) + failsafes(2) = 8 bytes
@@ -873,13 +914,14 @@ def parse_ack_packet(data: bytes) -> Optional[dict]:
     
     tag = extract_byte(data, 0)      # body[0] = Tag being ACKed
     reason = extract_byte(data, 1)   # body[1] = Reason (255 = success, 0 = failure)
-    
-    return {
+
+    result = {
         'ack_tag': tag,
         'ack_success': reason != 0,
         'ack_reason': reason,
         'ack_text': 'ACK' if reason != 0 else 'NACK'
     }
+    return result
 
 
 def parse_waypoint_packet(data: bytes) -> Optional[dict]:
@@ -937,12 +979,20 @@ def parse_airframe_name(data: bytes) -> Optional[dict]:
 def parse_execution_time(data: bytes) -> Optional[ExecTimeData]:
     """Parse UAVXExecutionTimePacket (Tag=67) - from telem.c SendExecutionTimeStatus()
     Body: execUs u32(4) + execPeakUs u32(4)
-          + revision(2) + imuRejectCount(2) + wdtTripMark(2)
-          + imuFaultCode(2) + imuFaultRecoveries(2)
+          + revision(2) + imuRejectCount(2) + bootDiag(2)
+          + imuFaultCode(2) + imuFaultDetections(2)
           + rateSlewMax rad/s f32x3(12) + accSlewMax m/s^2 f32x3(12)
           + reject-class counters i16x4(8): busWedge, freeFall, gyroSlew,
             accelSlew (cumulative, sum == imuRejectCount)
           = 50 bytes
+    The offset-12 hole was the retired WDT fail-point mark. It is left in place
+    rather than closed up so the packet stays 50 bytes: an older GCS still
+    parses this packet whole instead of failing its length check and losing the
+    IMU/exec telemetry with it. The FC now carries Config.BootDiag there (how
+    the last boot obtained the config block), which stays wire-compatible in
+    both directions - a newer FC is simply ignored by an older GCS, and an
+    older FC streams 0 here, which reads as "not reported". Overwritten resets
+    are reported via RCC reset cause -> pPowerResetCause.
     """
     if len(data) < 50:
         return None
@@ -952,9 +1002,9 @@ def parse_execution_time(data: bytes) -> Optional[ExecTimeData]:
     f.exec_peak_us = extract_int32(data, 4)
     f.revision = extract_short(data, 8)
     f.imu_rejects = extract_short(data, 10)
-    f.wdt_mark = extract_short(data, 12)
+    f.boot_diag = extract_short(data, 12)
     f.imu_fault_code = extract_short(data, 14)
-    f.imu_fault_recoveries = extract_short(data, 16)
+    f.imu_fault_detections = extract_short(data, 16)
     f.rate_slew_max_rs = (extract_real32(data, 18),
                           extract_real32(data, 22),
                           extract_real32(data, 26))
@@ -1013,25 +1063,38 @@ def parse_tuning_packet(data: bytes) -> Optional[TuningData]:
 def parse_calibration_packet(data: bytes) -> Optional[dict]:
     """Parse UAVXCalibrationPacket (Tag=62) - from telem.c SendCalibrationPacket()
     Body: flags(12) + refTemp f32(4) + orientation(2)
-          + 3 axes x (grad,rbias,accScale,accBias f32(16) + magLive i16(2)
-          + magBias f32(4) = 22)
-          + LPFs i16x5(10) + population i16x8(16) + mm i32(4) + ids(2)
-          + mag config regs A/B/MODE u8(3) = 119 bytes
+          + 3 axes x (grad,rbias,agrad,accScale,accBias f32(20) + magLive i16(2)
+          + magBias f32(4) = 26)
+          + LPFs i16x5(10) + population i16x8(16) + mm i32(4)
+          + magResidual f32(4) + ids(2)
+          + mag config regs A/B/MODE u8(3) = 135 bytes
+
+    A 119-byte body is the older layout (per-axis stride 22, no accelerometer
+    temperature gradient, no fit residual), so an FC that has not been reflashed
+    is still read correctly rather than silently mis-strided.
 
     Cal values arrive as raw float32 in FC-native units:
       rate grads/biases in raw gyro counts (apply RATE_GYRO_SCALE),
-      acc scale unitless, acc bias in raw counts, mag bias in native units.
+      acc grads/biases in raw acc counts, acc scale unitless,
+      mag bias and mag fit residual in native units.
     Live mag reads stay int16 counts. Orientation = imuQuadrant/imuFlip/
     magQuadrant currently flashed on the FC.
     """
     if len(data) < 116:
         return None
 
+    new_layout = len(data) >= 128
+    stride = 26 if new_layout else 22
+    lpf_at = 18 + 3 * stride
+    oct_at = lpf_at + 10
+    mm_at = oct_at + 16
+
     result = {
         'flags': [extract_byte(data, i) for i in range(12)],
         'cal_ref_temp': extract_real32(data, 12),
         'rate_temp_grad': [],
         'rate_bias': [],
+        'acc_temp_grad': [],
         'acc_scale': [],
         'acc_bias': [],
         'mag_live': [],
@@ -1046,31 +1109,86 @@ def parse_calibration_packet(data: bytes) -> Optional[dict]:
     for _ in range(3):
         result['rate_temp_grad'].append(extract_real32(data, off))
         result['rate_bias'].append(extract_real32(data, off + 4))
-        result['acc_scale'].append(extract_real32(data, off + 8))
-        result['acc_bias'].append(extract_real32(data, off + 12))
-        result['mag_live'].append(extract_signed_short(data, off + 16))
-        result['mag_bias'].append(extract_real32(data, off + 18))
-        off += 22
+        if new_layout:
+            result['acc_temp_grad'].append(extract_real32(data, off + 8))
+            result['acc_scale'].append(extract_real32(data, off + 12))
+            result['acc_bias'].append(extract_real32(data, off + 16))
+            result['mag_live'].append(extract_signed_short(data, off + 20))
+            result['mag_bias'].append(extract_real32(data, off + 22))
+        else:
+            result['acc_scale'].append(extract_real32(data, off + 8))
+            result['acc_bias'].append(extract_real32(data, off + 12))
+            result['mag_live'].append(extract_signed_short(data, off + 16))
+            result['mag_bias'].append(extract_real32(data, off + 18))
+        off += stride
 
     # LPF bandwidths (5 x i16) - informational only
-    result['lpf'] = [extract_short(data, 84 + 2 * i) for i in range(5)]
+    result['lpf'] = [extract_short(data, lpf_at + 2 * i) for i in range(5)]
 
     # Mag calibration octant population counts and total
-    result['octants'] = [extract_short(data, 94 + 2 * i) for i in range(8)]
-    result['mm'] = extract_int32(data, 110)
+    result['octants'] = [extract_short(data, oct_at + 2 * i) for i in range(8)]
+    result['mm'] = extract_int32(data, mm_at)
 
-    result['imu_id'] = data[114]
-    result['mag_id'] = data[115]
+    ids_at = mm_at + 4
+    if new_layout:
+        # RMS sphere-fit residual of the last mag sweep, raw mag counts
+        result['mag_fit_residual'] = extract_real32(data, ids_at)
+        ids_at += 4
+    else:
+        result['mag_fit_residual'] = None
+
+    result['imu_id'] = data[ids_at]
+    result['mag_id'] = data[ids_at + 1]
 
     # Optional trailing mag config registers (FC snapshot at init)
-    if len(data) >= 119:
-        result['mag_cfg_a'] = data[116]
-        result['mag_cfg_b'] = data[117]
-        result['mag_mode'] = data[118]
+    if len(data) >= ids_at + 3:
+        result['mag_cfg_a'] = data[ids_at + 2]
+        result['mag_cfg_b'] = data[ids_at + 3]
+        result['mag_mode'] = data[ids_at + 4]
     else:
         result['mag_cfg_a'] = None
         result['mag_cfg_b'] = None
         result['mag_mode'] = None
+
+    # Unified bench calibration session block (FC >= the guided multi-pose accel
+    # fit). Absent on an older FC, so every field falls back to "no session".
+    ses_at = ids_at + 5
+    if len(data) >= ses_at + 22:
+        ses = data[ses_at]
+        result['calib_active'] = bool(ses & 0x01)
+        result['calib_want_mag'] = bool(ses & 0x02)
+        result['calib_want_acc'] = bool(ses & 0x04)
+        result['calib_mag_done'] = bool(ses & 0x08)
+        result['calib_acc_done'] = bool(ses & 0x10)
+        result['calib_mag_warn'] = bool(ses & 0x20)
+        result['calib_acc_warn'] = bool(ses & 0x40)
+        result['calib_pose'] = data[ses_at + 1]
+        # Sent as milliradians x1000, so back to radians.
+        result['calib_target_roll'] = extract_signed_short(data, ses_at + 2) * 0.001
+        result['calib_target_pitch'] = extract_signed_short(data, ses_at + 4) * 0.001
+        result['calib_pose_mask'] = extract_short(data, ses_at + 6)
+        result['calib_pose_samples'] = extract_short(data, ses_at + 8)
+        result['calib_total'] = extract_short(data, ses_at + 10)
+        result['calib_acc_residual'] = extract_real32(data, ses_at + 12)
+        result['calib_acc_radius'] = extract_real32(data, ses_at + 16)
+        result['calib_acc_iterations'] = extract_short(data, ses_at + 20)
+    else:
+        result['calib_active'] = False
+        result['calib_want_mag'] = False
+        result['calib_want_acc'] = False
+        result['calib_mag_done'] = False
+        result['calib_acc_done'] = False
+        result['calib_mag_warn'] = False
+        result['calib_acc_warn'] = False
+        result['calib_pose'] = 0
+        result['calib_target_roll'] = 0.0
+        result['calib_target_pitch'] = 0.0
+        result['calib_pose_mask'] = 0
+        result['calib_pose_samples'] = 0
+        result['calib_total'] = 0
+        result['calib_acc_residual'] = 0.0
+        result['calib_acc_radius'] = 0.0
+        result['calib_acc_iterations'] = 0
 
     return result
 
@@ -1254,14 +1372,24 @@ def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[objec
             return parse_serial_ports_packet(body), tag
         case 67:
             return parse_execution_time(body), tag
+        case 68:
+            return parse_reboot_info(body), tag
         case 69:
             return parse_link_stats(body), tag
         case 70:
-            if len(body) < 1:
+            # One function only: the uint16 preflight term mask (alarms.h
+            # PfTerms), little-endian. Flight state comes from the FLIGHT
+            # packet, not from here. A 3-byte body is an older FC build that
+            # prefixed a state byte; it is skipped, mask still read from 1..2.
+            if len(body) < 2:
                 return None, tag
             from types import SimpleNamespace
             ns = SimpleNamespace()
-            ns.flight_state = body[0]
+            if len(body) >= 3:
+                ns.flight_state = body[0]
+                ns.pf_terms = body[1] | (body[2] << 8)
+            else:
+                ns.pf_terms = body[0] | (body[1] << 8)
             return ns, tag
         case 71:
             return parse_param_packet(body), tag

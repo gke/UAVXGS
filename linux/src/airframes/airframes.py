@@ -10,6 +10,8 @@ Lines starting with '#' are comments.
 Blank lines are ignored.
 ParamName matches ParamIndex enum member name (case-insensitive).
 Enum values are looked up by name from the matching protocol enum.
+
+Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 import os
@@ -41,7 +43,6 @@ _LEGACY_PARAM_NAME_TO_TAG = {
     'KF_ACC_U_BIAS_VAR': 72,    # → Unused73
     'KF_BARO_VAR': 110,         # → Unused111
     'KF_ACC_U_VAR': 111,        # → Unused112
-    'FW_ROLL_CONTROL_PITCH_LIMIT': 113,  # → Unused114 (Euler-era FW roll guard)
 }
 
 
@@ -141,7 +142,7 @@ _LEGACY_ENUM_TOKENS = {
                         'USE_OFFSET_HOME': 'eUseOffsetHome',
                         'TEST_MISSION': 'eUnused1_6',
                         'ENFORCE_DRIVE_SYMMETRY': 'eEnforceDriveSymmetry'},
-        'Config2Bits': {'USE_BATTERY_COMP': 'eUseBatteryComp', 'USE_FAST_START': 'eUseFastStart',
+        'Config2Bits': {'USE_BATTERY_COMP': 'eUseBatteryComp', 'USE_FAST_START': 'eUnused2_1',
                         'USE_ESC_PROG': 'eUnused2_2', 'USE_BLHELI': 'eUnused2_2', 'USE_HAVE_GPS': 'eUseGPS',
                         'USE_PROP_SENSE': 'ePropsInwards', 'USE_TURN_TO_WP': 'eUseTurnToWP',
                         'USE_NAV_BEEP': 'eUseNavBeep'},
@@ -188,8 +189,30 @@ def _find_enum(param_name: str, raw_value: float) -> str:
     return None
 
 
+def _resolve_owned_or_any(enum_cls: type, token: str):
+    """Resolve a token against the param's own enum first, then any other.
+
+    Bare ambiguity-prone tokens (e.g. `DEFAULT`) exist on more than one
+    IntFlag, so the param's owning enum must take precedence, else
+    `CONFIG2_BITS = DEFAULT` resolves as Config1Bits.DEFAULT (0x16) instead
+    of Config2Bits.DEFAULT (0x4B).
+    """
+    if enum_cls is not None:
+        member = _resolve_enum_member(enum_cls, token)
+        if member is not None:
+            return member
+    for cls in ENUM_MAP.values():
+        if cls is None or cls is enum_cls:
+            continue
+        member = _resolve_enum_member(cls, token)
+        if member is not None:
+            return member
+    return None
+
+
 def _parse_value(param_name: str, text: str) -> float:
     """Parse a human-readable value string back to raw float."""
+    owned = _enum_for_param(param_name)
     text = text.strip()
     # Hex
     if text.startswith('0x') or text.startswith('0X'):
@@ -197,25 +220,21 @@ def _parse_value(param_name: str, text: str) -> float:
     # Pipe-separated IntFlag combination
     if '|' in text:
         total = 0
+        found_all = True
         for part in text.split('|'):
             part = part.strip()
-            found = False
-            for enum_cls in ENUM_MAP.values():
-                member = _resolve_enum_member(enum_cls, part)
-                if member is not None:
-                    total += member.value
-                    found = True
-                    break
-            if not found:
+            member = _resolve_owned_or_any(owned, part)
+            if member is None:
                 # If any part unrecognized, fall through to plain float
+                found_all = False
                 break
-        else:
+            total += member.value
+        if found_all:
             return float(total)
     # Try enum name lookup
-    for enum_cls in ENUM_MAP.values():
-        member = _resolve_enum_member(enum_cls, text)
-        if member is not None:
-            return float(member.value)
+    member = _resolve_owned_or_any(owned, text)
+    if member is not None:
+        return float(member.value)
     # Plain float
     return float(text)
 

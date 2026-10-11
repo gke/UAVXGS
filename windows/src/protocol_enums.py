@@ -2,6 +2,8 @@
 Complete UAVX Protocol Enums
 Mirrors the C header files (params.h, telem.h, protocol_constants.h, etc.)
 All enums start at 0 as per C convention
+
+Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 from enum import IntEnum, Enum, IntFlag
@@ -44,6 +46,7 @@ class PacketTag(IntEnum):
     TEST_RESPONSE = 74
     AFNAME_SET = 75
     I2C_ERRORS = 76
+    PARAM_IMAGE = 77
     REQUEST = 50
     ACK = 51
     MISC = 52
@@ -62,7 +65,7 @@ class PacketTag(IntEnum):
     UNUSED_TRACK = 65
     SERIAL_PORTS = 66
     EXECUTION_TIME = 67
-    UNUSED_ATTITUDE_CONTROL = 68
+    REBOOT_INFO = 68
     LINK_STATS = 69
     INIT_STATE = 70
     FRSKY = 99
@@ -80,7 +83,13 @@ class MiscCommand(IntEnum):
     BB_DUMP = 4           # Dump Black Box
     GPS_PASS_THRU_UNUSED = 5   # Slot retained: GPS pass-through removed
     CAL_ACC = 6           # Calibrate Accelerometer only
-    CAL_GYRO = 7          # Calibrate Gyro only
+    # Slot 7 retained, retired 2026-09-28. Was the blocking two-temperature
+    # "gyro only" hot calibration. The gyro bias now comes from the per-launch
+    # grab (ErectRateGyros) and its temperature gradient is learned at that
+    # same grab, so the routine was removed from the FC and there is nothing
+    # left to send here. The wire value is kept so the enum indices of
+    # everything after it do not shift.
+    CAL_GYRO_RETIRED = 7
     BOOTLOADER = 8        # Enter bootloader
     # Slot 9 = GPS_INIT reserved (removed: blocked the FC main loop ~9.4s → IWDG reset)
     FORCE_DEFAULTS = 10   # Reset all params to embedded defaults
@@ -222,6 +231,27 @@ def category_of(af_type):
 
 
 # ============================================================================
+# Preflight Terms (from alarms.h PfTerms enum)
+# ============================================================================
+# Bit order is a WIRE CONTRACT: it rides in byte 1 of the tag-70 breadcrumb.
+# A bit set means that term is BLOCKING preflight. Mirrored from alarms.h;
+# check_boot_steps.py asserts FC/GCS parity.
+class PfTerms(IntEnum):
+    ePfTSignal = 0
+    ePfTRCMap = 1
+    ePfTRCStart = 2
+    ePfTArmed = 3
+    ePfTThrottle = 4
+    ePfTNavSw = 5
+    ePfTIMU = 6
+    ePfTAccCal = 7
+    ePfTBaro = 8
+    ePfTMag = 9
+    ePfTBatt = 10
+    ePfTCount = 11
+
+
+# ============================================================================
 # ESC Types (from params.h)
 # ============================================================================
 class ESCType(IntEnum):
@@ -322,25 +352,49 @@ class FlightState(IntEnum):
     eErectingGyros = 10
     eMonitorInstruments = 11
     eInitialisingGPS = 12
-    eStepClocks = 13
-    eStepMisc = 14
-    eStepParams = 15
-    eStepHarness = 16
-    eStepOLED = 17
-    eStepBattery = 18
-    eStepLEDs = 19
-    eStepIMU = 20
-    eStepMag = 21
-    eStepMadgwick = 22
-    eStepAlt = 23
-    eStepNVMem = 24
-    eStepTemp = 25
-    eStepCtrl = 26
-    eStepNav = 27
-    eStepEmu = 28
-    eStepSPI = 29
-    eStepESCProg = 30
+    eBootStepBase = 13
+    eStepSerial = 14
+    eStepTarget = 15
+    eStepDrives = 16
+    eStepRC = 17
+    eStepBuses = 18
+    eStepAnalog = 19
+    eStepOLED = 20
+    eStepBattery = 21
+    eStepLEDs = 22
+    eStepIMU = 23
+    eStepMag = 24
+    eStepMadgwick = 25
+    eStepAlt = 26
+    eStepNVMem = 27
+    eStepTemp = 28
+    eStepCtrl = 29
+    eStepNav = 30
+    eStepEmu = 31
+    eStepSPI = 32
+    eStepInertFlt = 33
+    eStepIMUDrv = 34
+    eStepBaro = 35
+    eStepBaroDrv = 36
+    eStepGPS = 37
+    eStepIdentify = 38
 
+    eUnknownFlightState = 39
+
+    # Main-loop liveness breadcrumbs. Deliberately parked ABOVE eUnknownFlightState
+    # at explicit values: nothing existing renumbers, and because these are
+    # explicit the auto-numbered eStep* run above cannot collide with them.
+    eLivePreflight = 60
+    eLiveReady = 61
+    eLiveStarting = 62
+    eLiveErectingGyros = 63
+    eLiveWarmup = 64
+    eLiveMonitorInstruments = 65
+    eLiveInitialisingGPS = 66
+    eLiveThrottleOpenCheck = 67
+    eLiveLanded = 68
+    eLiveLanding = 69
+    eLiveShutdown = 70
     @classmethod
     def get_name(cls, state: int) -> str:
         names = {
@@ -357,10 +411,12 @@ class FlightState(IntEnum):
             cls.eErectingGyros: "Erect Gyros",
             cls.eMonitorInstruments: "Instrumentation",
             cls.eInitialisingGPS: "Init GPS",
-            cls.eStepClocks: "Init Clocks",
-            cls.eStepMisc: "Init Misc",
-            cls.eStepParams: "Load Params",
-            cls.eStepHarness: "Init Harness",
+            cls.eStepSerial: "Init Serial",
+            cls.eStepTarget: "Init Target",
+            cls.eStepDrives: "Init Drives",
+            cls.eStepRC: "Init RC",
+            cls.eStepBuses: "Init Buses",
+            cls.eStepAnalog: "Init Analog",
             cls.eStepOLED: "Init OLED",
             cls.eStepBattery: "Init Battery",
             cls.eStepLEDs: "Init LEDs",
@@ -374,9 +430,89 @@ class FlightState(IntEnum):
             cls.eStepNav: "Init Nav",
             cls.eStepEmu: "Init Emu",
             cls.eStepSPI: "Init SPI",
-            cls.eStepESCProg: "Init ESC Prog",
+            cls.eStepInertFlt: "Init Filt",
+            cls.eStepIMUDrv: "Init IMU Drv",
+            cls.eStepBaro: "Init Baro",
+            cls.eStepBaroDrv: "Init Baro Drv",
+            cls.eStepGPS: "Init GPS Drv",
+            cls.eStepIdentify: "Init Identify",
+            cls.eLivePreflight: "Live Preflight",
+            cls.eLiveReady: "Live Ready",
+            cls.eLiveStarting: "Live Starting",
+            cls.eLiveErectingGyros: "Live Erect Gyros",
+            cls.eLiveWarmup: "Live Warmup",
+            cls.eLiveMonitorInstruments: "Live Monitor Instr",
+            cls.eLiveInitialisingGPS: "Live Init GPS",
+            cls.eLiveThrottleOpenCheck: "Live Throttle Chk",
+            cls.eLiveLanded: "Live Landed",
+            cls.eLiveLanding: "Live Landing",
+            cls.eLiveShutdown: "Live Shutdown",
+            cls.eUnknownFlightState: "Unknown",
         }
         return names.get(state, f"Unknown({state})")
+
+    @classmethod
+    def get_mnemonic(cls, state: int) -> str:
+        """Short code per state (2-5 chars), for logs and compact columns.
+
+        Mirrors get_name()'s shape so the two can be swapped freely. Not used by
+        any display - call it explicitly. The eLive* codes carry an "L." prefix
+        because they sit next to the eStep* codes on the wire and would otherwise
+        be indistinguishable from them.
+        """
+        codes = {
+            cls.eStarting: "STG",
+            cls.eWarmup: "WRM",
+            cls.eLanding: "LNG",
+            cls.eLanded: "LND",
+            cls.eShutdown: "SHT",
+            cls.eInFlight: "FLY",
+            cls.eIREmulateUNUSED: "---",
+            cls.ePreflight: "PF",
+            cls.eReady: "RDY",
+            cls.eThrottleOpenCheck: "THR",
+            cls.eErectingGyros: "GYR",
+            cls.eMonitorInstruments: "MON",
+            cls.eInitialisingGPS: "GPS",
+            cls.eStepSerial: "SER",
+            cls.eStepTarget: "TGT",
+            cls.eStepDrives: "DRV",
+            cls.eStepRC: "RC",
+            cls.eStepBuses: "BUS",
+            cls.eStepAnalog: "ANL",
+            cls.eStepOLED: "OLD",
+            cls.eStepBattery: "BAT",
+            cls.eStepLEDs: "LED",
+            cls.eStepIMU: "IMU",
+            cls.eStepMag: "MAG",
+            cls.eStepMadgwick: "MDG",
+            cls.eStepAlt: "ALT",
+            cls.eStepNVMem: "NVM",
+            cls.eStepTemp: "TMP",
+            cls.eStepCtrl: "CTL",
+            cls.eStepNav: "NAV",
+            cls.eStepEmu: "EMU",
+            cls.eStepSPI: "SPI",
+            cls.eStepInertFlt: "IFL",
+            cls.eStepIMUDrv: "IDV",
+            cls.eStepBaro: "BAR",
+            cls.eStepBaroDrv: "BDV",
+            cls.eStepGPS: "GDR",
+            cls.eStepIdentify: "IDN",
+            cls.eLivePreflight: "L.PF",
+            cls.eLiveReady: "L.RDY",
+            cls.eLiveStarting: "L.STG",
+            cls.eLiveErectingGyros: "L.GYR",
+            cls.eLiveWarmup: "L.WRM",
+            cls.eLiveMonitorInstruments: "L.MON",
+            cls.eLiveInitialisingGPS: "L.GPS",
+            cls.eLiveThrottleOpenCheck: "L.THR",
+            cls.eLiveLanded: "L.LND",
+            cls.eLiveLanding: "L.LNG",
+            cls.eLiveShutdown: "L.SHT",
+            cls.eUnknownFlightState: "???",
+        }
+        return codes.get(state, f"?{state}")
 
 
 # ============================================================================
@@ -451,25 +587,37 @@ class Config1Bits(IntFlag):
     eUnused1_6 = 0x40
     eTestMission = eUnused1_6      # legacy .af token — do not re-use
 
-    # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm|Mag
-    DEFAULT = eUseRTHDescend | eUseAltHoldAlarm | eUsingMag
+    # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm.
+    # eUsingMag is NOT in the default (2026-09-29): most target boards have no
+    # magnetometer fitted, and with the bit set the FC's arming gate demands a
+    # mag calibration that cannot be obtained. The bit remains settable as an
+    # operator override to ignore a present-but-untrustworthy mag.
+    DEFAULT = eUseRTHDescend | eUseAltHoldAlarm
 
 
 class Config2Bits(IntFlag):
     """Config2 bit masks - matches params.h Config2"""
     eUseBatteryComp = 0x01         # bit 0
-    eUseFastStart = 0x02           # bit 1
+    eUnused2_1 = 0x02              # bit 1 — FREE (was eUseFastStart). FastStart only
+                                   # existed to skip the gyro grab, because a grab
+                                   # that could never succeed left the aircraft
+                                   # unarmable. The grab now always runs and always
+                                   # proceeds, falling back on the stored (and
+                                   # temperature-corrected) bias; a never-calibrated
+                                   # FC is blocked from arming by the FC instead.
+                                   # Available for a future feature.
+    eUseFastStart = eUnused2_1     # legacy .af token — do not re-use
     eUnused2_2 = 0x04              # bit 2 — FREE (was UseESCProg). ESC-Prog is now
-                               # runtime-triggered via the GCS ESC button (miscESCProg),
-                               # so it needs no config bit. Available for a future feature.
+                                   # runtime-triggered via the GCS ESC button (miscESCProg),
+                                   # so it needs no config bit. Available for a future feature.
     eUseGPS = 0x08             # bit 3
     ePropsInwards = 0x10           # bit 4 — SET = front two props rotate INWARDS (usual convention)
     eUseTurnToWP = 0x20           # bit 5
     eUseNavBeep = 0x40             # bit 6
     eUnused2_7 = 0x80              # bit 7 — FREE. Available for a future feature.
 
-    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|FastStart|GPS|NavBeep
-    DEFAULT = eUseBatteryComp | eUseFastStart | eUseGPS | eUseNavBeep
+    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|GPS|NavBeep
+    DEFAULT = eUseBatteryComp | eUseGPS | eUseNavBeep
 
 
 # ============================================================================
@@ -521,7 +669,7 @@ class FlagBits(IntEnum):
     DC_MOTORS = 31
     SAT = 32
     DUMP_BB = 33
-    PARAM = 34
+    CONFIG_UNCOMMITTED = 34
     SIGNAL = 35
     WP_NAV = 36
     IMU = 37
@@ -608,7 +756,7 @@ class ParamIndex(IntEnum):
     FW_ROLL_PITCH_FF = 64      # 65
     FW_PITCH_THROTTLE_FF = 65  # 66
     UNUSED_ALT_VEL_INT_LIMIT = 66  # 67
-    FW_MAX_CLIMB_ANGLE = 67    # 68
+    FW_THR_CUT = 67            # 68 — FW throttle-cut threshold (below: snap to 0; see control.c ShapeFWThrottle)
     NAV_MAX_ANGLE = 68         # 69
     FW_SPOILER_DECAY_PERCENT_PS = 69  # 70
     FW_AILERON_DIFFERENTIAL = 70       # 71
@@ -616,7 +764,7 @@ class ParamIndex(IntEnum):
     UNUSED_73 = 72            # 73 — was KFAccUBiasVar (tracked live in state.c)
     CONFIG2_BITS = 73          # 74
     MAX_PITCH_ANGLE = 74       # 75
-    QUAT_GAIN = 75            # 76
+    FW_ROLL_AUTHORITY = 75    # 76 — stabilised FW roll output scale (was QUAT_GAIN)
     MAX_ROLL_ANGLE = 76        # 77
     YAW_LPF_HZ = 77            # 78
     NAV_HEADING_TURNOUT = 78   # 79
@@ -653,8 +801,8 @@ class ParamIndex(IntEnum):
     YAW_RATE_INT_LIM = 109     # 110 — yaw rate-loop integral limit
     UNUSED_111 = 110          # 111 — was KFBaroVar (tracked live in state.c)
     UNUSED_112 = 111         # 112 — was KFAccUVar (tracked live in state.c)
-    FW_STICK_SCALE = 112       # 113
-    UNUSED_114 = 113            # 114 — was FW roll control pitch limit (Euler-era FW guard; unified quaternion loop is singularity-free)
+    FW_THR_RAMP_PS = 112      # 113 — FW throttle re-open slew limit (%/s)
+    FW_THR_HYST_BAND = 113    # 114 — FW throttle-cut re-open hysteresis band
     AH_THROTTLE_MOVING_TRIGGER = 114   # 115
     NAV_FENCE_RADIUS_M = 115   # 116
     DIVE_RECOVER_ALT = 116     # 117 — auto pull-out altitude AGL (m)
@@ -665,9 +813,9 @@ class ParamIndex(IntEnum):
     MAX_CLIMB_RATE_MP_S = 121   # 122 — vertical-profile ascent shaping rate (m/s)
     RUDDER_MOTOR_FF = 122          # 123
     SPIRAL_DESCENT_BAND_M = 123      # 124 — residual altitude (m) that triggers MR spiral-orbit descent
-    UNUSED_124 = 124     # 125 — was FS_CONFIG_BITS; VRS protection is always armed
+    FW_PITCH_AUTHORITY = 124  # 125 — stabilised FW pitch output scale (was FS_CONFIG_BITS)
     TRACE_TYPE = 125   # trace capture selector (TraceTypes: 0=None 1=Rate 2=Attitude 3=AltHold 4=Actuator 5=IMU)
-    UNUSED_126 = 126
+    FW_YAW_AUTHORITY = 126  # 127 — stabilised FW yaw output scale
     POWER_RESET_CAUSE = 127
 
 

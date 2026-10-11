@@ -73,7 +73,7 @@ def raw_to_percent(raw_value: int) -> float:
 # ============================================================================
 # Backward Compatibility - Flight State Names (use FlightState.get_name())
 # ============================================================================
-FLIGHT_STATE_NAMES = {i: FlightState.get_name(i) for i in range(13)}
+FLIGHT_STATE_NAMES = {i: FlightState.get_name(i) for i in FlightState}
 NAV_STATE_NAMES = {i: NavState.get_name(i) for i in range(20)}
 
 # Keep old constants for backward compatibility

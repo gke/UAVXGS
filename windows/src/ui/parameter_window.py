@@ -1,6 +1,8 @@
 # ui/parameter_window.py - Refactored with enums, no magic numbers
 """
 UAVX Parameter Editor Window
+
+Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 import sys
@@ -45,6 +47,7 @@ from packet_parser import *
 from core.data_manager import data_manager
 from parameters import PARAMETER_DEFS, PARAM_DEFAULTS, PARAM_LIMITS, PARAM_TYPES, PARAM_DISPLAY_MULT, PARAM_SCALES, LEGACY_TAGS, PID_GAIN_TAGS, PARAM_BOOT_REQUIRED
 from airframes import airframes as af_module
+import workspace
 
 # Nav m/s limits (40 Nav.MaxVelocity, 62 Nav.PosIntLim): not gains — they get a
 # clean 0.1 m/s step / 1 decimal, never the 4-decimal gain treatment.
@@ -141,11 +144,17 @@ class AfLoadDialog(QDialog):
     def __init__(self, parent=None, start_dir="", classify_fn=None):
         super().__init__(parent)
         self.setWindowTitle("Load Airframe Parameters")
-        self.resize(770, 500)
+        # Same footprint as the Firmware Flasher sub-window (Greg 2026-09-25).
+        self.setMinimumSize(660, 440)
+        self.resize(660, 440)
+        try:
+            workspace.ensure_dirs()
+        except OSError:
+            pass
         
-        self._start_dir = start_dir or os.path.expanduser("~/UAVX")
-        self._user_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'user')
-        self._original_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'original')
+        self._start_dir = start_dir or workspace.airframes_dir()
+        self._user_dir = workspace.airframes_dir()
+        self._contributed_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'contributed')
         self._proposed_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'proposed')
         self._generic_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'generic')
         self._classify_fn = classify_fn  # path -> class label ('MR'/'FW'/...)
@@ -162,7 +171,7 @@ class AfLoadDialog(QDialog):
         
         # Category filter
         self._filter_combo = QComboBox()
-        self._filter_combo.addItems(["All", "User Airframes", "Proposed (Read-Only)", "Generic (Read-Only)"])
+        self._filter_combo.addItems(["All", "User Airframes", "Generic (Read-Only)", "Contributed (Read-Only)", "Proposed (Read-Only)"])
         self._filter_combo.currentTextChanged.connect(self._on_filter_changed)
         layout.addWidget(self._filter_combo)
         
@@ -213,6 +222,8 @@ class AfLoadDialog(QDialog):
             collect(self._user_dir, False)
         if filter_text in ["All", "Proposed (Read-Only)"]:
             collect(self._proposed_dir, True)
+        if filter_text in ["All", "Contributed (Read-Only)"]:
+            collect(self._contributed_dir, True)
         if filter_text in ["All", "Generic (Read-Only)"]:
             collect(self._generic_dir, True)
 
@@ -648,8 +659,15 @@ class ParameterWindow(QMainWindow):
         QSpinBox { padding: 1px 2px; }
         QSpinBox::up-button, QSpinBox::down-button { width: 12px; }
     """
+    # Red = that channel is not present in the receiver's frame. Distinct from
+    # duplicate, which is amber: one is a fact about the link, the other is a
+    # clash the pilot created and the FC will refuse (F.RCMapFail blocks arming).
     RC_CH_BAD_STYLE = """
         QSpinBox { padding: 1px 2px; background-color: #e74c3c; color: white; }
+        QSpinBox::up-button, QSpinBox::down-button { width: 12px; }
+    """
+    RC_CH_DUP_STYLE = """
+        QSpinBox { padding: 1px 2px; background-color: #e67e22; color: white; }
         QSpinBox::up-button, QSpinBox::down-button { width: 12px; }
     """
     
@@ -735,28 +753,32 @@ class ParameterWindow(QMainWindow):
     ]
     
     FW_PARAMS = [
-        (ParamIndex.FW_MAX_CLIMB_ANGLE, "Climb Angle (Deg)", 60),
-        (ParamIndex.FW_CLIMB_THROTTLE, "Climb Thr (%)", 0),
+        (ParamIndex.FW_CLIMB_THROTTLE, "Climb Thr (%)", 60),
         (ParamIndex.FW_ROLL_PITCH_FF, "Roll/Pitch FF (%)", 0),
         (ParamIndex.FW_PITCH_THROTTLE_FF, "Pitch Thr FF (%)", 0),
         (ParamIndex.FW_AILERON_RUDDER_MIX, "Ail/Rud Mix (%)", 0),
         (ParamIndex.FW_ALT_SPOILER_FF, "Alt Spoiler FF (%)", 0),
         (ParamIndex.RUDDER_MOTOR_FF, "Rudder/Motor FF (%)", 0),
         (ParamIndex.FW_SPOILER_DECAY_PERCENT_PS, "Spoiler Decay (%/s)", 10),
-        (ParamIndex.FW_AILERON_DIFFERENTIAL, "Aileron Diff (%)", 0),
-        (ParamIndex.FW_STICK_SCALE, "Stick Scale(%)", 40),
+        (ParamIndex.FW_AILERON_DIFFERENTIAL, "Aileron Diff (%)", 40),
+        (ParamIndex.FW_ROLL_AUTHORITY, "Roll Auth (%)", 25),
+        (ParamIndex.FW_PITCH_AUTHORITY, "Pitch Auth (%)", 25),
+        (ParamIndex.FW_YAW_AUTHORITY, "Yaw Auth (%)", 25),
         (ParamIndex.FW_BOARD_PITCH_ANGLE, "Board Pitch (Deg)", 0),
     ]
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, configuration_required=False):
         super().__init__(parent)
         self.params = {}
         self.dirty_params = set()
+        self._fc_cfg_pend = False
+        # Fresh/out-of-the-box FC (empty airframe name on tag 63): show only
+        # the toolbar + a banner until a generic .af is loaded (Greg 2026-09-25).
+        self._configuration_required = bool(configuration_required)
         self.rc_channels = [0] * 16
         self._param_grid = None
         self._config_group = None
-        self._fw_left = None
-        self._fw_right = None
+        self._fw_group = None
         self.motor_bars = []
         self.motor_pct_labels = []
         self.motor_name_labels = []
@@ -775,10 +797,25 @@ class ParameterWindow(QMainWindow):
         self._verify_mode = False
         self._written_params = {}
         self._written_float = {}
-        self._image_dirty = False  # a bulk widget set (load) is pending push to FC RAM
+        # Last full tag-71 readback (idx -> raw float). Base for the tag-77 block
+        # image so params with no widget are never zeroed by a block write.
+        self._fc_readback_float: Dict[int, float] = {}
         self._write_in_progress = False
         self._flash_write_pending = False  # commit interlock: True from commit start until verify resolves
         self._verification_timer = None
+        # Commit button state: 'idle' (grey, flash matches the UI, nothing to
+        # send), 'pending' (red, local edits not yet in flash), 'committing'
+        # (amber, tag-77 sent, waiting for the FC's reboot + readback), or
+        # 'confirmed' (green, the post-reboot tag-71 readback matched).
+        self._commit_state = 'idle'
+        # A commit that ARRIVED while another was in flight is queued here and
+        # drained by the in-flight commit's resolution — never silently dropped.
+        self._apply_retry_pending = False
+        # Watchdog for the post-reboot reconnect that resolves the deferred
+        # verification. If the FC never streams a flight packet after a commit
+        # (e.g. stuck at a boot gate), the interlock would stick forever and
+        # abort every later Apply & Reboot; this breaks the stall loudly.
+        self._reconnect_watchdog_timer = None
         self._expecting_param_packet = False
         self._write_timestamp = 0
         self.MAX_PARAMS = 128
@@ -789,7 +826,7 @@ class ParameterWindow(QMainWindow):
         self._legacy_mode = False  # default OFF: unified raw float display (see legacy_check init)
         self._flash_airframe_name = None  # single source of truth: name from FC config flash
         self._generic_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'generic')
-        self._user_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'user')
+        self._user_dir = workspace.airframes_dir()
         self._proposed_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'proposed')
         self._warned_protected = set()  # track protected params that have been warned this session
         self._clamped_widgets = set()   # widgets currently showing the FC-clamp red highlight
@@ -839,6 +876,15 @@ class ParameterWindow(QMainWindow):
     def on_data_updated(self, flight_data):
         self.update_rc_display()
         self._check_mag_var_wmm(flight_data)
+        self._update_cruise_thr_readout(flight_data)
+
+    def _update_cruise_thr_readout(self, flight_data):
+        """Show the FC-tracked cruise throttle feed-forward (read-only)."""
+        label = getattr(self, '_cruise_thr_label', None)
+        if label is None or flight_data is None:
+            return
+        thr = float(getattr(flight_data, 'cruise_throttle', 0.0) or 0.0)
+        label.setText(f"{thr:.0%}" if thr > 0.0 else "--%")
 
     def _check_mag_var_wmm(self, flight_data):
         MAG_VAR_THRESHOLD_DEG = 3.0
@@ -998,7 +1044,13 @@ class ParameterWindow(QMainWindow):
                 val = 0.0
             received_u8[idx] = max(0, min(255, int(val)))
             received_float[idx] = val
-        
+
+        # A full readback is the base for the next tag-77 block image. Cache it
+        # so params the GCS has no widget for keep the FC's value instead of
+        # being written as 0.0. Echo ACKs (count == 1) must not overwrite it.
+        if getattr(typed_data, 'count', 0) > 100:
+            self._fc_readback_float = dict(received_float)
+
         # Verification path — only on bulk readback (echo ACKs skip this)
         if (self._verify_mode and self._expecting_param_packet and self._written_params
                 and typed_data.count > 100):
@@ -1056,6 +1108,8 @@ class ParameterWindow(QMainWindow):
         self.sync_setup_from_advanced()
         self.status_label.setText("✅ Parameters loaded from FC (typed)")
         self.status_label.setStyleSheet("color: #27ae60;")
+        # A plain connect/readback refreshes the UI from flash: they agree again.
+        self._set_commit_state('idle')
         self.reset_read_button()
         self._read_request_id = None
 
@@ -1081,7 +1135,7 @@ class ParameterWindow(QMainWindow):
         
         received_params = {}
         for i in range(self.MAX_PARAMS):
-            if i in self.params:
+            if self.param_widget(i) is not None:
                 received_params[i] = params_list[i] if i < len(params_list) else 0
         
         should_verify = (self._verify_mode and self._expecting_param_packet) or (self._write_timestamp > 0 and time_since_write < 2.0)
@@ -1105,8 +1159,8 @@ class ParameterWindow(QMainWindow):
         
         update_count = 0
         for i in range(self.MAX_PARAMS):
-            if i in self.params:
-                widget = self.params[i]
+            widget = self.param_widget(i)
+            if widget is not None:
                 try:
                     value = received_params.get(i, 0)
                     if isinstance(widget, QDoubleSpinBox):
@@ -1133,6 +1187,8 @@ class ParameterWindow(QMainWindow):
         self._params_received = True
         self.status_label.setText(f"✅ Parameters loaded from FC (Set={param_set})")
         self.status_label.setStyleSheet("color: #27ae60;")
+        # A plain connect/readback refreshes the UI from flash: they agree again.
+        self._set_commit_state('idle')
         self.reset_read_button()
         
         if self._read_timeout_timer:
@@ -1147,10 +1203,6 @@ class ParameterWindow(QMainWindow):
         Falls back to uint8 comparison for U8 params and when float data is missing.
         """
         self._log(f"  🔍 Verifying {len(self._written_params)} params...")
-
-        self.write_progress.setValue(100)
-        self.write_progress.setFormat("✅ Written to flash")
-        QTimer.singleShot(2500, self.write_progress.hide)
 
         if len(self._written_params) == 0:
             self._log("  ⚠️ WARNING: No written params to verify!")
@@ -1170,6 +1222,7 @@ class ParameterWindow(QMainWindow):
                 "Please try writing again."
             )
             self.reset_write_button()
+            self._set_commit_state('pending')
             return
         
         mismatches = []
@@ -1259,6 +1312,10 @@ class ParameterWindow(QMainWindow):
         self._verify_mode = False
         self._write_in_progress = False
         self._flash_write_pending = False
+        if self._reconnect_watchdog_timer is not None:
+            self._reconnect_watchdog_timer.stop()
+            self._reconnect_watchdog_timer = None
+        self._drain_queued_apply()
         self.reset_read_button()
         
         # Sync UI widgets with FC's actual values (in case of mismatches, clamps, or derived)
@@ -1361,6 +1418,7 @@ class ParameterWindow(QMainWindow):
             msg.exec_()
             self.status_label.setText(f"❌ Verification failed: {len(mismatches)} mismatches")
             self.status_label.setStyleSheet("color: #e74c3c;")
+            self._set_commit_state('pending')
 
         elif derived_warnings or clamped_warnings:
             warning_text = ""
@@ -1394,6 +1452,7 @@ class ParameterWindow(QMainWindow):
             )
             self.status_label.setText(f"⚠️ Written OK - {len(derived_warnings)} derived, {len(clamped_warnings)} clamped")
             self.status_label.setStyleSheet("color: #f39c12;")
+            self._set_commit_state('confirmed')
 
         else:
             QMessageBox.information(
@@ -1403,6 +1462,7 @@ class ParameterWindow(QMainWindow):
             )
             self.status_label.setText(f"✅ All {len(self._written_params)} parameters verified OK!")
             self.status_label.setStyleSheet("color: #27ae60;")
+            self._set_commit_state('confirmed')
 
     def reset_read_button(self):
         # Read button was removed (connect auto-populates the page via tag-71);
@@ -1422,19 +1482,94 @@ class ParameterWindow(QMainWindow):
         """
         if ok:
             self._log("  ✅ Commit ACK — config confirmed in flash; waiting for FC reboot...")
+            self.status_label.setText(
+                "✅ Saved to flash — waiting for the FC to reboot and confirm…")
+            self.status_label.setStyleSheet("color: #f39c12;")
             return
 
         self._log("  ❌ Commit ACK NACK — params were NOT saved to flash!")
-        self.write_progress.hide()
         self._flash_write_pending = False
+        if self._reconnect_watchdog_timer is not None:
+            self._reconnect_watchdog_timer.stop()
+            self._reconnect_watchdog_timer = None
         self.reset_write_button()
         if self.parent_window:
             self.parent_window._pending_param_verification = False
+        # Not saved: the button stays RED so the user can retry.
+        self._set_commit_state('pending')
+        self.status_label.setText("❌ Commit NACK — parameters NOT saved to flash")
+        self.status_label.setStyleSheet("color: #e74c3c;")
+        # A commit queued while this one was in flight can now run — the
+        # interlock just cleared and the FC did NOT reboot.
+        self._drain_queued_apply()
 
     def reset_write_button(self):
         self._write_in_progress = False
-        self.write_progress.hide()
-    
+
+    def _set_commit_state(self, state: str):
+        """Drive the explicit Commit button: grey/idle, red/pending,
+        amber/committing, green/confirmed.
+
+        The colour IS the flash-state cue (this button replaced the old colour
+        patch). Colours are set explicitly (not via the disabled palette) so
+        each state stays legible. Pending is the only enabled state - clicking
+        it commits; the others are status readouts.
+        """
+        self._commit_state = state
+        if not hasattr(self, 'commit_btn'):
+            return
+        if state == 'pending':
+            self.commit_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #e74c3c; color: #fff; "
+                "font-weight: bold; border: 1px solid #c0392b; border-radius: 3px;")
+            self.commit_btn.setText("● Commit to FC (unsaved)")
+            self.commit_btn.setEnabled(True)
+        elif state == 'committing':
+            self.commit_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #f39c12; color: #fff; "
+                "font-weight: bold; border: 1px solid #d68910; border-radius: 3px;")
+            self.commit_btn.setText("⏳ Committing…")
+            self.commit_btn.setEnabled(False)
+        elif state == 'confirmed':
+            self.commit_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #27ae60; color: #fff; "
+                "font-weight: bold; border: 1px solid #1e8449; border-radius: 3px;")
+            self.commit_btn.setText("✅ In Flash")
+            self.commit_btn.setEnabled(False)
+        else:
+            self.commit_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #bdc3c7; color: #2c3e50; "
+                "border: 1px solid #95a5a6; border-radius: 3px;")
+            self.commit_btn.setText("Commit to FC")
+            self.commit_btn.setEnabled(False)
+
+    def _mark_dirty(self):
+        """A local edit (or an airframe load) leaves flash behind: go red.
+
+        The only transition that leaves 'pending' is a successful commit; a
+        re-edit while already pending is a no-op here.
+        """
+        if self._commit_state != 'pending':
+            self._set_commit_state('pending')
+
+    def on_fc_config_uncommitted(self, uncommitted):
+        """Reflect the FC's own ConfigChanged cue (flags bit 34, cfg_pend).
+
+        A calibration the FC captured (acc/mag/gyro) sets ConfigChanged on the
+        FC without touching any GCS widget, so local dirty tracking alone never
+        prompts a commit. cfg_pend is the FC's authoritative RAM-vs-flash cue;
+        when it goes active the button must go red even with no local edit. A
+        commit already in flight owns the state machine and is left alone.
+        """
+        self._fc_cfg_pend = bool(uncommitted)
+        if self._commit_state == 'committing':
+            return
+        if uncommitted:
+            if self._commit_state != 'pending':
+                self._set_commit_state('pending')
+        elif self._commit_state == 'pending' and not self.dirty_params:
+            self._set_commit_state('idle')
+
     def _read_timeout(self):
         self._log("⏱️ Read timeout")
         self.status_label.setText("⚠️ Read timeout - will retry when FC data arrives")
@@ -1460,11 +1595,11 @@ class ParameterWindow(QMainWindow):
         self._written_float = {}
         self._expecting_param_packet = False
         self._write_timestamp = 0
+        # Interlock just released — run any commit that was queued behind it.
+        self._drain_queued_apply()
 
         self.status_label.setText("⚠️ Write timeout - no response from FC")
         self.status_label.setStyleSheet("color: #e74c3c;")
-        self.write_progress.setValue(0)
-        self.write_progress.hide()
         self.reset_write_button()
         self._write_timeout_timer = None
     
@@ -1503,6 +1638,19 @@ class ParameterWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setSpacing(4)
         main_layout.setContentsMargins(4, 4, 4, 4)
+
+        # Static banner shown only while configuration_required (no airframe
+        # loaded on the FC). Lives in main_layout so it always exists.
+        self.config_banner = QLabel(
+            "⚠️ No airframe configured — Load Airframe… below,"
+            " then the parameters page opens.")
+        self.config_banner.setStyleSheet(
+            "color: #8a5a00; background: #fff3d6; border: 1px solid #e0b34d;"
+            " padding: 6px; font-weight: bold;")
+        self.config_banner.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.config_banner.setWordWrap(True)
+        self.config_banner.setVisible(self._configuration_required)
+        main_layout.addWidget(self.config_banner)
         
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
@@ -1510,35 +1658,47 @@ class ParameterWindow(QMainWindow):
         self.save_btn = QPushButton("Save Params")
         self.save_btn.setStyleSheet("padding: 4px 12px;")
         toolbar.addWidget(self.save_btn)
-        
+
         self.load_btn = QPushButton("Load Airframe…")
         self.load_btn.setStyleSheet("padding: 4px 12px;")
         self.load_btn.setToolTip("Open the airframe library and load defaults + tuning limits")
         toolbar.addWidget(self.load_btn)
-        
+
+        # The airframe name corresponding to the CURRENT flash parameters,
+        # supplied by the FC config block (tag-63). Survives reboots because it
+        # is re-pulled with every commit verification and connect.
         self.airframe_name_label = QLabel("")
         self.airframe_name_label.setStyleSheet("color: #000; font-weight: normal;")
         self.airframe_name_label.setToolTip("Airframe name persisted in the FC config flash")
         self.airframe_name_label.hide()
         toolbar.addWidget(self.airframe_name_label)
-        
+
         toolbar.addStretch()
-        
+
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("color: #666;")
         toolbar.addWidget(self.status_label)
 
-        self.write_progress = QProgressBar()
-        self.write_progress.setRange(0, 100)
-        self.write_progress.setValue(0)
-        self.write_progress.setTextVisible(True)
-        self.write_progress.setFormat("%p%")
-        self.write_progress.setFixedWidth(200)
-        self.write_progress.hide()
-        toolbar.addWidget(self.write_progress)
-        
+        # One explicit Commit at the right-hand end of the bar. Edits are LOCAL
+        # to the GCS until this is pressed: no parameter is written to the FC on
+        # change. The button's text carries the save state - the old coloured
+        # flash-state patch is gone.
+        self.commit_btn = QPushButton("Commit to FC")
+        self.commit_btn.setToolTip(
+            "Send every parameter to the FC in one block, write it to flash, "
+            "and restart the FC.")
+        toolbar.addWidget(self.commit_btn)
+
         main_layout.addLayout(toolbar)
-        
+
+        # Whole parameter body (RC/motor, pages, info) lives in ONE container so
+        # the configuration-required gate can show toolbar-only + banner by
+        # hiding it wholesale (Greg 2026-09-25).
+        self.config_body = QWidget()
+        self.config_body_layout = QVBoxLayout(self.config_body)
+        self.config_body_layout.setSpacing(4)
+        self.config_body_layout.setContentsMargins(0, 0, 0, 0)
+
         # RC + Motors always visible (not scrollable)
         rc_motor_row = QHBoxLayout()
         rc_motor_row.setSpacing(0)
@@ -1549,7 +1709,7 @@ class ParameterWindow(QMainWindow):
         motor_group = self._create_motor_group()
         motor_group.setFixedHeight(160)
         rc_motor_row.addWidget(motor_group, 2)
-        main_layout.addLayout(rc_motor_row)
+        self.config_body_layout.addLayout(rc_motor_row)
         
         # Params page — Setup+Physics, Advanced toggle, and grid all inside here
         params_container = QWidget()
@@ -1602,10 +1762,10 @@ class ParameterWindow(QMainWindow):
         if hasattr(self, '_grid_container'):
             self.param_layout.addWidget(self._grid_container)
         
-        main_layout.addWidget(params_container)
+        self.config_body_layout.addWidget(params_container)
         
         # Prevent RC/Motors from stretching vertically
-        main_layout.addStretch(0)
+        self.config_body_layout.addStretch(0)
         
         info_box = QGroupBox()
         info_box.setTitle("Info")
@@ -1617,7 +1777,26 @@ class ParameterWindow(QMainWindow):
         self.info_text.setStyleSheet("padding: 3px; background-color: #f8f8f8; color: #555;")
         info_layout.addWidget(self.info_text)
         info_box.setLayout(info_layout)
-        main_layout.addWidget(info_box)
+        self.config_body_layout.addWidget(info_box)
+
+        main_layout.addWidget(self.config_body)
+        if self._configuration_required:
+            # Gate state at init = just the Load Airframe… selector + banner
+            # (Greg 2026-09-25); the param body and the rest of the toolbar are
+            # revealed once an airframe loads.
+            self.config_body.setVisible(False)
+            self.config_banner.setVisible(True)
+            self.save_btn.setVisible(False)
+            self.commit_btn.setVisible(False)
+            self.status_label.setVisible(False)
+        else:
+            self.config_body.setVisible(True)
+            self.config_banner.setVisible(False)
+            self.save_btn.setVisible(True)
+            self.commit_btn.setVisible(True)
+            self.status_label.setVisible(True)
+
+        self._set_commit_state('idle')
     
     def _on_advanced_toggled(self, checked):
         """Show/hide the advanced parameter grid. Window expands when Advanced is shown."""
@@ -1636,6 +1815,19 @@ class ParameterWindow(QMainWindow):
             self.info_text.setText(f"<b>{param.name}</b>")
         else:
             self.info_text.setText(f"Parameter {idx}")
+
+    def _param_display_name(self, idx):
+        """Friendly param name for dialogs: PROTECTED name, else the
+        ParamTable-derived definition name, else a raw 'P{n}' fallback.
+        (Fix: boot-scoped params like RFSensorType showed "P9" in the
+        Apply & Reboot offer — Greg 2026-09-25.)"""
+        name = self._PROTECTED_NAMES.get(int(idx))
+        if name:
+            return name
+        param = PARAMETER_DEFS.get(int(idx))
+        if param and param.name:
+            return param.name
+        return f"P{int(idx)+1}"
     
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Enter:
@@ -1691,6 +1883,7 @@ class ParameterWindow(QMainWindow):
         # Altitude - make two columns using the two-col compact helper
         alt_group = self._create_two_col_compact_group("Altitude", self.ALTITUDE_PARAMS)
         alt_group.setMaximumWidth(440)  # 2x 220
+        self._add_altitude_readout(alt_group)
         grid.addWidget(alt_group, 1, 1)
 
         # Fixed Wing - double column box
@@ -1716,20 +1909,16 @@ class ParameterWindow(QMainWindow):
         QTimer.singleShot(0, self._update_fw_style)
     
     def _update_fw_style(self):
-        for fw_group in (self._fw_left, self._fw_right):
-            if fw_group is None:
-                continue
+        if self._fw_group is not None:
             af_combo = self._setup_widgets.get(int(ParamIndex.AF_TYPE)) if hasattr(self, '_setup_widgets') else None
             if not isinstance(af_combo, QComboBox):
                 af_combo = self.params.get(int(ParamIndex.AF_TYPE))
-            if not isinstance(af_combo, QComboBox):
-                fw_group.setVisible(False)
-                continue
-            data = af_combo.currentData()
-            if data is None:
-                fw_group.setVisible(False)
-                continue
-            fw_group.setVisible(AirframeType.eElevonAF <= int(data) <= AirframeType.eVTOL2AF)
+            is_fw = False
+            if isinstance(af_combo, QComboBox):
+                data = af_combo.currentData()
+                if data is not None:
+                    is_fw = self._category_for_af(int(data)) == 'FW'
+            self._fw_group.setVisible(is_fw)
         self._apply_pid_view()
 
     def _create_rc_combined_group(self):
@@ -1817,6 +2006,7 @@ class ParameterWindow(QMainWindow):
         # Third column: spare channels 12-15, same cell layout, no assignment
         self.rc_spare_labels = []
         self.rc_spare_bars = []
+        self.rc_spare_spins = []
         for i in range(4):
             row = i + 1
             val = QLabel("---")
@@ -1841,8 +2031,10 @@ class ParameterWindow(QMainWindow):
             spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             spin.setMaximumHeight(18)
             spin.setStyleSheet(self.RC_CH_STYLE)
+            spin.setProperty("_rc_style", self.RC_CH_STYLE)
             spin.setToolTip("Unmapped Rx channel (no function assigned)")
             layout.addWidget(spin, row, 10)
+            self.rc_spare_spins.append(spin)
 
             func_label = QLabel(f"CH{13 + i}")
             func_label.setStyleSheet("font-weight: bold;")
@@ -2005,7 +2197,7 @@ class ParameterWindow(QMainWindow):
                 if not self._motor_nan_warned:
                     self._motor_nan_warned = True
                     self._log("Non-finite (NaN) motor/servo value from FC — "
-                              "bars flagged invalid", "Error")
+                              "bars flagged invalid")
             else:
                 self._motor_nan_warned = False
         else:
@@ -3234,15 +3426,17 @@ class ParameterWindow(QMainWindow):
         layout.addWidget(self._pid_view_combo, 3, 1, 1, 2)
 
         # Apply-Derived button: materialise the Rate-view derived values into the
-        # real spins (via the normal param_changed live-write path), but only after
-        # an explicit confirmation — the one gated write. After it succeeds the
-        # page is a normal editable grid (auto-flip to Angle view).
+        # real spins (via the normal param_changed path, which stages them as
+        # local edits), after an explicit confirmation. After it succeeds the
+        # page is a normal editable grid (auto-flip to Angle view) and the
+        # Commit button goes RED like any other edit.
         self._apply_derived_btn = QPushButton("Apply Derived")
         self._apply_derived_btn.setObjectName("pidApplyDerived")
         self._apply_derived_btn.setToolTip(
-            "Write the currently derived values into the real parameter spins "
-            "(one confirmed write to the FC; afterwards the page is a normal "
-            "editable grid \u2014 subsequent edits are live-written as usual).\n"
+            "Stage the currently derived values into the real parameter spins "
+            "(one confirmed edit; afterwards the page is a normal editable "
+            "grid \u2014 subsequent edits are staged as usual). Nothing reaches "
+            "the FC until Commit is pressed.\n"
             "Dormant rows (Ki / I-Limit on fixed-wing frames) are skipped.")
         self._apply_derived_btn.clicked.connect(self._on_apply_pid_derived)
         layout.addWidget(self._apply_derived_btn, 3, 3)
@@ -3430,11 +3624,11 @@ class ParameterWindow(QMainWindow):
         """Apply-Derived button: materialise the currently derived values into the
         real parameter spins, after an explicit confirmation.
 
-        One gated write: the spin setValue calls fire the normal
-        valueChanged -> param_changed live-write path (debounced, echo-ACK), so the
-        derived values reach the FC via the standard transport. No confirmation is
-        shown for subsequent edits — after Apply the page is a normal editable grid.
-        Dormant rows (FW Ki/I-Limit, and all yaw angle rows on FW) are skipped.
+        The spin setValue calls fire the normal valueChanged -> param_changed
+        path, which stages the derived values as local edits (and marks the
+        Commit button pending). No confirmation is shown for subsequent edits —
+        after Apply the page is a normal editable grid. Dormant rows (FW
+        Ki/I-Limit, and all yaw angle rows on FW) are skipped.
         """
         derived = getattr(self, "_pid_derived", [])
         yaw_derived = getattr(self, "_pid_yaw_derived", [])
@@ -3633,6 +3827,8 @@ class ParameterWindow(QMainWindow):
             layout.addWidget(cb, ss_row + 1 + i // 2, (i % 2) * 2, 1, 2)
             self.servo_sense_checks.append(cb)
 
+        self._fw_group = group
+
         group.setLayout(layout)
         return group
 
@@ -3719,24 +3915,26 @@ class ParameterWindow(QMainWindow):
         self.config1_checks = []
         config1_bits = [
             ("Ext Mag", 0), ("Autoland", 1), ("Use Mag", 2),
-            ("Emulation", 3), ("AH Alarm", 4), ("GPS Alt", 5),
+            ("Emulation", 3, True, "Emulation disabled — commissioning is real flight only."),
+            ("AH Alarm", 4), ("GPS Alt", 5),
             ("Unused 1-6", 6, True), ("Clamp", 7),
         ]
         for i, item in enumerate(config1_bits):
             name, bit = item[0], item[1]
             unused = len(item) > 2 and item[2]
+            tip = item[3] if len(item) > 3 else None
             cb = QCheckBox(name)
             cb.setProperty("bit", bit)
             cb.stateChanged.connect(lambda s, b=bit: self.bit_changed(ParamIndex.CONFIG1_BITS, b, s))
             if unused:
                 cb.setEnabled(False)
-                cb.setToolTip("Unused — free config bit (Config1 bit 6). Emulation now implies the 4-WP test mission.")
+                cb.setToolTip(tip if tip else "Unused — free config bit (Config1 bit 6). Emulation now implies the 4-WP test mission.")
             layout.addWidget(cb, i // 2, (i % 2) + 1)
             self.config1_checks.append(cb)
 
         self.config2_checks = []
         config2_bits = [
-            ("Batt Comp", 0), ("Fast Start", 1), ("Unused 2-2", 2, True),
+            ("Batt Comp", 0), ("Unused 2-1", 1, True), ("Unused 2-2", 2, True),
             ("Have GPS", 3), ("Prop In", 4), ("Turn WP", 5), ("Beep WP", 6),
             ("Unused 2-7", 7, True),
         ]
@@ -3750,6 +3948,12 @@ class ParameterWindow(QMainWindow):
                 cb.setToolTip("Sets/clears FC HaveGPS (drives InitialisingGPS / no-GPS boot):\n"
                               "bit SET = GPS required (waits for a fix),\n"
                               "bit CLEAR = no GPS - FC skips InitialisingGPS and flies without a satellite fix")
+            elif bit == 1:
+                cb.setEnabled(False)
+                cb.setToolTip("Unused — free config bit (Config2 bit 1), was Fast Start.\n"
+                              "FastStart only skipped the gyro grab; the grab now always runs "
+                              "and falls back on the stored bias, and a never-calibrated FC is "
+                              "blocked from arming by the FC instead.")
             elif unused:
                 cb.setEnabled(False)
                 cb.setToolTip(f"Unused — free config bit (Config2 bit {bit}). Available for a future feature.")
@@ -3812,6 +4016,25 @@ class ParameterWindow(QMainWindow):
 
         group.setLayout(layout)
         return group
+
+    def _add_altitude_readout(self, group):
+        """Append the display-only live Cruise Throttle readout to the Altitude box."""
+        layout = group.layout()
+        if not isinstance(layout, QGridLayout):
+            return
+        row = (len(self.ALTITUDE_PARAMS) + 1) // 2 + 1
+        self._cruise_thr_label = QLabel("--%")
+        self._cruise_thr_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._cruise_thr_label.setMinimumWidth(62)
+        self._cruise_thr_label.setMaximumWidth(70)
+        self._cruise_thr_label.setStyleSheet(
+            "color: #555; font-weight: bold; padding: 1px 2px;")
+        self._cruise_thr_label.setToolTip(
+            "Cruise throttle feed-forward the FC tracks in flight (read-only)")
+        name = QLabel("Cruise Thr (tracked)")
+        name.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(self._cruise_thr_label, row, 0)
+        layout.addWidget(name, row, 1, 1, 3)
 
     def add_spin(self, layout, idx: ParamIndex, default: float, row: int, col: int):
         """Always a QDoubleSpinBox. Step = range/50."""
@@ -3938,6 +4161,18 @@ class ParameterWindow(QMainWindow):
         self.params[int(idx)] = combo
         return combo
     
+    def config_bits(self, idx) -> Optional[int]:
+        """Current value of a config-bitmask parameter, or None if unknown.
+
+        Other windows need this to mirror FC gate conditions that depend on
+        config bits - e.g. the calibration window must know whether UseMag is
+        set before it can say an uncalibrated mag "blocks arming", because the
+        FC's CalibrationSufficient() only demands it when MagInUse() holds.
+        Returns None rather than 0 when the value has not been read back yet,
+        so a caller can tell "not known" from "known to be clear".
+        """
+        return self._config_values.get(int(idx))
+
     def bit_changed(self, idx: ParamIndex, bit: int, state: int):
         """Handle configuration bit checkbox changes"""
         current = self._config_values.get(int(idx), 0)
@@ -3949,10 +4184,15 @@ class ParameterWindow(QMainWindow):
         new_value = max(0, min(255, new_value))
         self._config_values[int(idx)] = new_value
         
-        # Sync the hidden widget so write_params/send_params_typed use the corrected value
+        # Sync the hidden widget so the block-image builder uses the corrected
+        # value. blockSignals: the spinbox's valueChanged is already wired to
+        # param_changed, which is then called explicitly below — an unblocked
+        # setValue would run param_changed twice per config bit toggle.
         pi = int(idx)
         if pi in self.params and isinstance(self.params[pi], QDoubleSpinBox):
+            self.params[pi].blockSignals(True)
             self.params[pi].setValue(new_value)
+            self.params[pi].blockSignals(False)
             self._log(f"  🔧 Config bit toggled: Param[{pi}] = {current} → {new_value} (synced)")
         else:
             self._log(f"  ⚠️ Config bit toggled: Param[{pi}] = {current} → {new_value} (widget NOT FOUND)")
@@ -3998,28 +4238,19 @@ class ParameterWindow(QMainWindow):
         self.dirty_params.add(idx_int)
         self.status_label.setText(f"P{idx_int+1} changed ({len(self.dirty_params)})")
         self.status_label.setStyleSheet("color: #f39c12;")
+        self._mark_dirty()
 
-        if value == 0:
-            return
-        clashes = []
-        for other_spin in self.rc_channel_spins:
-            if other_spin is self.params.get(idx_int):
-                continue
-            if other_spin.value() == value:
-                other_idx = other_spin.property("param_index")
-                other_fn = other_spin.property("fn_index")
-                if other_fn is not None and other_fn < len(self.RC_MAP_PARAMS):
-                    other_name = self.RC_MAP_PARAMS[other_fn][1]
-                else:
-                    other_name = f"P{other_idx+1}"
-                clashes.append(other_name)
-        if clashes:
-            func_name = self.RC_MAP_PARAMS[fn_idx][1] if fn_idx < len(self.RC_MAP_PARAMS) else f"P{idx_int+1}"
+        # Channel 0 is a legal channel and throttle's default, so there is no
+        # "zero means unset" early-out here - that skip was the one case most
+        # likely to be duplicated, and it went unreported.
+        dups = self._rc_duplicate_map()
+        if value in dups:
+            names = dups[value]
             QMessageBox.warning(
                 self, "Channel Clash",
-                f"{func_name} is assigned to channel {value},\n"
-                f"which is also used by: {', '.join(clashes)}\n\n"
-                "Duplicate channel assignments will cause conflicts."
+                f"Channel {value} is assigned to: {', '.join(names)}\n\n"
+                "Every function must have its own channel. The FC refuses a "
+                "map with a duplicate (F.RCMapFail) and will not arm under it."
             )
 
     def update_config_display(self):
@@ -4061,12 +4292,29 @@ class ParameterWindow(QMainWindow):
         self._log("  🔧 Config reset: both Config1 and Config2 set to 0 (synced to spinbox)")
         self.update_config_display()
 
+    def param_widget(self, idx):
+        """Return the authoritative widget for a parameter index, or None.
+
+        The Setup group registers its widgets into _setup_widgets, NOT into
+        self.params, so a few parameters exist only there (AF_TYPE,
+        AS_SENSOR_TYPE, BATTERY_CAPACITY, CURRENT_SCALE, VOLT_SCALE). The
+        Advanced page duplicates some Setup parameters in both dicts and keeps
+        them in sync (_sync_setup_to_advanced / sync_setup_from_advanced);
+        for those self.params stays authoritative, so nothing changes. The
+        fallback is what stops the bulk collectors from silently dropping a
+        setup-only parameter on read, and from writing/saving it as 0.0.
+        """
+        widget = self.params.get(idx)
+        if widget is None:
+            widget = getattr(self, "_setup_widgets", {}).get(idx)
+        return widget
+
     def _raw_float_values(self) -> List[float]:
         """Collect current widget values as raw float32 values (already scaled)."""
         vals = []
         for i in range(self.MAX_PARAMS):
-            if i in self.params:
-                widget = self.params[i]
+            widget = self.param_widget(i)
+            if widget is not None:
                 if isinstance(widget, QDoubleSpinBox):
                     mult = self._display_mult(i)
                     vals.append(widget.value() / mult)
@@ -4085,6 +4333,42 @@ class ParameterWindow(QMainWindow):
             else:
                 vals.append(0.0)
         return vals
+
+    def build_raw_image(self) -> List[float]:
+        """Return the complete 128-value raw float image for a tag-77 block write.
+
+        Widget values are authoritative where a widget exists. Parameters the GCS
+        has no widget for take their value from the last full tag-71 readback
+        (`_fc_readback_float`), so a block write can never zero a parameter the
+        GCS does not manage. Only a value with no widget AND no readback falls
+        back to 0.0, and that is logged elsewhere as a skip in the tag-17 path.
+        """
+        image = []
+        for i in range(self.MAX_PARAMS):
+            # POWER_RESET_CAUSE is FC-written at boot (the live reset reason);
+            # the airframe's copy is stale by definition. Keep the FC's own
+            # value so a commit persists the real cause, never the file's 0.
+            if i == int(ParamIndex.POWER_RESET_CAUSE):
+                image.append(float(self._fc_readback_float.get(i, 0.0)))
+                continue
+            widget = self.param_widget(i)
+            if isinstance(widget, QDoubleSpinBox):
+                image.append(widget.value() / self._display_mult(i))
+            elif isinstance(widget, QSpinBox):
+                image.append(float(widget.value()))
+            elif isinstance(widget, QComboBox):
+                data = widget.currentData()
+                if data is None:
+                    raise ValueError(
+                        f"Combo param {i} selection has no data "
+                        f"(index={widget.currentIndex()}) — refusing to send "
+                        f"a positional index as the value")
+                image.append(float(data))
+            elif i in self._fc_readback_float:
+                image.append(float(self._fc_readback_float[i]))
+            else:
+                image.append(0.0)
+        return image
 
     def _apply_airframe_limits(self):
         """Re-apply spinbox ranges from the current .af [LIMITS] block (raw
@@ -4160,17 +4444,12 @@ class ParameterWindow(QMainWindow):
                     }
                 """)
         self._clamped_widgets.clear()
-        # A programmatic bulk set has changed widgets without going through the
-        # live-edit queue — the FC's RAM image no longer matches the UI. Any
-        # later commit must push the whole image first (only the load path
-        # calls this; FC readbacks update widgets in place, never here).
-        self._image_dirty = True
         self._suppress_sim_auto = True
         try:
             for i, raw in raw_values.items():
-                if i not in self.params:
+                widget = self.param_widget(i)
+                if widget is None:
                     continue
-                widget = self.params[i]
                 try:
                     # Block signals so programmatic bulk loads never trigger the
                     # protected-param confirm dialogs (combo_changed/param_changed)
@@ -4238,21 +4517,54 @@ class ParameterWindow(QMainWindow):
             self.airframe_name_label.setText("")
             self.airframe_name_label.hide()
 
+    def set_configuration_required(self, required):
+        """Gate the parameter body on whether an airframe is configured.
+
+        Fresh/out-of-the-box or cal-cleared FC: Config.AirframeName[0]==0, so tag
+        63 arrives with an empty name and the page shows only the Load Airframe…
+        selector + a banner until a generic .af is loaded (Greg 2026-09-25).
+        Called from main_window on tag 63 — keyed on the empty airframe NAME,
+        which is the same condition the FC uses to refuse arming (Config.Empty is
+        cleared only once a name is written) — and again after a successful
+        airframe load. It is NOT keyed on AFType: the FC transmits pAFType, filled
+        from the ParamTable default eQuadXAF, so a blank FC still reports a
+        valid-looking airframe.
+        """
+        required = bool(required)
+        if required == self._configuration_required:
+            return
+        self._configuration_required = required
+        if hasattr(self, 'config_body'):
+            self.config_body.setVisible(not required)
+        if hasattr(self, 'config_banner'):
+            self.config_banner.setVisible(required)
+            self.config_banner.setText(
+                "⚠️ No airframe configured — Load Airframe… below,"
+                " then the parameters page opens."
+            )
+        # Gate state shows just the Load Airframe… selector + banner; the rest
+        # of the toolbar (Save Params, status/progress) is irrelevant until an
+        # airframe is actually loaded (Greg 2026-09-25).
+        if hasattr(self, 'save_btn'):
+            self.save_btn.setVisible(not required)
+        if hasattr(self, 'commit_btn'):
+            self.commit_btn.setVisible(not required)
+        if hasattr(self, 'status_label'):
+            self.status_label.setVisible(not required)
+        # Collapse to just the selector + banner in the gate state; re-expand
+        # to fit the full parameter body once an airframe is loaded (Greg
+        # 2026-09-25).
+        self.adjustSize()
+
     def _load_airframe(self, path: str):
         """Load an airframe file's defaults + [LIMITS] into the UI.
 
         Shared by the toolbar 'Load Airframe…' button and the Load Params
-        dialog. Replaces the current values in the UI and, when connected,
-        live-writes the loaded set to the FC's RAM image immediately — Load IS
-        the write (no separate Write button in the live-write model).
-        Boot-scoped params in the loaded set trigger the one-shot
-        Apply & Reboot offer once the writes drain.
+        dialog. Replaces the current values in the UI only: nothing is written
+        to the FC. The loaded set is staged and the Commit button goes RED until
+        the user presses Commit, which sends the tag-77 block and reboots.
         """
         name = os.path.splitext(os.path.basename(path))[0] if path else ""
-
-        # Save any pending tweaks before switching airframe
-        if not self._save_if_dirty():
-            return
 
         if not path or not os.path.exists(path):
             self._log(f"  ❌ Airframe file not found: {path}")
@@ -4261,11 +4573,10 @@ class ParameterWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "Airframe Defaults",
-            f"Load and write defaults for \"{name}\"?\n\n"
-            "This will replace current parameter values in the UI and\n"
-            "write the new set to the flight controller immediately "
-            "(when connected).\n"
-            "Boot-only parameters will then ask whether to apply and reboot.",
+            f"Load defaults for \"{name}\"?\n\n"
+            "This replaces the current parameter values in the UI only —\n"
+            "nothing is sent to the flight controller yet. Press Commit to\n"
+            "write the new set to flash and restart the FC.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -4289,6 +4600,9 @@ class ParameterWindow(QMainWindow):
         self._written_float = {}
         self._expecting_param_packet = False
         self._write_timestamp = 0
+        if self._reconnect_watchdog_timer is not None:
+            self._reconnect_watchdog_timer.stop()
+            self._reconnect_watchdog_timer = None
         if self._verification_timer:
             self._verification_timer.stop()
             self._verification_timer = None
@@ -4310,7 +4624,6 @@ class ParameterWindow(QMainWindow):
         # Apply .af [LIMITS] tuning ranges (fallback = class-ceiling PARAM_LIMITS)
         self._airframe_limits = dict(meta.get('LIMITS', {}) or {})
         self._apply_airframe_limits()
-        self._ensure_config2_fast_start()
         self.update_config_display()
         self.update_rc_display()
         # Restore character slider from .af metadata
@@ -4328,37 +4641,27 @@ class ParameterWindow(QMainWindow):
             self._load_phys_from_metadata(phys_meta)
         connected = bool(self.parent_window
                          and getattr(self.parent_window, 'connected', False))
-        if connected and hasattr(self.parent_window, 'send_params_typed'):
-            # Load = a single serialized batch write of the whole widget image
-            # via the tag-17 batch sender. `_write_in_progress` makes every
-            # echo ACK inert (update_params_from_typed returns early), so the
-            # UI stays static during the ~1 s push — no widget churn, no
-            # per-param live-queue interleaving, no offer mid-stream. The
-            # Apply & Reboot offer appears exactly once, after the batch drains.
-            self._write_in_progress = True
-
-            def _on_load_write_complete():
-                self._write_in_progress = False
-                self._image_dirty = False  # the full batch landed — RAM == UI
-                boot_idx = next((b for b in sorted(PARAM_BOOT_REQUIRED)
-                                 if b in self.params), None)
-                if boot_idx is not None:
-                    self._offer_apply_reboot_for_boot_param(boot_idx)
-                self.status_label.setText(
-                    f"📝 Loaded \"{name}\" — written to FC ({len(raw_values)} params)")
-                self.status_label.setStyleSheet("color: #27ae60;")
-
-            self.parent_window.send_params_typed(on_complete=_on_load_write_complete)
-        else:
-            self.status_label.setText(
-                f"📝 Loaded \"{name}\" defaults in UI — "
-                + ("(not connected)" if not connected else "(no parent write path)"))
-            self.status_label.setStyleSheet("color: #f39c12;")
+        # Load is LOCAL only (Greg 2026-10-07): the values replace the UI and
+        # the Commit button goes RED, but nothing is written to the FC until the
+        # user presses Commit. The tag-77 block is then sent on that press
+        # (CRC-checked by the FC, written to flash in one blocking pass, and
+        # rebooted); flash is still never written in the air, since
+        # can_write_parameters()/RefreshConfig() gate on State != eInFlight.
+        self._mark_dirty()
+        self.status_label.setText(
+            f"📝 Loaded \"{name}\" into the UI — press Commit to send to the FC"
+            + ("" if connected else " (not connected)"))
+        self.status_label.setStyleSheet(
+            "color: #f39c12;" if connected else "color: #e74c3c;")
 
         # The loaded .af name is the current airframe for the next flash commit
         # (a later connect refreshes it from the FC config flash).
         self._flash_airframe_name = name
         self._update_airframe_name_label()
+
+        # An airframe is now configured — reveal the full page (if we were in
+        # the out-of-the-box banner state).
+        self.set_configuration_required(False)
 
         # Reset protected param warnings for new airframe
         self._warned_protected.clear()
@@ -4371,34 +4674,15 @@ class ParameterWindow(QMainWindow):
         settings = QSettings("UAVX", "Groundstation")
         saved_path = settings.value("airframe_path", "")
         if not saved_path:
-            # Default: retuned Ken_450_1165 (proposed tuning set — read-only
-            # fully-populated defaults from the retune campaign).
-            default_name = "Ken_450_1165"
-            candidate = os.path.join(self._proposed_dir, f"{default_name}.af")
-            if os.path.exists(candidate):
-                settings.setValue("airframe_path", candidate)
-                self._current_airframe_path = candidate
-                self._log(f"  Auto-selected default airframe: {default_name}")
+            # NO default airframe (Greg 2026-09-25): an out-of-the-box FC
+            # boots eAFUnknown and the params page gates on the empty tag-63
+            # name until the user loads a generic .af. Do not quietly adopt a
+            # proposed/user airframe as a stand-in default.
             return
         self._current_airframe_path = saved_path
 
-    def _ensure_config2_fast_start(self):
-        """Ensure Config2 Fast Start bit (bit 1) is set — preserves all other bits
-        (bit 0 BatteryComp is now a fleet-wide default and must survive loading)."""
-        idx = int(ParamIndex.CONFIG2_BITS)
-        config2 = self._config_values.get(idx, 0)
-        corrected = config2 | 2  # Set bit 1 (Fast Start), keep everything else
-        if config2 != corrected:
-            self._log(f"  🔧 FIXING Config2 at {ParamIndex.CONFIG2_BITS.name}: {config2} -> {corrected}")
-            self._config_values[idx] = corrected
-            if idx in self.params and isinstance(self.params[idx], QDoubleSpinBox):
-                self.params[idx].setValue(corrected)
-                self._log(f"  🔧 Config2 widget synced to {corrected}")
-            self.dirty_params.add(idx)
-    
-
-    
     def combo_changed(self, idx: int, value: int = None):
+
         # Derive authoritative FC value from widget data
         if value is None:
             widget = self.params.get(idx)
@@ -4409,7 +4693,7 @@ class ParameterWindow(QMainWindow):
         if idx in self._PROTECTED_PARAMS and idx not in self._warned_protected:
             old_val = self._committed_values.get(idx, float(value))
             if abs(float(value) - old_val) > 0.001:
-                name = self._PROTECTED_NAMES.get(idx, f"P{idx+1}")
+                name = self._param_display_name(idx)
                 warning = self._PROTECTED_WARNINGS.get(idx, "This parameter affects critical behavior.")
                 reply = QMessageBox.question(
                     self, "Confirm Parameter Change",
@@ -4446,7 +4730,7 @@ class ParameterWindow(QMainWindow):
         self.dirty_params.add(idx)
         self.status_label.setText(f"P{idx+1} changed ({len(self.dirty_params)})")
         self.status_label.setStyleSheet("color: #f39c12;")
-        self._enqueue_live_write(idx)
+        self._mark_dirty()
         # Sync back to setup widget if this param has one (bidirectional tracking)
         if hasattr(self, '_setup_widgets') and idx in self._setup_widgets:
             setup_w = self._setup_widgets.get(idx)
@@ -4468,7 +4752,7 @@ class ParameterWindow(QMainWindow):
         if idx in self._PROTECTED_PARAMS and idx not in self._warned_protected:
             old_val = self._committed_values.get(idx, value)
             if abs(value - old_val) > 0.001:
-                name = self._PROTECTED_NAMES.get(idx, f"P{idx+1}")
+                name = self._param_display_name(idx)
                 warning = self._PROTECTED_WARNINGS.get(idx, "This parameter affects critical behavior.")
                 reply = QMessageBox.question(
                     self, "Confirm Parameter Change",
@@ -4494,7 +4778,7 @@ class ParameterWindow(QMainWindow):
         self.dirty_params.add(idx)
         self.status_label.setText(f"P{idx+1} changed ({len(self.dirty_params)})")
         self.status_label.setStyleSheet("color: #f39c12;")
-        self._enqueue_live_write(idx)
+        self._mark_dirty()
         self.update_config_display()
 
         # Tuning param edit → debounced auto robustness check
@@ -4549,85 +4833,14 @@ class ParameterWindow(QMainWindow):
                         setup_w.setValue(adv_val)
                         setup_w.blockSignals(False)
 
-    def _enqueue_live_write(self, idx):
-        """Debounce a param change for live-write to the FC RAM image.
-
-        Also arms the one-shot Apply & Reboot offer for boot-scoped params
-        (effective only after reboot). Shared by both the spinbox path
-        (param_changed) and the combo path (combo_changed) — boot-scoped
-        selectors like AF_TYPE are combos, so both must route here.
-        """
-        if not hasattr(self, '_live_pending'):
-            self._live_pending = set()
-            self._live_timer = QTimer(self)
-            self._live_timer.setSingleShot(True)
-            self._live_timer.timeout.connect(self._flush_live_writes)
-        self._live_pending.add(idx)
-        self._live_timer.start(350)
-        if idx in PARAM_BOOT_REQUIRED:
-            self._boot_reboot_offer = idx
-
-    def _pending_live_float(self, idx):
-        """Raw fc-float for a live write — mirrors the send_params_typed logic."""
-        widget = self.params.get(idx)
-        if isinstance(widget, QDoubleSpinBox):
-            mult = self._display_mult(idx)
-            return widget.value() / mult
-        if isinstance(widget, QSpinBox):
-            return float(widget.value())
-        if isinstance(widget, QComboBox):
-            data = widget.currentData()
-            if data is None:
-                raise ValueError(
-                    f"Combo param {idx} selection has no data "
-                    f"(index {widget.currentIndex()}) — refusing to write a "
-                    f"positional index as the value")
-            return float(data)
-        return 0.0
-
-    def _flush_live_writes(self):
-        """Push all debounced live-write indices to the FC's RAM image.
-
-        After a boot-scoped param (PARAM_BOOT_REQUIRED) drains, offer the
-        explicit Apply & Reboot — its effect can only appear at next power-on.
-        """
-        if not hasattr(self, '_live_pending') or not self._live_pending:
-            return
-        pending = sorted(self._live_pending)
-        self._live_pending.clear()
-        if self.parent_window and hasattr(self.parent_window, '_write_params_live'):
-            self.parent_window._write_params_live(
-                [(i, self._pending_live_float(i)) for i in pending])
-        if self.parent_window and getattr(self.parent_window, 'connected', False):
-            boot_idx = getattr(self, '_boot_reboot_offer', None)
-            if boot_idx is not None and boot_idx in pending:
-                self._boot_reboot_offer = None
-                self._boot_reboot_offer_param = boot_idx
-                self._when_param_write_drained(self._offer_apply_reboot_for_boot_param)
-
-    def _offer_apply_reboot_for_boot_param(self, idx=None):
-        """Ask once whether to persist + reboot after a boot-scoped change."""
-        if idx is None:
-            if not hasattr(self, '_boot_reboot_offer_param'):
-                return
-            idx = self._boot_reboot_offer_param
-        self._boot_reboot_offer_param = None
-        name = self._PROTECTED_NAMES.get(idx, f"P{idx+1}")
-        reply = QMessageBox.question(
-            self,
-            "Apply & Reboot?",
-            f"{name}\n\n"
-            "This parameter only takes effect after the FC restarts.\n"
-            "Save all parameters to flash and restart the FC now?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes
-        )
-        if reply == QMessageBox.Yes:
-            self.apply_and_reboot(confirm=False)
-
     def setup_connections(self):
         self.load_btn.clicked.connect(self._pick_and_load_airframe)
         self.save_btn.clicked.connect(self.save_params)
+        self.commit_btn.clicked.connect(self._on_commit_clicked)
+
+    def _on_commit_clicked(self):
+        """Explicit Commit: send the whole local image (tag-77) and reboot."""
+        self.apply_and_reboot(confirm=True)
 
     def _snapshot_baseline(self):
         """Capture current widget values as the baseline for dirty detection"""
@@ -4639,25 +4852,6 @@ class ParameterWindow(QMainWindow):
                 self._baseline_snapshot[idx] = widget.currentData()
             elif isinstance(widget, QSpinBox):
                 self._baseline_snapshot[idx] = widget.value()
-
-    def _is_dirty_from_baseline(self):
-        """Check if any widget differs from the last-loaded baseline"""
-        for idx, widget in self.params.items():
-            if isinstance(widget, QDoubleSpinBox):
-                current = widget.value()
-            elif isinstance(widget, QComboBox):
-                current = widget.currentData()
-            elif isinstance(widget, QSpinBox):
-                current = widget.value()
-            else:
-                continue
-            baseline = self._baseline_snapshot.get(idx)
-            if baseline is None:
-                if current is not None and current != 0:
-                    return True
-            elif abs(float(current) - float(baseline)) > 0.001:
-                return True
-        return False
 
     def _source_airframe_name(self):
         """Base name of the current airframe for default save filenames.
@@ -4694,59 +4888,6 @@ class ParameterWindow(QMainWindow):
         # Guard against a last-resort empty stem so we never write "_.af".
         return name if name else "Params"
 
-    def _default_save_path(self):
-        """Build default save path: airframes/user/<name>_<YYYYMMDD_HHMMSS>.af
-
-        An edited airframe is NEVER saved over its read-only source; a date/
-        time tag is appended and the result lands in the user airframes dir.
-        Read-only sources (generic/original) can therefore never be
-        overwritten, and every save produces a fresh, uniquely named file.
-        """
-        from datetime import datetime
-        airframe_name = self._base_airframe_name()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        tuned_dir = self._user_dir
-        os.makedirs(tuned_dir, exist_ok=True)
-        return os.path.join(tuned_dir, f"{airframe_name}_{stamp}.af")
-
-    def _save_if_dirty(self):
-        """Save dirty params before proceeding. Returns True to proceed.
-
-        Greg 2026-09-07: the "Save/Discard/Cancel?" prompt was wasted clicks —
-        Save was always the right answer (and the default button), and a
-        parameter window read-only-close loses nothing that a timestamped .af
-        in airframes/user/ wouldn't recover. So the prompt is gone: if any
-        tweaks are pending they are saved unconditionally. The write can never
-        hit a read-only source (`_default_save_path` always name-tags into the
-        user dir). Returns False ONLY if the save itself failed.
-        """
-        if not self._is_dirty_from_baseline():
-            return True
-        return self._save_current_to_af()
-
-    def _save_current_to_af(self):
-        """Snapshot current widget values to a timestamped user .af."""
-        path = self._default_save_path()
-        try:
-            raw_vals = self._raw_float_values()
-            raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
-            metadata = {}
-            if self._character_slider:
-                metadata['Character'] = str(self._character_slider.value())
-            metadata.update(self._phys_to_metadata())
-            metadata['LIMITS'] = dict(self._airframe_limits)
-            text = af_module.format_af("Tuned Parameters", raw_dict, metadata=metadata)
-            with open(path, 'w') as f:
-                f.write(text)
-            self._log(f"✅ Saved tuned params to {path}")
-            self.status_label.setText(f"✅ Saved to {os.path.basename(path)}")
-            self.status_label.setStyleSheet("color: #27ae60;")
-            return True
-        except Exception as e:
-            self._log(f"❌ Save failed: {e}")
-            QMessageBox.critical(self, "Save Failed", str(e))
-            return False
-    
     def save_params(self):
         from datetime import datetime
         raw_vals = self._raw_float_values()
@@ -4770,6 +4911,7 @@ class ParameterWindow(QMainWindow):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         suggested = f"{self._base_airframe_name()}_{timestamp}.af"
         
+        self._user_dir = workspace.airframes_dir()
         dialog = AfSaveDialog(self, suggested, phys_summary, self._user_dir)
         if dialog.exec_() != QDialog.Accepted:
             return
@@ -4803,6 +4945,7 @@ class ParameterWindow(QMainWindow):
         This is the single Load button — it opens the airframe library. The
         button's label shows the current airframe name (from the FC config
         flash on connect, or the file just loaded)."""
+        self._user_dir = workspace.airframes_dir()
         dialog = AfLoadDialog(self, classify_fn=self._category_for_af_file)
         if dialog.exec_() != QDialog.Accepted:
             return
@@ -4829,6 +4972,31 @@ class ParameterWindow(QMainWindow):
         else:
             return 0
     
+    def _rc_duplicate_map(self):
+        """Channels claimed by more than one function -> {channel: [fn names]}.
+
+        Every function in RC_MAP_PARAMS gets a spin box over all 16 channels
+        (0..15), so a channel value is only a clash if two spins hold it. This
+        is the same rule the FC applies, and it must not skip channel 0: that
+        is a legal channel and is throttle's default, so it is the single most
+        likely value to be duplicated.
+        """
+        by_channel = {}
+        for spin in self.rc_channel_spins:
+            by_channel.setdefault(spin.value(), []).append(spin)
+        dups = {}
+        for value, spins in by_channel.items():
+            if len(spins) > 1:
+                names = []
+                for spin in spins:
+                    fn_idx = spin.property("fn_index")
+                    if fn_idx is not None and fn_idx < len(self.RC_MAP_PARAMS):
+                        names.append(self.RC_MAP_PARAMS[fn_idx][1])
+                    else:
+                        names.append(f"P{spin.property('param_index') + 1}")
+                dups[value] = names
+        return dups
+
     def update_rc_display(self):
         """Update RC display using function-to-channel mapping"""
         if not hasattr(self, 'rc_value_labels'):
@@ -4839,13 +5007,20 @@ class ParameterWindow(QMainWindow):
         if flight_data:
             discovered = getattr(flight_data, 'discovered_channels', 0)
 
+        dups = self._rc_duplicate_map()
         for spin in self.rc_channel_spins:
             slot = spin.value()
-            bad = discovered > 0 and slot >= discovered
-            old = spin.property("_rc_hot") is True
-            if bool(bad) != old:
-                spin.setStyleSheet(self.RC_CH_BAD_STYLE if bad else self.RC_CH_STYLE)
-                spin.setProperty("_rc_hot", bool(bad))
+            # duplicate first: it is the state the FC will refuse to arm under,
+            # so it must not be hidden behind the "channel not present" colour
+            if slot in dups:
+                style = self.RC_CH_DUP_STYLE
+            elif discovered > 0 and slot >= discovered:
+                style = self.RC_CH_BAD_STYLE
+            else:
+                style = self.RC_CH_STYLE
+            if style != spin.property("_rc_style"):
+                spin.setStyleSheet(style)
+                spin.setProperty("_rc_style", style)
 
         # Physical Rx channel values (RCInp[] uS as received), one per channel.
         phys = list(getattr(flight_data, 'rc_physical', []) or []) if flight_data else []
@@ -4878,13 +5053,31 @@ class ParameterWindow(QMainWindow):
         # Function rows: look up each assigned channel's physical value
         for fn_idx, (param_idx, func_name, tc) in enumerate(self.RC_MAP_PARAMS):
             assigned_ch = self._get_param_value(int(param_idx))
+            spin = self.rc_channel_spins[fn_idx] if hasattr(self, 'rc_channel_spins') and fn_idx < len(self.rc_channel_spins) else None
+            if discovered > 0 and assigned_ch >= discovered:
+                style = self.RC_CH_BAD_STYLE
+            else:
+                style = self.RC_CH_STYLE
+            if spin is not None and hasattr(spin, 'property'):
+                if style != spin.property("_rc_style"):
+                    spin.setStyleSheet(style)
+                    spin.setProperty("_rc_style", style)
             val = ch_values.get(assigned_ch, 0)
             style_label(self.rc_value_labels[fn_idx], val)
             style_bar(self.rc_progress_bars[fn_idx], val)
 
         # Spare channels 12-15 (third column)
         for i in range(4):
-            val = ch_values.get(12 + i, 0)
+            slot = 12 + i
+            spin = self.rc_spare_spins[i] if hasattr(self, 'rc_spare_spins') and i < len(self.rc_spare_spins) else None
+            if discovered > 0 and slot >= discovered:
+                style = self.RC_CH_BAD_STYLE
+            else:
+                style = self.RC_CH_STYLE
+            if spin is not None and style != spin.property("_rc_style"):
+                spin.setStyleSheet(style)
+                spin.setProperty("_rc_style", style)
+            val = ch_values.get(slot, 0)
             style_label(self.rc_spare_labels[i], val)
             style_bar(self.rc_spare_bars[i], val)
 
@@ -4914,10 +5107,14 @@ class ParameterWindow(QMainWindow):
                     max_idx = self.params[i].count() - 1
                     self.params[i].setCurrentIndex(max(0, min(max_idx, clamped)))
         
-        # Defaults: Config1 = safe (no emulation) + use mag, Config2 = Batt Comp +
-        # Fast Start + GPS + Nav Beep (matches the fleet-wide retune sweep)
-        self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.eEnforceDriveSymmetry | Config1Bits.eUsingMag))
-        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseFastStart | Config2Bits.eUseGPS | Config2Bits.eUseNavBeep))
+        # Defaults: Config1 = RTHDescend|AltHoldAlarm, mirroring the FC's
+        # DEFAULT_CONFIG1 in params.c. It was EnforceDriveSymmetry|UsingMag here,
+        # which disagreed with both the FC default and Config1Bits.DEFAULT - the
+        # two GCS sites had drifted. eUsingMag is dropped for the arming-deadlock
+        # reason recorded at Config1Bits.DEFAULT; Config2 = Batt Comp + GPS +
+        # Nav Beep (matches the fleet-wide retune sweep).
+        self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.eUseRTHDescend | Config1Bits.eUseAltHoldAlarm))
+        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseGPS | Config2Bits.eUseNavBeep))
         
         self.update_config_display()
         self.update_rc_display()
@@ -4980,20 +5177,33 @@ class ParameterWindow(QMainWindow):
                 self._read_timeout_timer = None
     
     def apply_and_reboot(self, confirm=True):
-        """Flush any pending live writes, then commit RAM→flash and reboot (tag-72).
+        """Send the full widget image to the FC (tag-77) and reboot.
 
-        Live-writes already keep the FC's RAM image in sync, so there is no
-        batch of param packets to send — the commit just needs the debounced
-        write queue drained first, otherwise the packed flash block could miss
-        the newest value. Reuses the existing commit tail (airframe-name persist
-        + tag-72 + deferred post-reboot verification).
+        The tag-77 block sends every parameter in one CRC-checked packet and
+        makes the FC write flash and reboot. This is the ONLY path that writes
+        parameters to the FC: edits (and airframe loads) are local until Commit
+        is pressed. Reuses the existing commit tail (airframe-name persist +
+        deferred post-reboot tag-71 verification).
 
-        confirm=True (default) asks the caller-facing "Are you sure?" — the
-        auto-offer from a boot-scoped param edit passes confirm=False because
-        its own prompt has already asked.
+        confirm=True asks the caller-facing "Are you sure?". confirm=False is
+        used when draining a commit that was queued behind an in-flight one and
+        has already been confirmed.
         """
+        if self._configuration_required:
+            self._log("  ⛔ No airframe configured — load an airframe before committing")
+            self.status_label.setText("⛔ No airframe configured — load an airframe first")
+            self.status_label.setStyleSheet("color: #e74c3c;")
+            return
         if self._write_in_progress:
-            self._log("⚠️ Apply & Reboot already in progress")
+            # A commit cycle (RAM→flash + reboot + deferred verify) is already
+            # under way. Do NOT silently drop this request — a second Commit
+            # press arriving mid-commit would otherwise be lost. Queue it: the
+            # in-flight cycle's resolution (verify success, verify timeout, or
+            # commit NACK) drains it immediately after the cross-clears.
+            self._apply_retry_pending = True
+            self._log("⚠️ Apply & Reboot already in progress — queued; will run when the current commit cycle resolves")
+            self.status_label.setText("⏳ Commit in progress — apply queued (waiting)")
+            self.status_label.setStyleSheet("color: #f39c12;")
             return
         if not (self.parent_window and getattr(self.parent_window, 'connected', False)):
             self.status_label.setText("❌ Cannot commit - no connection")
@@ -5043,15 +5253,48 @@ class ParameterWindow(QMainWindow):
         self._flash_write_pending = True
         self.status_label.setText("💾 Committing parameters to flash and restarting FC...")
         self.status_label.setStyleSheet("color: #f39c12;")
+        self._set_commit_state('committing')
 
-        # Snapshot the whole current image so the post-reboot readback can be
-        # verified against it (catches a failed flash commit/verify mismatch).
+        # The verification snapshot is NOT taken here. It must be taken in
+        # _commit_to_flash, which records the widget values actually sent, so the
+        # post-reboot readback is compared against the image the FC received
+        # rather than widget state that has not been sent yet.
+        self._verify_mode = True
+        self._expecting_param_packet = True
+        self._write_timestamp = time.time()
+
+        # Edits are local, so there is no tag-17 queue to drain or abort: the
+        # tag-77 block IS the whole set. Send it.
+        self._commit_to_flash()
+
+    def _drain_queued_apply(self):
+        """Run an Apply & Reboot that was queued while another commit was in flight.
+
+        Called on every interlock release (verify success, verify timeout,
+        commit NACK, write timeout). Re-invokes apply_and_reboot(confirm=False)
+        — the queued request was a second Commit already confirmed by the user,
+        so re-prompting is wrong.
+        """
+        if getattr(self, '_apply_retry_pending', False):
+            self._apply_retry_pending = False
+            self._log("  🔁 Running queued Apply & Reboot")
+            self.apply_and_reboot(confirm=False)
+
+    def _snapshot_written_image(self):
+        """Record the image the FC is expected to hold, for the post-reboot verify.
+
+        Called from _commit_to_flash immediately before the tag-77 block is
+        sent, so the snapshot is exactly the image the FC receives. It is the
+        baseline the post-reboot tag-71 readback is compared against.
+        """
         self._written_float = self._compute_written_float()
         self._written_params = {}
         for i in range(self.MAX_PARAMS):
-            if i not in self.params:
+            widget = self.param_widget(i)
+            if widget is None:
                 continue
-            widget = self.params[i]
+            if i == int(ParamIndex.POWER_RESET_CAUSE):
+                continue
             if isinstance(widget, QDoubleSpinBox):
                 mult = self._display_mult(i)
                 self._written_params[i] = int(widget.value() / mult)
@@ -5060,62 +5303,68 @@ class ParameterWindow(QMainWindow):
             elif isinstance(widget, QComboBox):
                 data = widget.currentData()
                 self._written_params[i] = int(data) if data is not None else widget.currentIndex()
-        self._verify_mode = True
-        self._expecting_param_packet = True
-        self._write_timestamp = time.time()
-
-        # Any live-write sitting in the 350 ms debounce window must hit RAM
-        # before the tag-72 commit packs the flash block.
-        #
-        # A bulk-set (load) that never reached the FC — offline load, or a load
-        # whose batch did not drain — leaves the FC RAM stale vs the UI. If one
-        # is pending, push the WHOLE widget image first: it supersedes whatever
-        # the FC held, and the debounced live-edit flush that follows overrides
-        # just the indices the user edited afterwards. Without this the commit
-        # flashes stale RAM (old values / factory defaults) while the verify
-        # compares against the loaded widget values — the 10-slot mismatch.
-        if getattr(self, '_image_dirty', False):
-            self._image_dirty = False
-            self._log("  ⚙️ Bulk-set pending — pushing full param image before commit")
-            if hasattr(self.parent_window, 'send_params_typed'):
-                self.parent_window.send_params_typed()
-        self._flush_live_writes()
-        self._when_param_write_drained(self._commit_to_flash)
-
-    def _when_param_write_drained(self, callback, attempts=200):
-        """Invoke callback once the tag-17 live-write queue has drained."""
-        parent = self.parent_window
-        if not parent or not getattr(parent, '_param_write_list', []):
-            callback()
-            return
-        n = [attempts]
-
-        def _poll():
-            n[0] -= 1
-            if not getattr(parent, '_param_write_list', []) or n[0] <= 0:
-                callback()
-                return
-            QTimer.singleShot(20, _poll)
-
-        QTimer.singleShot(20, _poll)
 
     def _commit_to_flash(self):
-        """Persist the airframe name and commit RAM→flash via tag-72."""
+        """Persist the airframe name and commit the full image via tag-77.
+
+        The tag-77 block carries every parameter, so it replaces both the
+        tag-17 batch and the tag-72 commit: the FC verifies the CRC, writes the
+        whole config to flash in one blocking pass, conditions it, ACKs, and
+        reboots. AFName is staged first (tag 75) so it rides the same config
+        write — `RefreshConfig` writes the whole ConfigStruct including the name.
+        """
+        self._snapshot_written_image()
         self.dirty_params.clear()
-        self.write_progress.setValue(100)
-        self.write_progress.setFormat("Committing to flash...")
-        self.write_progress.show()
-        # Persist the airframe name into FC config flash BEFORE commit so both
-        # land in the same config write — flash is the single source of truth.
         if self.parent_window and hasattr(self.parent_window, 'send_afname'):
             self.parent_window.send_afname(self._airframe_name_to_persist())
-        if self.parent_window and hasattr(self.parent_window, 'send_param_commit'):
-            self.parent_window.send_param_commit()
-        # Don't verify immediately — FC resets after commit.
-        # Defer to when the next flight packet arrives (FC reconnected).
-        self._log("  ⏳ Waiting for FC to reconnect after commit...")
+        if self.parent_window and hasattr(self.parent_window, 'send_param_image'):
+            self.parent_window.send_param_image()
+        # Don't verify immediately — FC resets after commit. Defer until tag 68
+        # (SendRebootInfoPacket, one call at the end of InitHarness) reports the
+        # reboot from the FC that came back: the FC streams at 10 Hz and waits
+        # 500 ms after its commit ACK before resetting, so any packet arriving
+        # before the reset is still the OLD boot.
+        self._log("  ⏳ Waiting for FC to reboot and reconnect after commit...")
         if self.parent_window:
             self.parent_window._pending_param_verification = True
+        # Arm a watchdog: if the FC reboots but never streams a flight packet
+        # again (stuck at a boot gate / eAFUnknown + cleared cal), the deferred
+        # verification can never fire and the commit interlock would stay set
+        # forever, silently aborting every later Apply & Reboot. Break the
+        # stall loudly so a reconnect / manual commit can recover.
+        if self._reconnect_watchdog_timer is not None:
+            self._reconnect_watchdog_timer.stop()
+        self._reconnect_watchdog_timer = QTimer()
+        self._reconnect_watchdog_timer.setSingleShot(True)
+        self._reconnect_watchdog_timer.timeout.connect(self._reconnect_watchdog_timeout)
+        self._reconnect_watchdog_timer.start(25000)
+
+    def _reconnect_watchdog_timeout(self):
+        """The FC never reconnected (no flight packet) after a commit+reboot.
+
+        The deferred post-reboot verification is keyed on the first flight
+        packet seen AFTER the reboot was observed, so a silent FC leaves
+        `_pending_param_verification` True and the commit interlock latched —
+        every later Apply & Reboot is dropped at the interlock check. Release
+        the latches loudly so the user can reconnect / re-verify rather than
+        being silently frozen out.
+        """
+        self._reconnect_watchdog_timer = None
+        if self.parent_window and getattr(self.parent_window, '_pending_param_verification', False):
+            self.parent_window._pending_param_verification = False
+        if self._write_in_progress or self._flash_write_pending:
+            self._log("⚠️ FC did not reconnect after commit+reboot — releasing commit interlock (verify flash manually)")
+            self.status_label.setText("⚠️ No reconnect after commit — release interlock; verify flash load manually")
+            self.status_label.setStyleSheet("color: #e74c3c;")
+            self._set_commit_state('pending')
+            self._write_in_progress = False
+            self._flash_write_pending = False
+            self._verify_mode = False
+            self._expecting_param_packet = False
+            self._written_params = {}
+            self._written_float = {}
+            self._write_timestamp = 0
+            self._drain_queued_apply()
 
     def _compute_written_float(self, indices=None):
         """Compute the float32 values that will be sent — mirrors send_params_typed logic.
@@ -5124,8 +5373,8 @@ class ParameterWindow(QMainWindow):
         param_range = indices if indices is not None else range(self.MAX_PARAMS)
         floats = {}
         for i in param_range:
-            if i in self.params:
-                widget = self.params[i]
+            widget = self.param_widget(i)
+            if widget is not None:
                 if isinstance(widget, QDoubleSpinBox):
                     mult = self._display_mult(i)
                     floats[i] = widget.value() / mult
@@ -5150,10 +5399,15 @@ class ParameterWindow(QMainWindow):
 
         Uses the currently loaded .af file's base name (the file is the source
         of the parameter set being written). The flash then becomes the single
-        source of truth displayable on GCS restart.
+        source of truth displayable on GCS restart. "Params" is only the
+        synthetic fallback for a session with no .af loaded; a file actually
+        named Params*.af must still persist, otherwise the FC keeps an empty
+        name and the params page re-gates on every reconnect.
         """
         src = self._base_airframe_name()
-        return src if src and src != "Params" else ""
+        if src == "Params" and not self._current_airframe_path:
+            return ""
+        return src if src else ""
 
     def _request_write_verify(self):
         """Request param readback via tagged protocol (subtag 71) for verification"""
@@ -5167,7 +5421,7 @@ class ParameterWindow(QMainWindow):
         self._verification_timer = QTimer()
         self._verification_timer.setSingleShot(True)
         self._verification_timer.timeout.connect(self._verification_timeout)
-        self._verification_timer.start(5000)
+        self._verification_timer.start(12000)
 
     def _verification_timeout(self):
         self._log("⏱️ Verification timeout - no automatic param packet received from FC")
@@ -5186,8 +5440,15 @@ class ParameterWindow(QMainWindow):
                 self._flash_write_pending = False
                 self._write_timestamp = 0
                 
+                if self._reconnect_watchdog_timer is not None:
+                    self._reconnect_watchdog_timer.stop()
+                    self._reconnect_watchdog_timer = None
                 self.status_label.setText("⚠️ Verification timeout - no param packet from FC")
                 self.status_label.setStyleSheet("color: #e74c3c;")
+                # Unverified: keep the button RED so the user can re-commit.
+                self._set_commit_state('pending')
+                # Interlock just released — run any commit queued behind it.
+                self._drain_queued_apply()
             else:
                 self._log("  ⏳ Still waiting for param packet...")
                 # Restart timer
@@ -5208,10 +5469,7 @@ class ParameterWindow(QMainWindow):
         if self._verification_timer:
             self._verification_timer.stop()
             self._verification_timer = None
-        
-        if not self._save_if_dirty():
-            event.ignore()
-            return
+
         event.accept()
     
     def set_buttons_enabled(self, enabled: bool):
