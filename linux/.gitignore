@@ -13,6 +13,8 @@ src/.venv/
 
 # Firmware binaries
 *.bin
+!/*.bin
+*.hex
 *.elf
 
 # Excluded dev/debug files

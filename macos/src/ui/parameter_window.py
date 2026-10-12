@@ -1473,9 +1473,10 @@ class ParameterWindow(QMainWindow):
     def on_param_commit_ack(self, ok):
         """Handle the tag-72 flash-commit ACK from the FC.
 
-        ok=True  — config confirmed written to flash; the FC is about to reboot,
-                   so the widget returns to the waiting state; the deferred
-                   post-reboot tag-71 verification then confirms the flash load.
+        ok=True  — config confirmed written to flash; the GCS now sends the
+                   reboot command (tag 78), so the widget returns to the waiting
+                   state; the deferred post-reboot tag-71 verification then
+                   confirms the flash load.
         ok=False — commit was NOT persisted (write/erase failed, or FC is in
                    flight). The FC does NOT reboot. Un-arm the deferred verify,
                    reset the button and show the failure loudly.
@@ -1495,6 +1496,7 @@ class ParameterWindow(QMainWindow):
         self.reset_write_button()
         if self.parent_window:
             self.parent_window._pending_param_verification = False
+            self.parent_window._armed_boot_verify = False
         # Not saved: the button stays RED so the user can retry.
         self._set_commit_state('pending')
         self.status_label.setText("❌ Commit NACK — parameters NOT saved to flash")
@@ -4648,6 +4650,7 @@ class ParameterWindow(QMainWindow):
         # rebooted); flash is still never written in the air, since
         # can_write_parameters()/RefreshConfig() gate on State != eInFlight.
         self._mark_dirty()
+        self.dirty_params.add(-1)
         self.status_label.setText(
             f"📝 Loaded \"{name}\" into the UI — press Commit to send to the FC"
             + ("" if connected else " (not connected)"))
@@ -5319,14 +5322,15 @@ class ParameterWindow(QMainWindow):
             self.parent_window.send_afname(self._airframe_name_to_persist())
         if self.parent_window and hasattr(self.parent_window, 'send_param_image'):
             self.parent_window.send_param_image()
-        # Don't verify immediately — FC resets after commit. Defer until tag 68
-        # (SendRebootInfoPacket, one call at the end of InitHarness) reports the
-        # reboot from the FC that came back: the FC streams at 10 Hz and waits
-        # 500 ms after its commit ACK before resetting, so any packet arriving
+        # Don't verify immediately — the FC no longer resets after the commit;
+        # it waits for the GCS to send the tag-78 reboot command. Defer until
+        # tag 68 (SendRebootInfoPacket, one call at the end of InitHarness)
+        # reports the reboot from the FC that came back, so any packet arriving
         # before the reset is still the OLD boot.
         self._log("  ⏳ Waiting for FC to reboot and reconnect after commit...")
         if self.parent_window:
             self.parent_window._pending_param_verification = True
+            self.parent_window._armed_boot_verify = False
         # Arm a watchdog: if the FC reboots but never streams a flight packet
         # again (stuck at a boot gate / eAFUnknown + cleared cal), the deferred
         # verification can never fire and the commit interlock would stay set
@@ -5352,6 +5356,7 @@ class ParameterWindow(QMainWindow):
         self._reconnect_watchdog_timer = None
         if self.parent_window and getattr(self.parent_window, '_pending_param_verification', False):
             self.parent_window._pending_param_verification = False
+            self.parent_window._armed_boot_verify = False
         if self._write_in_progress or self._flash_write_pending:
             self._log("⚠️ FC did not reconnect after commit+reboot — releasing commit interlock (verify flash manually)")
             self.status_label.setText("⚠️ No reconnect after commit — release interlock; verify flash load manually")

@@ -47,6 +47,7 @@ class PacketTag(IntEnum):
     AFNAME_SET = 75
     I2C_ERRORS = 76
     PARAM_IMAGE = 77
+    REBOOT = 78
     REQUEST = 50
     ACK = 51
     MISC = 52

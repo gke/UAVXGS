@@ -482,6 +482,7 @@ class MainWindow(QMainWindow):
         self._pending_params = None
         self._pending_typed_params = None
         self._pending_param_verification = False
+        self._armed_boot_verify = False
         self.nav_window: Optional[NavWindow] = None
         self.calib_window: Optional[CalibrationWindow] = None
         self.misc_window: Optional[MiscWindow] = None
@@ -1848,11 +1849,12 @@ class MainWindow(QMainWindow):
     def _verify_post_commit_config(self, parsed):
         """Gate the deferred post-commit readback on the FC's own reboot report.
 
-        The tag-72 ACK is the FC's verified truth: RefreshConfig() returns true
-        only after erase + program + byte-for-byte read-back, and the FC reboots
-        only on a confirmed commit. What the ACK cannot show is whether flash
-        holds the values the GCS intended, so an independent tag-71 comparison
-        against what was written is still required.
+        The tag-77 ACK is the FC's verified truth: ApplyParamImage returns true
+        only after erase + program + byte-for-byte read-back. The FC then waits
+        for the GCS to send the tag-78 reboot command, and reboots only then.
+        What the ACK cannot show is whether flash holds the values the GCS
+        intended, so an independent tag-71 comparison against what was written
+        is still required.
 
         That readback must be served by the FC that came back AFTER the reset.
         This used to gate on a tag-70 flight_state of eStepNav, which could
@@ -1866,6 +1868,7 @@ class MainWindow(QMainWindow):
             return
 
         self._pending_param_verification = False
+        self._armed_boot_verify = False
 
         # The FC has reported, so the reconnect watchdog has served its purpose
         # either way - a late arrival still needs releasing.
@@ -2054,6 +2057,7 @@ class MainWindow(QMainWindow):
         self.connect_btn.setEnabled(False)
         self.connect_btn.setText("Disconnecting...")
         self._pending_param_verification = False
+        self._armed_boot_verify = False
         if self.param_window is not None:
             # Clear the write interlock so a mid-commit disconnect/reconnect
             # doesn't leave the commit path locked forever.
@@ -2106,6 +2110,13 @@ class MainWindow(QMainWindow):
             # readback once the first post-reconnect tag-67 reports the config
             # block is valid. Avoids a racing double-read.
             if self._pending_param_verification:
+                # Arm the tag-67 boot-edge trigger HERE, on the genuine
+                # post-reboot reconnection. The FC waits 500 ms before it
+                # resets, and the outgoing instance keeps streaming tag-67
+                # with the pre-commit boot_diag during that window; arming
+                # only on reconnect guarantees the readback is served by the
+                # FC that came back, not the one on its way down.
+                self._armed_boot_verify = True
                 # The FC sends tag 68 once at the end of InitHarness(), which is
                 # buffered and drained on either link - but on USB the host may
                 # still be mid-reopen backoff, so ask for it again. Free when
@@ -2348,7 +2359,8 @@ class MainWindow(QMainWindow):
 
         The FC verifies the CRC, stages the image, clamps and copies it into the
         active Config mirror, writes the whole config to flash in one blocking
-        erase+program, conditions it via LoadParameters(), ACKs, and reboots.
+        erase+program, conditions it via LoadParameters(), ACKs, then waits for
+        the GCS reboot command (tag 78), which is sent once the ACK is seen.
         This is the bulk replacement for the per-parameter tag-17 batch + tag-72
         commit. The image is built by the parameter window, which fills params it
         has no widget for from the last full tag-71 readback so a block write can
@@ -2380,6 +2392,29 @@ class MainWindow(QMainWindow):
                 f"{len(packet)} B wired, write()={n})")
         except Exception as e:
             self._trace(f"❌ [commit] Failed to send param image: {e}", "Errors")
+
+    def send_reboot(self):
+        """Authorise the FC to reset after a verified flash commit (tag 78).
+
+        The FC writes and verifies the whole config to flash, ACKs tag 77, and
+        then waits — it no longer resets itself. This command is the GCS's
+        explicit go-ahead, so the reboot edge happens on the GCS's terms and the
+        post-reboot readback is served by the FC that came back. There is no
+        ACK: the link drop and reconnect are the confirmation, and a reboot ACK
+        would just re-enter the same post-reset race this handshake removes.
+        """
+        serial_port = getattr(self.telemetry, 'serial', None)
+        if not serial_port or not serial_port.is_open:
+            self._trace("❌ [commit] Cannot send reboot command - serial port not open", "Errors")
+            return
+        raw_data = bytearray([PacketTag.REBOOT])
+        raw_data.extend(struct.pack('<H', 0))
+        packet = self._build_packet_with_checksum(raw_data)
+        try:
+            n = serial_port.write(packet)
+            self._trace(f"📤 [commit] Sent reboot command ({len(packet)} B wired, write()={n})")
+        except Exception as e:
+            self._trace(f"❌ [commit] Failed to send reboot command: {e}", "Errors")
 
     def abort_param_writes(self):
         """Stop an in-flight tag-17 batch without reporting completion.
@@ -3091,13 +3126,16 @@ class MainWindow(QMainWindow):
                         # CONFIRMED in flash (erase + program + read-back
                         # verify). ok=False means the FC did NOT save and will
                         # NOT reboot: surface it loudly and un-arm the deferred
-                        # verification. PARAM_IMAGE ACKs on the same path — the
-                        # FC writes flash and reboots exactly as tag-72 did.
+                        # verification. tag-72 is the self-rebooting legacy path;
+                        # tag-77 leaves the FC waiting, so the reset is only
+                        # authorised here, once the flash commit is ACKed.
                         if self.param_window is not None:
                             self.param_window.on_param_commit_ack(ok)
                         if ok:
                             self.log_debug("✅ Flash commit CONFIRMED in FC",
                                            "Info")
+                            if at == PacketTag.PARAM_IMAGE:
+                                self.send_reboot()
                         else:
                             self.log_debug("❌ Flash commit FAILED — params NOT saved",
                                            "Errors")
@@ -3198,6 +3236,13 @@ class MainWindow(QMainWindow):
                 # fault was parsed and then silently dropped.
                 self._report_imu_fault(parsed)
                 self._report_boot_diag(parsed)
+                # tag-67 carries the same Config.BootDiag as the one-shot
+                # tag-68, but streams continuously, so its edge is the reliable
+                # post-commit boot trigger when tag-68 is lost across a USB
+                # re-enumeration. Armed only by on_connected(True), i.e. by the
+                # reconnection after the reboot; see _verify_post_commit_config.
+                if self._armed_boot_verify:
+                    self._verify_post_commit_config(parsed)
 
             case 64:
                 packet_logger.log_received(64, "WIND", parsed)
