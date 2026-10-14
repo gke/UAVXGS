@@ -74,6 +74,12 @@ class AnomalyBox(QGroupBox):
                 lay.addWidget(t_lbl, row, col)
                 setattr(self, val_attr, t_lbl)
 
+        lay.addWidget(QLabel("Mag fault"), 6, 0)
+        self.mag_fault = QLabel("-")
+        self.mag_fault.setStyleSheet("font-weight: bold;")
+        self.mag_fault.setAlignment(Qt.AlignLeft)
+        lay.addWidget(self.mag_fault, 6, 1, 1, 3)
+
         self.setLayout(lay)
         self._alert = False
 
@@ -94,7 +100,14 @@ class AnomalyBox(QGroupBox):
         self.sio_mag_peak.setText(str(d.mag_peak_us))
         self.sio_baro_avg.setText(str(d.baro_avg_us))
         self.sio_baro_peak.setText(str(d.baro_peak_us))
-        if d.imu_errors or d.mag_errors or d.baro_errors:
+        reason = getattr(d, "mag_fail_reason", 0)
+        if reason:
+            self.mag_fault.setText(d.mag_fail_reason_name)
+            self.mag_fault.setStyleSheet("font-weight: bold; color: #c00000;")
+        else:
+            self.mag_fault.setText("-")
+            self.mag_fault.setStyleSheet("font-weight: bold;")
+        if d.imu_errors or d.mag_errors or d.baro_errors or reason:
             self.set_alert(True)
 
     def set_alert(self, on: bool):

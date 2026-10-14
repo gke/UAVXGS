@@ -293,10 +293,6 @@ class CalibrationWindow(QMainWindow):
         self.imu_start_btn.setStyleSheet("font-weight: bold; padding: 8px; background-color: #3498db; color: white;")
         btn_layout.addWidget(self.imu_start_btn)
         
-        self.imu_reset_btn = QPushButton("Reset Offsets")
-        self.imu_reset_btn.setStyleSheet("padding: 8px;")
-        btn_layout.addWidget(self.imu_reset_btn)
-        
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
         layout.addStretch()
@@ -429,10 +425,6 @@ class CalibrationWindow(QMainWindow):
         self.mag_start_btn = QPushButton("Start Calibration")
         self.mag_start_btn.setStyleSheet("font-weight: bold; padding: 8px; background-color: #3498db; color: white;")
         btn_layout.addWidget(self.mag_start_btn)
-        
-        self.mag_clear_btn = QPushButton("Clear Calibration")
-        self.mag_clear_btn.setStyleSheet("padding: 8px;")
-        btn_layout.addWidget(self.mag_clear_btn)
         
         layout.addLayout(btn_layout)
         layout.addStretch()
@@ -745,11 +737,9 @@ class CalibrationWindow(QMainWindow):
         
         # IMU
         self.imu_start_btn.clicked.connect(self.start_imu_calibration)
-        self.imu_reset_btn.clicked.connect(self.reset_imu_offsets)
         
         # Magnetometer
         self.mag_start_btn.clicked.connect(self.start_mag_calibration)
-        self.mag_clear_btn.clicked.connect(self.clear_mag_calibration)
         
         # RC
         self.rc_auto_btn.clicked.connect(self.auto_rc_calibration)
@@ -782,7 +772,6 @@ class CalibrationWindow(QMainWindow):
         if idx != -1:
             self.tab_widget.removeTab(idx)
         self.mag_start_btn.setEnabled(False)
-        self.mag_clear_btn.setEnabled(False)
         self._log("No magnetometer detected (FC telemetry bit 38) - "
                   "magnetometer calibration retired for this session")
 
@@ -847,7 +836,6 @@ class CalibrationWindow(QMainWindow):
             self.mag_cal_status.setText(text)
             self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #f39c12; color: white; font-weight: bold; border-radius: 4px;")
         self.mag_start_btn.setEnabled(True)
-        self.mag_clear_btn.setEnabled(True)
 
     def _send_misc_command(self, command: MiscCommand, param: int = 0):
         """Send a MISC command to the FC"""
@@ -1108,18 +1096,6 @@ class CalibrationWindow(QMainWindow):
         self.imu_status.setStyleSheet("padding: 5px; background-color: #d4edda; color: #155724; border-radius: 4px;")
         self.status_label.setText(f"✅ {type_name} calibration captured — Commit to FC to persist")
     
-    def reset_imu_offsets(self):
-        """Reset IMU offsets to zero"""
-        self.gyro_roll_offset.setText("0.00")
-        self.gyro_pitch_offset.setText("0.00")
-        self.gyro_yaw_offset.setText("0.00")
-        self.acc_x_offset.setText("0.00")
-        self.acc_y_offset.setText("0.00")
-        self.acc_z_offset.setText("0.00")
-        self.imu_status.setText("IMU offsets reset to zero")
-        self.imu_status.setStyleSheet("padding: 5px; background-color: #f8f8f8; border-radius: 4px;")
-        self.status_label.setText("IMU offsets reset")
-    
     def start_mag_calibration(self):
         """Start magnetometer calibration"""
         if self.mag_calibration_requested:
@@ -1179,13 +1155,19 @@ class CalibrationWindow(QMainWindow):
                 self.mag_status.setStyleSheet("padding: 5px; background-color: #f8d7da; color: #721c24; border-radius: 4px;")
                 self.status_label.setText("⚠️ Mag calibration failed - rotate fully through all 8 octants and retry")
                 self._log("⚠️ Mag calibration failed - previous calibration retained")
+        elif command in (MiscCommand.CAL_IMU, MiscCommand.CAL_ACC) \
+                and self.imu_calibration_requested:
+            if success:
+                self._finish_imu_calibration()
+            else:
+                self.imu_calibration_requested = False
+                self.imu_calibrating = False
+                self.imu_start_btn.setEnabled(True)
+                self.imu_status.setText("⚠️ IMU calibration FAILED")
+                self.imu_status.setStyleSheet("padding: 5px; background-color: #f8d7da; color: #721c24; border-radius: 4px;")
+                self.status_label.setText("IMU calibration failed")
+                self._log("⚠️ IMU calibration failed")
 
-    def clear_mag_calibration(self):
-        """Clear magnetometer calibration"""
-        self.mag_status.setText("Calibration cleared")
-        self.mag_status.setStyleSheet("padding: 5px; background-color: #f8f8f8; border-radius: 4px;")
-        self.status_label.setText("Magnetometer calibration cleared")
-    
     def auto_rc_calibration(self):
         """Auto-calibrate RC channels from live telemetry"""
         flight_data = data_manager.get_flight_data()

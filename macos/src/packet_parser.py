@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, Dict, Any
 import struct
 
 from protocol_constants import *
+from protocol_enums import MagFailReason
 
 
 def extract_byte(data: bytes, offset: int) -> int:
@@ -330,8 +331,17 @@ class I2CErrorData:
     spl_raw_p: int = 0       # scalar copy - logger records scalars only
     spl_raw_t: int = 0
     spl_cfg: tuple = ()      # (prs_cfg, tmp_cfg, cfg_reg) echo-backs
+    spl_cfg: tuple = ()      # (prs_cfg, tmp_cfg, cfg_reg) echo-backs
     spl_tcalc: float = None  # recomputed temperature from ground truth (C)
     spl_pcalc: float = None  # recomputed pressure from ground truth (Pa)
+    mag_fail_reason: int = 0  # MagFailReason cause of last mag failure (tag 76 trailer)
+
+    @property
+    def mag_fail_reason_name(self) -> str:
+        try:
+            return MagFailReason(self.mag_fail_reason).name.lower()
+        except ValueError:
+            return f"unknown({self.mag_fail_reason})"
 
 
 @dataclass
@@ -782,7 +792,9 @@ def parse_i2c_errors(data: bytes) -> Optional[I2CErrorData]:
     high startFails → the bus never clocks (peripheral/wiring/power dead).
     Counts/avg/peak saturated to int16 on the FC. Timings are SIO
     (serial-I/O) transaction times — the device's bus-access cost whichever
-    bus it sits on.
+    bus it sits on. The mag error count also absorbs data-validity failures
+    (raw -4096 overflow and all-zero/null reads), not just bus faults. The
+    final byte is the last magnetometer failure reason (MagFailReason).
     """
     if len(data) < 21:
         return None
@@ -839,6 +851,8 @@ def parse_i2c_errors(data: bytes) -> Optional[I2CErrorData]:
         d.spl_cfg = (extract_byte(data, 81), extract_byte(data, 82),
                      extract_byte(data, 83))
         _spl_verify(d)
+    if len(data) >= 85:
+        d.mag_fail_reason = extract_byte(data, 84)
     return d
 
 
@@ -1198,11 +1212,10 @@ def parse_serial_ports_packet(data: bytes) -> Optional[dict]:
     Body: numPorts(1) + bufSize(2)
           + telemetry_flags(1) + telemetry_tx(2) + telemetry_rx(2)
           + gps_flags(1) + gps_tx(2) + gps_rx(2)
-          + softserial_flags(1) + softserial_tx(2) + softserial_rx(2)
           + uart4_sr(2)
-          = 20 bytes
+          = 15 bytes
     """
-    if len(data) < 18:
+    if len(data) < 13:
         return None
 
     def _port(name: str, off: int):
@@ -1220,11 +1233,10 @@ def parse_serial_ports_packet(data: bytes) -> Optional[dict]:
         'buffer_size': extract_short(data, 1),
         'telemetry': _port('Telemetry', 3),
         'gps': _port('GPS', 8),
-        'softserial': _port('SoftSerial', 13),
     }
 
-    if len(data) >= 20:
-        d['uart4_sr'] = extract_short(data, 18)
+    if len(data) >= 15:
+        d['uart4_sr'] = extract_short(data, 13)
     else:
         d['uart4_sr'] = None
 

@@ -73,6 +73,21 @@ class PacketTag(IntEnum):
 
 
 # ============================================================================
+# Magnetometer Failure Reasons (from hmc5xxx_mag.h MagFailReasons enum)
+# Streamed as the trailing byte of the I2C/SPI health packet (Tag=76).
+# ============================================================================
+class MagFailReason(IntEnum):
+    """Cause of the last magnetometer failure."""
+    NONE = 0
+    IO = 1
+    OVERFLOW = 2
+    NULL = 3
+    UNCALIBRATED = 4
+    DEGENERATE = 5
+    ABSENT = 6
+
+
+# ============================================================================
 # MISC Commands (from telem.h MiscComms enum)
 # ============================================================================
 class MiscCommand(IntEnum):
@@ -148,6 +163,16 @@ class RCControl(IntEnum):
     eTransitionRC = 10
     eAux1CamPitchRC = 11
     eNullRC = 12
+
+
+# Per-logical-channel RC values in microseconds, mirroring the FC tables in
+# UAVXArmQ/src/rc.c: cDefault[] (the value an absent receiver channel holds) and
+# cFS[] (the signal-loss failsafe). Indexed by RCControl order; the tail entries
+# beyond eNullRC cover the FC's eAux2..eAux5 logicals that this enum stops short of.
+RC_DEFAULT_US = (1000, 1500, 1500, 1500, 1000, 1000, 1000, 1000,
+                 1000, 1000, 1500, 1500, 1000, 1000, 1000, 1000)
+RC_FAILSAFE_US = (1000, 1500, 1500, 1500, 1000, 1000, 2000, 1000,
+                  1000, 1000, 1500, 1500, 1000, 1000, 1000, 1000)
 
 
 # ============================================================================

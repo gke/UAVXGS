@@ -1405,10 +1405,7 @@ class MainWindow(QMainWindow):
         self.ser_gps_tx = QProgressBar(); self.ser_gps_tx.setStyleSheet(bar_style); self.ser_gps_tx.setRange(0, 512); self.ser_gps_tx.setValue(0); self.ser_gps_tx.setTextVisible(True)
         self.ser_gps_rx = QProgressBar(); self.ser_gps_rx.setStyleSheet(bar_style); self.ser_gps_rx.setRange(0, 512); self.ser_gps_rx.setValue(0); self.ser_gps_rx.setTextVisible(True)
         self.ser_gps_ov = QLabel("--")
-        self.ser_soft_tx = QProgressBar(); self.ser_soft_tx.setStyleSheet(bar_style); self.ser_soft_tx.setRange(0, 512); self.ser_soft_tx.setValue(0); self.ser_soft_tx.setTextVisible(True)
-        self.ser_soft_rx = QProgressBar(); self.ser_soft_rx.setStyleSheet(bar_style); self.ser_soft_rx.setRange(0, 512); self.ser_soft_rx.setValue(0); self.ser_soft_rx.setTextVisible(True)
-        self.ser_soft_ov = QLabel("--")
-        for ov in (self.ser_telem_ov, self.ser_gps_ov, self.ser_soft_ov):
+        for ov in (self.ser_telem_ov, self.ser_gps_ov):
             ov.setStyleSheet("font-weight: bold;")
         serial_layout.addWidget(QLabel("Telem:"), 1, 0)
         serial_layout.addWidget(self.ser_telem_tx, 1, 1)
@@ -1418,10 +1415,6 @@ class MainWindow(QMainWindow):
         serial_layout.addWidget(self.ser_gps_tx, 2, 1)
         serial_layout.addWidget(self.ser_gps_rx, 2, 2)
         serial_layout.addWidget(self.ser_gps_ov, 2, 3)
-        serial_layout.addWidget(QLabel("Soft:"), 3, 0)
-        serial_layout.addWidget(self.ser_soft_tx, 3, 1)
-        serial_layout.addWidget(self.ser_soft_rx, 3, 2)
-        serial_layout.addWidget(self.ser_soft_ov, 3, 3)
         serial_box.setLayout(serial_layout)
         
         link_serial_row = QHBoxLayout()
@@ -3894,7 +3887,6 @@ class MainWindow(QMainWindow):
                 ov_lbl.setStyleSheet("font-weight: bold;")
         _set('telemetry', self.ser_telem_tx, self.ser_telem_rx, self.ser_telem_ov)
         _set('gps', self.ser_gps_tx, self.ser_gps_rx, self.ser_gps_ov)
-        _set('softserial', self.ser_soft_tx, self.ser_soft_rx, self.ser_soft_ov)
 
     def check_connection(self):
         now = time.monotonic()

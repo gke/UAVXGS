@@ -25,6 +25,7 @@ from protocol_enums import (
     MiscCommand,
     RC_MAPPING_NAMES,
     RCControl,
+    RC_DEFAULT_US,
     AirframeType,
     ESCType,
     RxType,
@@ -1548,11 +1549,31 @@ class ParameterWindow(QMainWindow):
     def _mark_dirty(self):
         """A local edit (or an airframe load) leaves flash behind: go red.
 
+        Any parameter change also makes the .af stale, so colour the Save button
+        orange at the same time — the user must Save to persist params+physics.
         The only transition that leaves 'pending' is a successful commit; a
         re-edit while already pending is a no-op here.
         """
         if self._commit_state != 'pending':
             self._set_commit_state('pending')
+        self._set_save_state(True)
+
+    def _set_save_state(self, unsaved: bool):
+        """Colour the Save button when physics edits are unsaved.
+
+        PHYS_* descriptors live only in the .af file, so a physics edit is not
+        captured by Commit-to-FC. Amber Save prompts the user to persist them.
+        """
+        if not hasattr(self, 'save_btn'):
+            return
+        if unsaved:
+            self.save_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #f39c12; color: #fff; "
+                "font-weight: bold; border: 1px solid #d68910; border-radius: 3px;")
+            self.save_btn.setText("● Save Params (physics unsaved)")
+        else:
+            self.save_btn.setStyleSheet("padding: 4px 12px;")
+            self.save_btn.setText("Save Params")
 
     def on_fc_config_uncommitted(self, uncommitted):
         """Reflect the FC's own ConfigChanged cue (flags bit 34, cfg_pend).
@@ -2414,12 +2435,32 @@ class ParameterWindow(QMainWindow):
         group.setLayout(layout)
         return group
 
-    def _build_phys_row(self):
-        """Build or rebuild the physical descriptor row based on current AF_TYPE category"""
+    def _build_phys_row(self, preserve=True):
+        """Build or rebuild the physical descriptor row based on current AF_TYPE category.
+
+        preserve=True keeps the current descriptor values across a same-category
+        rebuild (the FC param-read path: connect, post-commit verify, reboot).
+        preserve=False resets to the category's descriptor defaults — used when
+        the airframe itself changes (AF_TYPE switch, .af load), where the new
+        airframe's own physics must take over instead of stale values.
+        """
         if not hasattr(self, '_phys_grid') or not hasattr(self, '_phys_row'):
             return
         grid = self._phys_grid
         row = self._phys_row
+
+        # Snapshot current descriptor values before clearing. This method is
+        # re-run on every FC param read (connect, post-commit verify, reboot)
+        # via sync_setup_from_advanced/_set_widgets_from_raw; rebuilding from
+        # the hard-coded descriptor defaults alone would silently discard user
+        # physics edits (e.g. battery/motor voltage -> default 14.8).
+        prev_values = {}
+        if preserve:
+            for key, widget in self._phys_widgets.items():
+                if isinstance(widget, QDoubleSpinBox):
+                    prev_values[key] = widget.value()
+                elif isinstance(widget, QLineEdit):
+                    prev_values[key] = widget.text()
 
         # Clear old widgets from grid
         for key, widget in self._phys_widgets.items():
@@ -2471,7 +2512,7 @@ class ParameterWindow(QMainWindow):
                 edit.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 edit.setToolTip(tooltip)
                 edit.setStyleSheet("QLineEdit { padding: 1px 2px; }")
-                edit.textChanged.connect(lambda t, k=key: self._phys_changed(k))
+                edit.textChanged.connect(lambda t, k=key: self._phys_changed(k, user=True))
                 self._phys_widgets[key] = edit
                 grid.addWidget(edit, row, col * 2)
             else:
@@ -2481,7 +2522,7 @@ class ParameterWindow(QMainWindow):
                 spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 spin.setToolTip(tooltip)
                 spin.setStyleSheet("QDoubleSpinBox { padding: 1px 2px; }")
-                spin.valueChanged.connect(lambda v, k=key: self._phys_changed(k))
+                spin.valueChanged.connect(lambda v, k=key: self._phys_changed(k, user=True))
                 # Sensible ranges to catch obviously wrong values
                 if 'AUW' in key:
                     spin.setRange(50, 20000)
@@ -2508,6 +2549,21 @@ class ParameterWindow(QMainWindow):
             lbl.setToolTip(tooltip)
             grid.addWidget(lbl, row, col * 2 + 1)
 
+        # Re-apply the snapshot for keys present in both the old and new rows so
+        # a same-category rebuild (param read/verify/reconnect) keeps the user's
+        # physics values instead of resetting them to descriptor defaults.
+        for key, widget in self._phys_widgets.items():
+            if key not in prev_values:
+                continue
+            widget.blockSignals(True)
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setValue(float(prev_values[key]))
+            elif isinstance(widget, QLineEdit):
+                widget.setText(str(prev_values[key]))
+            widget.blockSignals(False)
+        if self._phys_widgets:
+            self._current_phys_meta = self._phys_to_metadata()
+
     @staticmethod
     def _parse_prop(text: str) -> tuple:
         """Parse prop string 'DxP' or 'DxPxB' → (diameter, pitch, blades)."""
@@ -2530,7 +2586,7 @@ class ParameterWindow(QMainWindow):
             return f"{dia_s}x{pitch_s}"
         return f"{dia_s}x{pitch_s}x{blades}"
 
-    def _phys_changed(self, key):
+    def _phys_changed(self, key, user=False):
         """Handle change to a physical descriptor — recompute derived values and check sanity"""
         phys_meta = {}
         for k, widget in self._phys_widgets.items():
@@ -2542,6 +2598,12 @@ class ParameterWindow(QMainWindow):
                 phys_meta['PHYS_PROP_PITCH_INCH'] = str(pitch)
                 phys_meta['PHYS_PROP_BLADES'] = str(blades)
         self._current_phys_meta = self._compute_physics_from_descriptors(phys_meta)
+
+        # A user edit here is not an FC param (PHYS_* is airframe-file state the
+        # FC never sees), so it must NOT touch the Commit button. It only marks
+        # the Save button, which is the sole way to persist PHYS_* to the .af.
+        if user:
+            self._set_save_state(True)
 
         if hasattr(self, '_phys_hover_lbl'):
             cat = self._category_for_af(self._current_af_type)
@@ -2576,25 +2638,32 @@ class ParameterWindow(QMainWindow):
     def _load_phys_from_metadata(self, meta):
         """Populate physical descriptor widgets from .af metadata.
 
-        Handles backward compatibility: converts old PHYS_MASS_KG→PHYS_AUW_G,
-        PHYS_ARM_LEN_M→PHYS_ARM_MM, etc.
+        The canonical input descriptors (PHYS_AUW_G, PHYS_ARM_MM,
+        PHYS_PROP_INCH) are authoritative. The legacy derived keys in
+        _PHYS_KEY_MAP are a fallback only: they are applied when the canonical
+        key is absent, never when it is present. This matters because .af files
+        historically carried both the inputs and their echoes, and the echoes
+        were written last — reading them back unconditionally silently
+        overwrote the user's inputs (AUW 115 g loading as 88 g).
         """
         normalized = {}
         for k, v in meta.items():
-            if k in self._PHYS_KEY_MAP:
-                new_key = self._PHYS_KEY_MAP[k]
-                try:
-                    converted = self._PHYS_CONVERSIONS[k](v)
-                    if new_key == 'PHYS_AUW_G':
-                        normalized[new_key] = str(int(converted))
-                    elif new_key == 'PHYS_ARM_MM':
-                        normalized[new_key] = str(int(converted))
-                    else:
-                        normalized[new_key] = str(converted)
-                except (ValueError, TypeError):
-                    normalized[new_key] = v
-            else:
+            if k not in self._PHYS_KEY_MAP:
                 normalized[k] = v
+        for k, v in meta.items():
+            if k not in self._PHYS_KEY_MAP:
+                continue
+            new_key = self._PHYS_KEY_MAP[k]
+            if new_key in normalized:
+                continue
+            try:
+                converted = self._PHYS_CONVERSIONS[k](v)
+                if new_key in ('PHYS_AUW_G', 'PHYS_ARM_MM'):
+                    normalized[new_key] = str(int(converted))
+                else:
+                    normalized[new_key] = str(converted)
+            except (ValueError, TypeError):
+                normalized[new_key] = v
         # Backward compat: old PHYS_MOTOR_W → derive thrust/current/voltage
         if 'PHYS_MOTOR_W' in normalized and 'PHYS_MOTOR_THRUST_G' not in normalized:
             try:
@@ -2630,8 +2699,14 @@ class ParameterWindow(QMainWindow):
                     pass
         self._phys_changed(next(iter(self._phys_widgets.keys()), None) or '')
 
-    def _phys_to_metadata(self):
-        """Collect current physical descriptor values as metadata dict"""
+    def _phys_to_metadata(self, include_derived=True):
+        """Collect current physical descriptor values as metadata dict.
+
+        include_derived=True (the default) appends the computed _PHYS_* echoes,
+        which callers use for warnings and the physics summary. Pass False when
+        persisting: only the input descriptors are written, so a saved .af never
+        carries derived values that would later shadow the inputs on load.
+        """
         result = {}
         for key, widget in self._phys_widgets.items():
             if isinstance(widget, QDoubleSpinBox):
@@ -2642,7 +2717,7 @@ class ParameterWindow(QMainWindow):
                 result['PHYS_PROP_INCH'] = str(dia)
                 result['PHYS_PROP_PITCH_INCH'] = str(pitch)
                 result['PHYS_PROP_BLADES'] = str(blades)
-        if result:
+        if result and include_derived:
             result = self._compute_physics_from_descriptors(result)
         return result
 
@@ -2662,7 +2737,7 @@ class ParameterWindow(QMainWindow):
             self.dirty_params.add(idx_int)
             self.combo_changed(idx_int, int(data) if data is not None else 0)
             if idx_int == int(ParamIndex.AF_TYPE):
-                self._build_phys_row()
+                self._build_phys_row(preserve=False)
         elif isinstance(setup_w, QDoubleSpinBox) and isinstance(adv_w, QDoubleSpinBox):
             val = setup_w.value()
             adv_w.blockSignals(True)
@@ -2763,6 +2838,9 @@ class ParameterWindow(QMainWindow):
 
         self.update_config_display()
         self._schedule_sim_check()
+        # Computed tuning is a parameter change: Commit goes red and the .af is
+        # now stale, so the Save button goes orange too.
+        self._mark_dirty()
 
     def _cascade_integrity_caveats(self, computed):
         """Report cascade-integrity caveats for the just-computed tuning.
@@ -4635,8 +4713,10 @@ class ParameterWindow(QMainWindow):
             except (ValueError, TypeError):
                 pass
         self.sync_setup_from_advanced()
-        # Rebuild physics descriptor row for the loaded AF_TYPE (sync blocks signals)
-        self._build_phys_row()
+        # Rebuild physics descriptor row for the loaded AF_TYPE from the new
+        # category's defaults (preserve=False) so a loaded airframe's physics is
+        # not polluted by the previous one; .af PHYS_* then overrides below.
+        self._build_phys_row(preserve=False)
         # Load physical descriptors from .af metadata
         phys_meta = {k: v for k, v in meta.items() if k.startswith('PHYS_')}
         if phys_meta:
@@ -4651,6 +4731,9 @@ class ParameterWindow(QMainWindow):
         # can_write_parameters()/RefreshConfig() gate on State != eInFlight.
         self._mark_dirty()
         self.dirty_params.add(-1)
+        # Physics came from the loaded .af, not from a user edit — the Save
+        # button is not "unsaved physics" anymore.
+        self._set_save_state(False)
         self.status_label.setText(
             f"📝 Loaded \"{name}\" into the UI — press Commit to send to the FC"
             + ("" if connected else " (not connected)"))
@@ -4931,7 +5014,7 @@ class ParameterWindow(QMainWindow):
             metadata = {}
             if self._character_slider:
                 metadata['Character'] = str(self._character_slider.value())
-            metadata.update(phys_meta)
+            metadata.update(self._phys_to_metadata(include_derived=False))
             metadata['LIMITS'] = dict(self._airframe_limits)
             text = af_module.format_af("Saved Parameters", raw_dict, metadata=metadata)
             with open(path, 'w') as f:
@@ -4939,6 +5022,7 @@ class ParameterWindow(QMainWindow):
             self._log(f"✅ Saved {self.MAX_PARAMS} parameters to {path}")
             self.status_label.setText(f"✅ Saved to {os.path.basename(path)}")
             self.status_label.setStyleSheet("color: #27ae60;")
+            self._set_save_state(False)
         except Exception as e:
             self._log(f"❌ Save failed: {e}")
             QMessageBox.critical(self, "Save Failed", str(e))
@@ -5053,6 +5137,17 @@ class ParameterWindow(QMainWindow):
             bar.setRange(900, 2100)
             bar.setValue(min(2100, max(900, round(val))) if val > 0.01 else 1500)
 
+        # A row with no live physical value (its channel is not in the receiver's
+        # frame) shows the FC's per-logical-channel default from cDefault[] in
+        # rc.c, so an unused channel reads its default rather than a bare neutral.
+        def row_us(logical, physical_ch):
+            live = ch_values.get(physical_ch, 0)
+            if live > 0.01:
+                return live
+            if 0 <= logical < len(RC_DEFAULT_US):
+                return RC_DEFAULT_US[logical]
+            return 0
+
         # Function rows: look up each assigned channel's physical value
         for fn_idx, (param_idx, func_name, tc) in enumerate(self.RC_MAP_PARAMS):
             assigned_ch = self._get_param_value(int(param_idx))
@@ -5065,7 +5160,7 @@ class ParameterWindow(QMainWindow):
                 if style != spin.property("_rc_style"):
                     spin.setStyleSheet(style)
                     spin.setProperty("_rc_style", style)
-            val = ch_values.get(assigned_ch, 0)
+            val = row_us(fn_idx, assigned_ch)
             style_label(self.rc_value_labels[fn_idx], val)
             style_bar(self.rc_progress_bars[fn_idx], val)
 
@@ -5080,7 +5175,7 @@ class ParameterWindow(QMainWindow):
             if spin is not None and style != spin.property("_rc_style"):
                 spin.setStyleSheet(style)
                 spin.setProperty("_rc_style", style)
-            val = ch_values.get(slot, 0)
+            val = row_us(slot, slot)
             style_label(self.rc_spare_labels[i], val)
             style_bar(self.rc_spare_bars[i], val)
 

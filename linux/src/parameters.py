@@ -444,7 +444,7 @@ PARAM_CLASS_BOUNDS: Dict[str, Tuple[float, float]] = {
     "eClassAmps":             (0.0, 255.0),         # A
     "eClassMetres":             (0.0, 1000.0),        # m
     "eClassMs":            (0.0, 50.0),          # m/s
-    "eClassMah":           (1500.0, 10000.0),    # mAh
+    "eClassMah":           (400.0, 10000.0),    # mAh
     "eClassSeconds":             (0.0, 60.0),          # s
 }
 
@@ -516,7 +516,7 @@ PARAM_EXPLICIT_LIMITS: Dict[int, Tuple[float, float]] = {
     14: (0.0, 5.0),           # RxType CPPMRx..UnknownRx
     15: (0.0, 255.0),         # Config1Bits (bits 0..7)
     16: (0.0, 15.0),          # RxThrottleCh
-    17: (9.0, 20.0),          # LowVoltThres
+    17: (4.0, 20.0),          # LowVoltThres
     19: (0.0, 255.0),         # Unused20 (was EstCruiseThr — moved to FC Config.CruiseThrottleFF)
     40: (0.1, 15.0),          # NavMaxVelocity (GCS key is the legacy NAV_POS_INT_LIMIT). lo 0.1: divides in WPDistanceTimeout()
     74: (0.01, 1.047198),     # PitchAngleMax — per-tag: eClassAngle also holds pMagVariation, where 0 is legitimate
