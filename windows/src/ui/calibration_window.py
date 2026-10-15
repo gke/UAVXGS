@@ -426,6 +426,7 @@ class CalibrationWindow(QMainWindow):
         self.mag_start_btn.setStyleSheet("font-weight: bold; padding: 8px; background-color: #3498db; color: white;")
         btn_layout.addWidget(self.mag_start_btn)
         
+        btn_layout.addStretch()
         layout.addLayout(btn_layout)
         layout.addStretch()
         

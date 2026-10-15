@@ -2522,7 +2522,6 @@ class ParameterWindow(QMainWindow):
                 spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 spin.setToolTip(tooltip)
                 spin.setStyleSheet("QDoubleSpinBox { padding: 1px 2px; }")
-                spin.valueChanged.connect(lambda v, k=key: self._phys_changed(k, user=True))
                 # Sensible ranges to catch obviously wrong values
                 if 'AUW' in key:
                     spin.setRange(50, 20000)
@@ -2541,6 +2540,7 @@ class ParameterWindow(QMainWindow):
                 else:
                     spin.setRange(0, 99999)
                 spin.setValue(default)
+                spin.valueChanged.connect(lambda v, k=key: self._phys_changed(k, user=True))
                 self._phys_widgets[key] = spin
                 grid.addWidget(spin, row, col * 2)
             lbl = QLabel(label)
@@ -5188,7 +5188,10 @@ class ParameterWindow(QMainWindow):
         """Set a config register to a default value — updates _config_values and spinbox."""
         pi = int(idx)
         if pi in self.params and isinstance(self.params[pi], QDoubleSpinBox):
-            self.params[pi].setValue(float(value))
+            spin = self.params[pi]
+            spin.blockSignals(True)
+            spin.setValue(float(value))
+            spin.blockSignals(False)
         self._config_values[pi] = value
 
     def load_default_params(self):
@@ -5203,7 +5206,10 @@ class ParameterWindow(QMainWindow):
                     pass  # Keep initial value from add_spin
                 elif isinstance(self.params[i], QComboBox):
                     max_idx = self.params[i].count() - 1
-                    self.params[i].setCurrentIndex(max(0, min(max_idx, clamped)))
+                    combo = self.params[i]
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(max(0, min(max_idx, clamped)))
+                    combo.blockSignals(False)
         
         # Defaults: Config1 = RTHDescend|AltHoldAlarm, mirroring the FC's
         # DEFAULT_CONFIG1 in params.c. It was EnforceDriveSymmetry|UsingMag here,
