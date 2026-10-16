@@ -341,6 +341,37 @@ class AfLoadDialog(QDialog):
         return item.data(Qt.UserRole) if item else ""
 
 
+def _fw_phys_rows(auw, wing, thrust, root, prop, curr, volt, batt):
+    """Build the fixed-wing PHYS descriptor rows for one AF type.
+
+    The per-AF-type numbers are only convenient defaults; every field is
+    user-overridable and the simulation derives all further quantities from
+    whatever the .af ends up holding. Geometry is entered as ruler
+    measurements (mm), never as angles: tip sweep and tip dihedral are the
+    tip's rearward offset and vertical rise relative to the root, which the
+    sim converts to angles once the span is known. CG has no default — it is
+    planform-dependent and is validated/advised rather than assumed.
+    """
+    return [
+        ("PHYS_AUW_G",           "AUW (g)",           0, auw,    "All-up weight in grams — weigh the aircraft on a scale"),
+        ("PHYS_WINGSPAN_MM",     "Span (mm)",         0, wing,   "Wingtip to wingtip"),
+        ("PHYS_MOTOR_THRUST_G",  "Thrust (g)",        0, thrust, "Max thrust per motor in grams"),
+        ("PHYS_ROOT_CHORD_MM",   "Root chord (mm)",   0, root,   "Front-to-back width of the wing at the centreline"),
+        ("PHYS_TIP_CHORD_MM",    "Tip chord (mm)",    0, root,   "At the wingtip — same as root for a straight wing"),
+        ("PHYS_PROP",            "Prop",              None, prop, "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+        ("PHYS_MOTOR_THRUST_A",  "Curr (A)",          1, curr,   "Max current per motor in amps"),
+        ("PHYS_MOTOR_THRUST_V",  "Volt (V)",          1, volt,   "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+        ("PHYS_BATT_V",          "Batt V",            1, batt,   "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
+        ("PHYS_TIP_SWEEP_MM",    "Tip sweep (mm)",    0, 0,      "How far the wingtip sits behind the root leading edge (0 = straight wing)"),
+        ("PHYS_TIP_DIHEDRAL_MM", "Tip rise (mm)",     0, 0,      "Wingtip height above the root with the wing level (negative = droops)"),
+        ("PHYS_CG_MM",           "CG behind LE (mm)", 0, 0,      "Balance point behind the wing leading edge — leave blank if not measured"),
+        ("PHYS_TAIL_ARM_MM",     "Tail arm (mm)",     0, 0,      "Wing root LE to stab LE"),
+        ("PHYS_STAB_CHORD_MM",   "Stab chord (mm)",   0, 0,      "Horizontal stabiliser chord"),
+        ("PHYS_STAB_SPAN_MM",    "Stab span (mm)",    0, 0,      "Horizontal stabiliser span"),
+        ("PHYS_MOTOR_COUNT",     "Motors",            0, 1,      "Number of motors"),
+    ]
+
+
 class ParameterWindow(QMainWindow):
     """Parameter editor window - refactored with enums"""
 
@@ -473,16 +504,7 @@ class ParameterWindow(QMainWindow):
         ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8,   "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
         ("PHYS_MOTOR_COUNT","Motors",          0, 4,      "Number of motors"),
     ]
-    _FW_PHYS_DESCRIPTORS = [
-        ("PHYS_AUW_G",       "AUW (g)",        0, 1000,  "All-up weight in grams — weigh the aircraft on a scale"),
-        ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1800,  "Wingtip to wingtip"),
-        ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 800,   "Max thrust per motor in grams"),
-        ("PHYS_CHORD_MM",    "Chord (mm)",     0, 250,   "Average root chord"),
-        ("PHYS_PROP",        "Prop",           None, "10x5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
-        ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 30.0,  "Max current per motor in amps"),
-        ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8,  "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
-        ("PHYS_BATT_V",      "Batt V",         1, 50.0,  "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
-    ]
+    _FW_PHYS_DESCRIPTORS = _fw_phys_rows(1000, 1800, 800, 250, "10x5", 30.0, 14.8, 50.0)
     _LAND_PHYS_DESCRIPTORS = [
         ("PHYS_AUW_G",       "AUW (g)",        0, 5000,  "All-up weight in grams — weigh the vehicle on a scale"),
         ("PHYS_TRACK_MM",    "Track/WB (mm)",  0, 300,   "Track width or wheelbase in mm"),
@@ -555,57 +577,33 @@ class ParameterWindow(QMainWindow):
     }
 
     _FW_PHYS_DEFAULTS = {
-        13: [  # ELEVON
-            ("PHYS_AUW_G",       "AUW (g)",        0, 650,  "All-up weight in grams — weigh the aircraft on a scale"),
-            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 850,  "Wingtip to wingtip"),
-            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 400,  "Max thrust per motor in grams"),
-            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 180,  "Average root chord"),
-            ("PHYS_PROP",        "Prop",           None, "8x5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
-            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 20.0, "Max current per motor in amps"),
-            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 11.1, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
-            ("PHYS_BATT_V",      "Batt V",         1, 11.1, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
-        ],
-        14: [  # DELTA
-            ("PHYS_AUW_G",       "AUW (g)",        0, 550,  "All-up weight in grams — weigh the aircraft on a scale"),
-            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 850,  "Wingtip to wingtip"),
-            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 300,  "Max thrust per motor in grams"),
-            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 280,  "Average root chord"),
-            ("PHYS_PROP",        "Prop",           None, "6.5x4", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
-            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 20.0, "Max current per motor in amps"),
-            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 11.1, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
-            ("PHYS_BATT_V",      "Batt V",         1, 11.1, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
-        ],
-        15: [  # AILERON
-            ("PHYS_AUW_G",       "AUW (g)",        0, 1200, "All-up weight in grams — weigh the aircraft on a scale"),
-            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1200, "Wingtip to wingtip"),
-            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 800,  "Max thrust per motor in grams"),
-            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 220,  "Average root chord"),
-            ("PHYS_PROP",        "Prop",           None, "10x6", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
-            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 30.0, "Max current per motor in amps"),
-            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
-            ("PHYS_BATT_V",      "Batt V",         1, 14.8, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
-        ],
-        18: [  # RUDDER_ELEVATOR
-            ("PHYS_AUW_G",       "AUW (g)",        0, 900,  "All-up weight in grams — weigh the aircraft on a scale"),
-            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1380, "Wingtip to wingtip"),
-            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 600,  "Max thrust per motor in grams"),
-            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 220,  "Average root chord"),
-            ("PHYS_PROP",        "Prop",           None, "10x6", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
-            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 25.0, "Max current per motor in amps"),
-            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
-            ("PHYS_BATT_V",      "Batt V",         1, 11.1, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
-        ],
-        16: [  # AILERON_SPOILER_FLAPS
-            ("PHYS_AUW_G",       "AUW (g)",        0, 1000, "All-up weight in grams — weigh the aircraft on a scale"),
-            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1100, "Wingtip to wingtip"),
-            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 700,  "Max thrust per motor in grams"),
-            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 200,  "Average root chord"),
-            ("PHYS_PROP",        "Prop",           None, "9x5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
-            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 25.0, "Max current per motor in amps"),
-            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
-            ("PHYS_BATT_V",      "Batt V",         1, 14.8, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
-        ],
+        13: _fw_phys_rows(650, 850, 400, 180, "8x5", 20.0, 11.1, 11.1),    # ELEVON
+        14: _fw_phys_rows(550, 850, 300, 280, "6.5x4", 20.0, 11.1, 11.1),  # DELTA
+        15: _fw_phys_rows(1200, 1200, 800, 220, "10x6", 30.0, 14.8, 14.8),  # AILERON
+        16: _fw_phys_rows(1000, 1100, 700, 200, "9x5", 25.0, 14.8, 14.8),    # AILERON_SPOILER_FLAPS
+        17: _fw_phys_rows(1000, 1200, 700, 220, "10x6", 25.0, 14.8, 14.8),   # AILERON_VTAIL
+        18: _fw_phys_rows(900, 1380, 600, 220, "10x6", 25.0, 14.8, 11.1),    # RUDDER_ELEVATOR
     }
+
+    # PHYS keys held back in the collapsible "Extended" sub-panel. They are
+    # inferred from the wing planform and only matter to tailed frames, so the
+    # common measured-geometry path stays uncluttered. Planks (elevon/delta)
+    # ignore them and keep the sim's trailing-edge fin fallback.
+    _PHYS_EXTENDED_KEYS = frozenset({
+        'PHYS_TAIL_ARM_MM',
+        'PHYS_STAB_CHORD_MM',
+        'PHYS_STAB_SPAN_MM',
+    })
+
+    # Fixed-wing types with a separate horizontal tailplane: the Extended panel
+    # auto-expands for these so the tail geometry is visible exactly when it is
+    # relevant. Elevon (13) and Delta (14) have no tailplane of their own.
+    _FW_TAILED_TYPES = frozenset({
+        int(AirframeType.eAileronAF),
+        int(AirframeType.eAileronSpoilerFlapsAF),
+        int(AirframeType.eAileronVTailAF),
+        int(AirframeType.eRudderElevatorAF),
+    })
 
     _LAND_PHYS_DEFAULTS = {
         22: [  # TRACKED
@@ -2417,20 +2415,61 @@ class ParameterWindow(QMainWindow):
         af_row.addStretch(1)
         layout.addLayout(af_row)
 
-        # Physical descriptor grid — rebuilt when AF_TYPE changes
+        # Physical descriptor grid — rebuilt when AF_TYPE changes. Both grids
+        # must exist before _build_phys_row() runs, since it populates each.
         self._phys_grid = QGridLayout()
         self._phys_grid.setHorizontalSpacing(6)
         self._phys_grid.setVerticalSpacing(2)
         self._phys_grid.setContentsMargins(0, 0, 0, 0)
+
+        # Collapsible "Extended" sub-panel: inferred tail/stabiliser geometry.
+        # Collapsed by default; auto-expands when a tailed AF type is selected.
+        self._phys_ext_grid = QGridLayout()
+        self._phys_ext_grid.setHorizontalSpacing(6)
+        self._phys_ext_grid.setVerticalSpacing(2)
+        self._phys_ext_grid.setContentsMargins(0, 0, 0, 0)
+
+        self._phys_ext_btn = QToolButton()
+        self._phys_ext_btn.setText("Extended")
+        self._phys_ext_btn.setCheckable(True)
+        self._phys_ext_btn.setChecked(False)
+        self._phys_ext_btn.setArrowType(Qt.RightArrow)
+        self._phys_ext_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._phys_ext_btn.setStyleSheet(
+            "QToolButton { border: none; font-weight: bold; color: #9b59b6; padding: 1px 0; }"
+        )
+        self._phys_ext_btn.toggled.connect(self._toggle_phys_ext)
+        self._phys_ext_btn.hide()
+
+        self._phys_ext_box = QWidget()
+        ext_layout = QVBoxLayout(self._phys_ext_box)
+        ext_layout.setContentsMargins(8, 0, 0, 0)
+        ext_layout.setSpacing(0)
+        ext_layout.addLayout(self._phys_ext_grid)
+        self._phys_ext_box.hide()
+
         self._phys_row = 0
         self._build_phys_row()
+
         layout.addLayout(self._phys_grid)
+        layout.addWidget(self._phys_ext_btn)
+        layout.addWidget(self._phys_ext_box)
 
         self._phys_hover_lbl = QLabel("")
         self._phys_hover_lbl.setStyleSheet("font-weight: bold; font-size: 10px;")
         self._phys_hover_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._phys_hover_lbl.hide()
         layout.addWidget(self._phys_hover_lbl)
+
+        # CG advisory (FW only): grades the entered CG against the planform's
+        # expected %MAC band. A blank/unmeasured CG is called out, never assumed.
+        self._phys_cg_lbl = QLabel("")
+        self._phys_cg_lbl.setWordWrap(True)
+        self._phys_cg_lbl.setStyleSheet("font-weight: bold; font-size: 10px;")
+        self._phys_cg_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._phys_cg_lbl.setToolTip("Balance point graded against the expected %MAC band for this planform")
+        self._phys_cg_lbl.hide()
+        layout.addWidget(self._phys_cg_lbl)
 
         group.setLayout(layout)
         return group
@@ -2462,20 +2501,22 @@ class ParameterWindow(QMainWindow):
                 elif isinstance(widget, QLineEdit):
                     prev_values[key] = widget.text()
 
-        # Clear old widgets from grid
+        # Clear old widgets from both grids
         for key, widget in self._phys_widgets.items():
             grid.removeWidget(widget)
+            self._phys_ext_grid.removeWidget(widget)
             widget.setParent(None)
             widget.deleteLater()
         self._phys_widgets.clear()
 
-        # Clear old labels too
-        while grid.count():
-            item = grid.takeAt(0)
-            w = item.widget()
-            if w:
-                w.setParent(None)
-                w.deleteLater()
+        # Clear old labels too — main grid, then the Extended grid
+        for target in (grid, self._phys_ext_grid):
+            while target.count():
+                item = target.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.setParent(None)
+                    w.deleteLater()
 
         af_combo = self._setup_widgets.get(int(ParamIndex.AF_TYPE))
         cat = 'MR'
@@ -2489,7 +2530,10 @@ class ParameterWindow(QMainWindow):
         self._current_af_type_int = af_type_int
 
         if cat == 'FW':
-            descriptors = self._FW_PHYS_DESCRIPTORS
+            # Per-AF-type geometry defaults (window is crafted by AFType), with
+            # the generic FW list as fallback for any unlisted type.
+            af_specific = self._FW_PHYS_DEFAULTS.get(self._current_af_type_int)
+            descriptors = af_specific if af_specific else self._FW_PHYS_DESCRIPTORS
         elif cat == 'LAND':
             descriptors = self._LAND_PHYS_DESCRIPTORS
         elif cat == 'NONE':
@@ -2502,52 +2546,24 @@ class ParameterWindow(QMainWindow):
             else:
                 descriptors = self._MR_PHYS_DESCRIPTORS
 
-        for i, (key, label, dec, default, tooltip) in enumerate(descriptors):
-            row = i // 3
-            col = i % 3
-            if dec is None:
-                edit = QLineEdit()
-                edit.setText(str(default))
-                edit.setMaximumWidth(70)
-                edit.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                edit.setToolTip(tooltip)
-                edit.setStyleSheet("QLineEdit { padding: 1px 2px; }")
-                edit.textChanged.connect(lambda t, k=key: self._phys_changed(k, user=True))
-                self._phys_widgets[key] = edit
-                grid.addWidget(edit, row, col * 2)
-            else:
-                spin = QDoubleSpinBox()
-                spin.setDecimals(dec)
-                spin.setMaximumWidth(70)
-                spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                spin.setToolTip(tooltip)
-                spin.setStyleSheet("QDoubleSpinBox { padding: 1px 2px; }")
-                # Sensible ranges to catch obviously wrong values
-                if 'AUW' in key:
-                    spin.setRange(50, 20000)
-                elif 'ARM' in key or 'WING' in key or 'CHORD' in key or 'TRACK' in key:
-                    spin.setRange(10, 5000)
-                elif 'WHEEL' in key:
-                    spin.setRange(1, 50)
-                elif 'THRUST_G' in key:
-                    spin.setRange(1, 5000)
-                elif 'THRUST_A' in key:
-                    spin.setRange(0.1, 500)
-                elif 'THRUST_V' in key:
-                    spin.setRange(1, 60)
-                elif 'COUNT' in key:
-                    spin.setRange(1, 16)
-                else:
-                    spin.setRange(0, 99999)
-                spin.setValue(default)
-                spin.valueChanged.connect(lambda v, k=key: self._phys_changed(k, user=True))
-                self._phys_widgets[key] = spin
-                grid.addWidget(spin, row, col * 2)
-            lbl = QLabel(label)
-            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            lbl.setStyleSheet("font-weight: normal;")
-            lbl.setToolTip(tooltip)
-            grid.addWidget(lbl, row, col * 2 + 1)
+        # Split the planform-measured essentials (main grid) from the inferred
+        # tail/stabiliser geometry (Extended sub-panel). Planks carry the keys
+        # too but the sim ignores them, so the panel simply stays collapsed.
+        main_desc = [d for d in descriptors if d[0] not in self._PHYS_EXTENDED_KEYS]
+        ext_desc = [d for d in descriptors if d[0] in self._PHYS_EXTENDED_KEYS]
+
+        for i, spec in enumerate(main_desc):
+            self._add_phys_descriptor(grid, i, *spec)
+        for i, spec in enumerate(ext_desc):
+            self._add_phys_descriptor(self._phys_ext_grid, i, *spec)
+
+        if ext_desc:
+            self._phys_ext_btn.show()
+            if not preserve:
+                self._phys_ext_btn.setChecked(self._current_af_type_int in self._FW_TAILED_TYPES)
+        else:
+            self._phys_ext_btn.setChecked(False)
+            self._phys_ext_btn.hide()
 
         # Re-apply the snapshot for keys present in both the old and new rows so
         # a same-category rebuild (param read/verify/reconnect) keeps the user's
@@ -2563,6 +2579,79 @@ class ParameterWindow(QMainWindow):
             widget.blockSignals(False)
         if self._phys_widgets:
             self._current_phys_meta = self._phys_to_metadata()
+
+    def _add_phys_descriptor(self, grid, index, key, label, dec, default, tooltip):
+        """Create one PHYS descriptor (value widget + label) and place it in grid.
+
+        The value widget is registered in self._phys_widgets so the metadata
+        round-trip (_phys_changed/_phys_to_metadata) sees every key regardless
+        of which grid — main or Extended — it lives in.
+        """
+        row = index // 3
+        col = index % 3
+        if dec is None:
+            edit = QLineEdit()
+            edit.setText(str(default))
+            edit.setMaximumWidth(70)
+            edit.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            edit.setToolTip(tooltip)
+            edit.setStyleSheet("QLineEdit { padding: 1px 2px; }")
+            edit.textChanged.connect(lambda t, k=key: self._phys_changed(k, user=True))
+            self._phys_widgets[key] = edit
+            grid.addWidget(edit, row, col * 2)
+        else:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(dec)
+            spin.setMaximumWidth(70)
+            spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            spin.setToolTip(tooltip)
+            spin.setStyleSheet("QDoubleSpinBox { padding: 1px 2px; }")
+            # Sensible ranges to catch obviously wrong values
+            if key in self._PHYS_EXTENDED_KEYS:
+                # 0 is the sentinel for "unset" — auto-filled from the wing
+                # planform, so it must not be clamped up to the 10 mm floor the
+                # generic chord/arm branch applies.
+                spin.setRange(0, 5000)
+            elif 'AUW' in key:
+                spin.setRange(50, 20000)
+            elif 'ARM' in key or 'WING' in key or 'CHORD' in key or 'TRACK' in key:
+                spin.setRange(10, 5000)
+            elif 'WHEEL' in key:
+                spin.setRange(1, 50)
+            elif 'THRUST_G' in key:
+                spin.setRange(1, 5000)
+            elif 'THRUST_A' in key:
+                spin.setRange(0.1, 500)
+            elif 'THRUST_V' in key:
+                spin.setRange(1, 60)
+            elif 'COUNT' in key:
+                spin.setRange(1, 16)
+            elif 'SWEEP' in key or 'DIHEDRAL' in key:
+                # Tip offset/rise relative to root: signed (anhedral/droop
+                # negative), so allow either side of zero.
+                spin.setRange(-3000, 3000)
+            elif 'CG' in key:
+                spin.setRange(0, 5000)
+            else:
+                spin.setRange(0, 99999)
+            spin.setValue(default)
+            if key == 'PHYS_CG_MM' or key in self._PHYS_EXTENDED_KEYS:
+                # 0 is the sentinel for "not measured/unset" — show a dash, never
+                # a number, so a blank field can never be mistaken for a real 0.
+                spin.setSpecialValueText("—")
+            spin.valueChanged.connect(lambda v, k=key: self._phys_changed(k, user=True))
+            self._phys_widgets[key] = spin
+            grid.addWidget(spin, row, col * 2)
+        lbl = QLabel(label)
+        lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        lbl.setStyleSheet("font-weight: normal;")
+        lbl.setToolTip(tooltip)
+        grid.addWidget(lbl, row, col * 2 + 1)
+
+    def _toggle_phys_ext(self, checked):
+        """Show/hide the Extended PHYS sub-panel and flip its disclosure arrow."""
+        self._phys_ext_box.setVisible(checked)
+        self._phys_ext_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
 
     @staticmethod
     def _parse_prop(text: str) -> tuple:
@@ -2605,6 +2694,9 @@ class ParameterWindow(QMainWindow):
         if user:
             self._set_save_state(True)
 
+        if hasattr(self, '_phys_cg_lbl'):
+            self._update_cg_advisory()
+
         if hasattr(self, '_phys_hover_lbl'):
             cat = self._category_for_af(self._current_af_type)
             if cat == 'NONE':
@@ -2622,6 +2714,52 @@ class ParameterWindow(QMainWindow):
             else:
                 self._phys_hover_lbl.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 10px;")
                 self._phys_hover_lbl.show()
+
+    def _update_cg_advisory(self):
+        """Grade the entered CG against the planform's expected %MAC band (FW only).
+
+        A CG of 0 is the "not measured" sentinel: it is reported as unset and
+        never replaced by a default, so a blank CG can never masquerade as a real
+        balance point. The band is a planform-class heuristic — a plank/flying
+        wing balances far forward of a conventional tailed wing — and is
+        advisory only; the pilot's dive test remains the authority.
+        """
+        if self._current_af_type != 'FW':
+            self._phys_cg_lbl.hide()
+            return
+
+        def _num(key, fallback=0.0):
+            try:
+                return float(self._current_phys_meta.get(key, fallback))
+            except (ValueError, TypeError):
+                return fallback
+
+        cg_mm = _num('PHYS_CG_MM')
+        root_mm = _num('PHYS_ROOT_CHORD_MM', _num('PHYS_CHORD_MM'))
+        tip_mm = _num('PHYS_TIP_CHORD_MM', root_mm)
+        if cg_mm <= 0.0 or root_mm <= 0.0:
+            self._phys_cg_lbl.setText("CG: not set — enter the balance point behind the LE")
+            self._phys_cg_lbl.setStyleSheet("color: #e67e22; font-weight: bold; font-size: 10px;")
+            self._phys_cg_lbl.show()
+            return
+
+        root_m = root_mm / 1000.0
+        tip_m = tip_mm / 1000.0
+        taper = tip_m / root_m
+        mac_m = (2.0 / 3.0) * root_m * (1.0 + taper + taper * taper) / (1.0 + taper)
+        cg_pct = (cg_mm / 1000.0) / mac_m * 100.0 if mac_m > 0.0 else 0.0
+        # Plank / flying-wing types balance much further forward than tailed wings.
+        if self._current_af_type_int in (13, 14):
+            lo, hi, centre = 12.0, 22.0, 16.0
+        else:
+            lo, hi, centre = 20.0, 33.0, 27.0
+        if lo <= cg_pct <= hi:
+            self._phys_cg_lbl.setText(f"CG: {cg_pct:.0f}% MAC — within expected band ({lo:.0f}–{hi:.0f}%)")
+            self._phys_cg_lbl.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 10px;")
+        else:
+            self._phys_cg_lbl.setText(f"CG: {cg_pct:.0f}% MAC — check balance (typical ≈{centre:.0f}%)")
+            self._phys_cg_lbl.setStyleSheet("color: #e67e22; font-weight: bold; font-size: 10px;")
+        self._phys_cg_lbl.show()
 
     # Old → new metadata key migration (backward compat with pre-existing .af files)
     _PHYS_KEY_MAP = {
@@ -3324,11 +3462,47 @@ class ParameterWindow(QMainWindow):
             except (ValueError, TypeError):
                 wingspan_mm = 1800
             wingspan_m = wingspan_mm / 1000.0
+
+            # Root chord is the planform fact the user measures; the mean
+            # aerodynamic chord is derived from it and the taper ratio. The
+            # legacy PHYS_CHORD_MM (average chord) is the fallback for files
+            # written before the root/tip split, so old frames are unchanged.
             try:
-                chord_mm = float(result.get('PHYS_CHORD_MM', 250))
+                root_mm = float(result.get('PHYS_ROOT_CHORD_MM', result.get('PHYS_CHORD_MM', 250)))
             except (ValueError, TypeError):
-                chord_mm = 250
-            chord_m = chord_mm / 1000.0
+                root_mm = 250
+            if root_mm <= 0:
+                root_mm = 250
+            try:
+                tip_mm = float(result.get('PHYS_TIP_CHORD_MM', root_mm))
+            except (ValueError, TypeError):
+                tip_mm = root_mm
+            if tip_mm <= 0:
+                tip_mm = root_mm
+            root_m = root_mm / 1000.0
+            tip_m = tip_mm / 1000.0
+            taper = tip_m / root_m
+            mac_m = (2.0 / 3.0) * root_m * (1.0 + taper + taper * taper) / (1.0 + taper)
+            chord_mm = mac_m * 1000.0
+            chord_m = mac_m
+
+            # Sweep and dihedral are derived from the measured tip offsets; the
+            # half-span is the moment arm for both angles.
+            half_span_m = wingspan_m / 2.0
+            try:
+                tip_sweep_mm = float(result.get('PHYS_TIP_SWEEP_MM', 0))
+            except (ValueError, TypeError):
+                tip_sweep_mm = 0
+            try:
+                tip_dihedral_mm = float(result.get('PHYS_TIP_DIHEDRAL_MM', 0))
+            except (ValueError, TypeError):
+                tip_dihedral_mm = 0
+            if half_span_m > 0:
+                sweep_deg = math.degrees(math.atan2(tip_sweep_mm / 1000.0, half_span_m))
+                dihedral_deg = math.degrees(math.atan2(tip_dihedral_mm / 1000.0, half_span_m))
+            else:
+                sweep_deg = 0.0
+                dihedral_deg = 0.0
             try:
                 prop_in = float(result.get('PHYS_PROP_INCH', 10))
             except (ValueError, TypeError):
@@ -3347,7 +3521,27 @@ class ParameterWindow(QMainWindow):
                 voltage_v = 14.8
             motor_w = current_a * voltage_v
 
-            wing_area = wingspan_m * chord_m
+            wing_area = wingspan_m * (root_m + tip_m) / 2.0
+
+            # Auto-fill tail/stabiliser geometry when blank (0 = unset). A
+            # measured value always wins; these defaults only keep the inferred
+            # geometry sane for frames that never recorded it. tail arm ≈ 3·MAC,
+            # stab chord ≈ 0.4·MAC, and the stab span follows from the assumed
+            # elevator area fraction (0.18·S, matching the sim).
+            tail_arm_mm = float(result.get('PHYS_TAIL_ARM_MM', 0.0) or 0.0)
+            stab_ch_mm = float(result.get('PHYS_STAB_CHORD_MM', 0.0) or 0.0)
+            stab_sp_mm = float(result.get('PHYS_STAB_SPAN_MM', 0.0) or 0.0)
+            if chord_mm > 0:
+                if tail_arm_mm <= 0:
+                    tail_arm_mm = 3.0 * chord_mm
+                    result['PHYS_TAIL_ARM_MM'] = f'{tail_arm_mm:.0f}'
+                if stab_ch_mm <= 0:
+                    stab_ch_mm = 0.4 * chord_mm
+                    result['PHYS_STAB_CHORD_MM'] = f'{stab_ch_mm:.0f}'
+                if stab_sp_mm <= 0 and stab_ch_mm > 0:
+                    elev_area_m2 = 0.18 * wing_area
+                    stab_sp_mm = elev_area_m2 / (stab_ch_mm / 1000.0) * 1000.0
+                    result['PHYS_STAB_SPAN_MM'] = f'{stab_sp_mm:.0f}'
 
             # Moments of inertia (thin plate approximation)
             ixx = mass_kg * wingspan_m * wingspan_m / 12.0
@@ -3367,7 +3561,18 @@ class ParameterWindow(QMainWindow):
 
             result['PHYS_WINGSPAN_M'] = f'{wingspan_m:.4f}'
             result['PHYS_CHORD_M'] = f'{chord_m:.4f}'
+            result['PHYS_MAC_M'] = f'{mac_m:.4f}'
+            result['PHYS_SWEEP_DEG'] = f'{sweep_deg:.1f}'
+            result['PHYS_DIHEDRAL_DEG'] = f'{dihedral_deg:.1f}'
             result['PHYS_WING_AREA'] = f'{wing_area:.4f}'
+
+            # CG as a fraction of MAC (advisory only; omitted when unmeasured).
+            try:
+                cg_mm = float(result.get('PHYS_CG_MM', 0))
+            except (ValueError, TypeError):
+                cg_mm = 0
+            if cg_mm > 0 and mac_m > 0:
+                result['PHYS_CG_PCT_MAC'] = f'{(cg_mm / 1000.0) / mac_m * 100.0:.1f}'
             result['PHYS_IROLL'] = f'{ixx:.6f}'
             result['PHYS_IPITCH'] = f'{iyy:.6f}'
             result['PHYS_IYAW'] = f'{izz:.6f}'

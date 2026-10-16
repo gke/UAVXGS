@@ -29,6 +29,13 @@ from protocol_enums import (
 )
 from parameters import PARAM_DISPLAY_MULT
 
+# Airframe library layout (read-only, ships inside the app):
+#   generic/      curated, supported defaults
+#   contributed/  user submissions promoted by the maintainer at a release (best-effort)
+#   proposed/     developer staging -- present but NOT flight-ready
+#   original/     frozen pre-fork snapshots (never tuned)
+# The user's own airframes are NOT stored here; they live in the user's
+# workspace on their machine. See wiki/docs/Airframe_Library_Layout.md.
 AIRFRAMES_DIR = os.path.join(os.path.dirname(__file__))
 
 LINE_RE = re.compile(r'^\s*(\w+)\s*=\s*(.+?)\s*$')
