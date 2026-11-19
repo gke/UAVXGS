@@ -37,7 +37,6 @@ from protocol_enums import (
     IMU_FILTER_NAMES,
     GYRO_LPF_NAMES,
     ACC_LPF_NAMES,
-    BB_LOG_NAMES,
     MOTOR_STOP_NAMES,
     FAILSAFE_ACTION_NAMES,
     ALL_AIRFRAMES,
@@ -46,7 +45,8 @@ from protocol_enums import (
 from protocol_constants import FlightState, FLIGHT_STATE_NAMES
 from packet_parser import *
 from core.data_manager import data_manager
-from parameters import PARAMETER_DEFS, PARAM_DEFAULTS, PARAM_LIMITS, PARAM_TYPES, PARAM_DISPLAY_MULT, PARAM_SCALES, LEGACY_TAGS, PID_GAIN_TAGS, PARAM_BOOT_REQUIRED
+from core.console import console
+from parameters import PARAMETER_DEFS, PARAM_DEFAULTS, PARAM_LIMITS, PARAM_TYPES, PARAM_DISPLAY_MULT, PID_GAIN_TAGS, PARAM_BOOT_REQUIRED
 from airframes import airframes as af_module
 import workspace
 
@@ -366,8 +366,8 @@ def _fw_phys_rows(auw, wing, thrust, root, prop, curr, volt, batt):
         ("PHYS_TIP_DIHEDRAL_MM", "Tip rise (mm)",     0, 0,      "Wingtip height above the root with the wing level (negative = droops)"),
         ("PHYS_CG_MM",           "CG behind LE (mm)", 0, 0,      "Balance point behind the wing leading edge — leave blank if not measured"),
         ("PHYS_TAIL_ARM_MM",     "Tail arm (mm)",     0, 0,      "Wing root LE to stab LE"),
-        ("PHYS_STAB_CHORD_MM",   "Stab chord (mm)",   0, 0,      "Horizontal stabiliser chord"),
-        ("PHYS_STAB_SPAN_MM",    "Stab span (mm)",    0, 0,      "Horizontal stabiliser span"),
+        ("PHYS_STAB_CHORD_MM",   "Stab chord (mm)",   0, 0,      "Horizontal stabiliser chord (elevon wings: vertical fin chord)"),
+        ("PHYS_STAB_SPAN_MM",    "Stab span (mm)",    0, 0,      "Horizontal stabiliser span (elevon wings: vertical fin height)"),
         ("PHYS_MOTOR_COUNT",     "Motors",            0, 1,      "Number of motors"),
     ]
 
@@ -469,7 +469,7 @@ class ParameterWindow(QMainWindow):
         int(ParamIndex.ALT_POS_KI):       (0.001, 0.005),
         int(ParamIndex.ALT_THROTTLE_COMP_LIMIT): (10.0, 25.0),   # mult 100 — mirrors FC pMaxAltHoldThrComp default 0.25 (aggressive end); min 10% = usable alt authority
         int(ParamIndex.ALT_ROC_KP):       (0.02, 1.5),       # fleet 0.05–1.0
-        int(ParamIndex.UNUSED_ALT_VEL_KI): (0.0003, 0.003),
+        int(ParamIndex.ALT_ROC_KI): (0.0003, 0.003),
         # Navigation
         int(ParamIndex.NAV_POS_KP):       (0.075, 0.3),
         int(ParamIndex.NAV_POS_KI):       (0.006, 0.025),
@@ -648,7 +648,7 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.RX_GEAR_CH, "NavMode", 6),
         (ParamIndex.RX_AUX6_CH, "PassThru", 7),
         (ParamIndex.RX_AUX7_CH, "Dive", 8),
-        (ParamIndex.RX_AUX4_CH, "Trace", 9),
+        (ParamIndex.RX_AUX4_CH, "Aux2", 9),
         (ParamIndex.RX_AUX5_CH, "RateGain", 10),
         (ParamIndex.RX_AUX3_CH, "CamPitch", 11),
     ]
@@ -675,8 +675,8 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.ALT_POS_KI, "Ki Alt", 0.0046),
         (ParamIndex.ALT_POS_INT_LIMIT, "I-Limit", 0.5),
         (ParamIndex.ALT_ROC_KP, "Kp ROC", 0.05),
-        (ParamIndex.UNUSED_ALT_VEL_KI, "Ki ROC", 0.001),
-        (ParamIndex.ALT_LPF, "Alt LPF (Hz)", 10),
+        (ParamIndex.ALT_ROC_KD, "Kd ROC", 0.000416),
+        (ParamIndex.ALT_ROC_KI, "Ki ROC", 0.001),
         (ParamIndex.ALT_HOLD_THR_COMP_DECAY_PERCENT_PS, "Thr Decay (%/s)", 25),
         (ParamIndex.ALT_THROTTLE_COMP_LIMIT, "Thr Comp Limit (%)", 25),
         (ParamIndex.AH_THROTTLE_MOVING_TRIGGER, "Thr Move Trig (%)", 2),
@@ -689,7 +689,7 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.NAV_POS_KI, "Ki Pos", 0.012),
         (ParamIndex.NAV_POS_INT_LIM, "I-Limit (m/s)", 1.0),
         (ParamIndex.NAV_VEL_KP, "Kp Vel", 0.25),
-        (ParamIndex.NAV_POS_INT_LIMIT, "Max Vel (m/s)", 5),
+        (ParamIndex.NAV_MAX_VELOCITY, "Max Vel (m/s)", 5),
         (ParamIndex.NAV_MAX_ANGLE, "Max Angle (Deg)", 25),
         (ParamIndex.NAV_RTH_ALT, "RTH Alt (m)", 10),
         (ParamIndex.NAV_MAG_VAR, "Mag Var (Deg)", 12.8),
@@ -704,7 +704,7 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.MAX_CLIMB_RATE_MP_S, "Climb Shape (m/s)", 3),
         (ParamIndex.SPIRAL_DESCENT_BAND_M, "Spiral Band (m)", 3),
         (ParamIndex.MOTOR_STOP_SEL, "Motor Stop", 0, list(MOTOR_STOP_NAMES.values())),
-        (ParamIndex.BB_LOG_TYPE, "BB Log", 0, list(BB_LOG_NAMES.values())),
+
     ]
     
     GENERAL_PARAMS = [
@@ -748,7 +748,6 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.VOLT_SCALE, "Volt Scale", 19),
         (ParamIndex.CURRENT_SCALE, "Curr Scale", 0),
         (ParamIndex.BATTERY_CAPACITY, "Batt mAH", 1500),
-        (ParamIndex.THROTTLE_GAIN_RATE, "Thr Gain (%)", 0),
     ]
     
     FW_PARAMS = [
@@ -760,9 +759,9 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.RUDDER_MOTOR_FF, "Rudder/Motor FF (%)", 0),
         (ParamIndex.FW_SPOILER_DECAY_PERCENT_PS, "Spoiler Decay (%/s)", 10),
         (ParamIndex.FW_AILERON_DIFFERENTIAL, "Aileron Diff (%)", 40),
-        (ParamIndex.FW_ROLL_AUTHORITY, "Roll Auth (%)", 25),
-        (ParamIndex.FW_PITCH_AUTHORITY, "Pitch Auth (%)", 25),
-        (ParamIndex.FW_YAW_AUTHORITY, "Yaw Auth (%)", 25),
+        (ParamIndex.FW_ROLL_AUTHORITY, "Roll Auth (%)", 100),
+        (ParamIndex.FW_PITCH_AUTHORITY, "Pitch Auth (%)", 100),
+        (ParamIndex.FW_YAW_AUTHORITY, "Yaw Auth (%)", 100),
         (ParamIndex.FW_BOARD_PITCH_ANGLE, "Board Pitch (Deg)", 0),
     ]
 
@@ -822,7 +821,6 @@ class ParameterWindow(QMainWindow):
         self.servo_sense_checks = []
         self._current_airframe_path = None
         self._airframe_limits: Dict[int, Tuple[float, float]] = {}  # .af [LIMITS] raw ranges
-        self._legacy_mode = False  # default OFF: unified raw float display (see legacy_check init)
         self._flash_airframe_name = None  # single source of truth: name from FC config flash
         self._generic_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'generic')
         self._user_dir = workspace.airframes_dir()
@@ -868,7 +866,7 @@ class ParameterWindow(QMainWindow):
         """Send debug message to parent window's log if available"""
         if self.parent_window and hasattr(self.parent_window, 'log_debug'):
             self.parent_window.log_debug(msg, "Info")
-        print(msg)
+        console(msg)
     
 
     
@@ -925,22 +923,26 @@ class ParameterWindow(QMainWindow):
         return PARAM_TYPES.get(idx, 'U8') == 'FLOAT'
 
     def _display_mult(self, idx: int) -> float:
-        """Effective display multiplier for a param index.
-
-        Normal mode:  raw * PARAM_DISPLAY_MULT[idx]
-        Legacy mode (for indices in LEGACY_TAGS):  raw / PARAM_SCALES[idx]
-        The write path divides by this same factor, so the raw float32
-        value sent to / read from the FC is identical in both modes.
-        """
-        if self._legacy_mode and idx in LEGACY_TAGS:
-            return 1.0 / PARAM_SCALES.get(idx, 1.0)
+        """Effective display multiplier for a param index: PARAM_DISPLAY_MULT[idx]."""
         return PARAM_DISPLAY_MULT.get(idx, 1.0)
 
     def _param_limits(self, idx: int) -> Tuple[float, float]:
-        """Effective raw (lo, hi) for a param — .af [LIMITS] range if present,
-        else the derived class ceiling from PARAM_LIMITS."""
-        return self._airframe_limits.get(idx,
-                                         PARAM_LIMITS.get(idx, (0.0, 255.0)))
+        """Effective raw (lo, hi) for a param: the ParamTable row, NARROWED by the
+        .af [LIMITS] band when that band is a genuine subset of it.
+
+        The [LIMITS] block is a display-only narrowing, so it may only ever
+        tighten the row. Returning the band un-intersected let an .af file widen
+        the spinbox past the FC's own clamp — the breach this table exists to
+        prevent. A band wider than the row, or one that does not overlap it at
+        all, is ignored: the row is what the FC stores.
+        """
+        row = PARAM_LIMITS.get(idx, (0.0, 255.0))
+        band = self._airframe_limits.get(idx)
+        if band is None:
+            return row
+        lo = max(row[0], band[0])
+        hi = min(row[1], band[1])
+        return (lo, hi) if lo <= hi else row
 
     def _min_decimals(self, idx: int, dec: int) -> int:
         """PID/gain terms (the 18 values across Roll/Pitch/Yaw/Alt/Nav) always
@@ -949,6 +951,16 @@ class ParameterWindow(QMainWindow):
         if idx in PID_GAIN_TAGS and dec < 4:
             return 4
         return dec
+
+    def _gain_step(self, idx: int, step: float, dec: int):
+        """Force the step to the display resolution on the PID/gain rows whose
+        _min_decimals floor exceeds the span/50 step: 0.02 arrows on a
+        0.0001-1.0 range cannot reach any intermediate value, so the step
+        becomes the last displayed decimal (0.0001)."""
+        min_dec = self._min_decimals(idx, dec)
+        if min_dec > dec:
+            step = 10 ** -min_dec
+        return step, min_dec
 
     def _resolve_combo_index(self, widget, value) -> int:
         """Return the combo index whose itemData == value, appending a marked
@@ -974,56 +986,6 @@ class ParameterWindow(QMainWindow):
         self._log(f"  ⚠️ Param value {int_value} not in combo data domain; "
                   f"appended '? Unknown ({int_value})' carrying the true value")
         return cb_idx
-
-    def _on_legacy_toggled(self, checked: bool):
-        self._legacy_mode = checked
-        self._refresh_legacy_display()
-
-    def _refresh_legacy_display(self):
-        """Re-apply display multiplier to all QDoubleSpinBox params in-place.
-
-        For each spinbox: read current value, divide by the OLD mult to
-        recover the raw float32, then set the new range and value using
-        the NEW (possibly legacy) mult.  The raw value is preserved.
-        """
-        if self._legacy_mode:
-            prev_mult_fn = lambda i: PARAM_DISPLAY_MULT.get(i, 1.0)
-        else:
-            prev_mult_fn = lambda i: (1.0 / PARAM_SCALES.get(i, 1.0)
-                                      if i in LEGACY_TAGS
-                                      else PARAM_DISPLAY_MULT.get(i, 1.0))
-        for idx, widget in self.params.items():
-            if not isinstance(widget, QDoubleSpinBox):
-                continue
-            try:
-                raw = widget.value() / prev_mult_fn(idx)
-            except (ZeroDivisionError, ValueError):
-                continue
-            new_mult = self._display_mult(idx)
-            limits = self._param_limits(idx)
-            lo = limits[0] * new_mult
-            hi = limits[1] * new_mult
-            span = hi - lo
-            step = max(0.001, span / 50.0)
-            if new_mult == 100:
-                step = 1.0
-            if idx in (68,) and step < 1.0:
-                step = 1.0
-            if idx in ONE_DECIMAL_LIMIT_TAGS:
-                step = 0.1
-            dec = max(0, min(6, -int(math.floor(math.log10(step)))))
-            # PID/gain terms: keep at least 4 decimals in every display mode
-            if idx in PID_GAIN_TAGS:
-                dec = max(dec, 4)
-            if new_mult not in (1.0, 100.0) and dec == 0 and step > 0.1:
-                step = 0.1
-                dec = 1
-            widget.blockSignals(True)
-            widget.setRange(lo, hi)
-            widget.setDecimals(dec)
-            widget.setSingleStep(step)
-            widget.setValue(max(lo, min(hi, raw * new_mult)))
-            widget.blockSignals(False)
 
     def update_params_from_typed(self, typed_data):
         """Update parameters from tag 17 packet — handles verify + normal update"""
@@ -1543,6 +1505,8 @@ class ParameterWindow(QMainWindow):
                 "border: 1px solid #95a5a6; border-radius: 3px;")
             self.commit_btn.setText("Commit to FC")
             self.commit_btn.setEnabled(False)
+        if getattr(self.parent_window, '_tx_muted', False):
+            self.commit_btn.setEnabled(False)
 
     def _mark_dirty(self):
         """A local edit (or an airframe load) leaves flash behind: go red.
@@ -1765,17 +1729,6 @@ class ParameterWindow(QMainWindow):
         self._advanced_checkbox.toggled.connect(self._on_advanced_toggled)
         advanced_row.addWidget(self._advanced_checkbox)
 
-        self.legacy_check = QCheckBox("Legacy")
-        self.legacy_check.setToolTip("Display legacy-tagged params as raw/scale (classic FC units)")
-        self.legacy_check.toggled.connect(self._on_legacy_toggled)
-        # Initial state mirrors __init__'s _legacy_mode (False = unified raw
-        # display). Widgets are already built in unified units via _display_mult,
-        # so set the visual state WITHOUT firing a redundant refresh (would
-        # double-convert when the user later toggles legacy on).
-        self.legacy_check.blockSignals(True)
-        self.legacy_check.setChecked(self._legacy_mode)
-        self.legacy_check.blockSignals(False)
-        advanced_row.addWidget(self.legacy_check)
         advanced_row.addStretch(1)
         self.param_layout.addLayout(advanced_row)
         
@@ -2315,7 +2268,7 @@ class ParameterWindow(QMainWindow):
         # fleet character-curve machinery computes gains from AF type + slider +
         # physics, but angle gains are now locked-derived
         # (QKp = RateMax/(2·sin(AngleMax/2))) and rate gains are pot-bracketed
-        # (Ch10) + trace-measured per airframe, so the slider has no seat in the
+        # (Ch10) + identify-measured per airframe, so the slider has no seat in the
         # field workflow. Set UAVXGS_DEV_TUNE_SLIDER=1 to restore the full row
         # (all widgets are still constructed so compute_defaults /
         # _get_scale_factors / reset_to_computed / metadata round-trip stay
@@ -2956,9 +2909,9 @@ class ParameterWindow(QMainWindow):
         self._cascade_warnings = caveats
         if caveats:
             caveat_str = "\n".join(caveats)
-            print(f"⚠️ Cascade integrity caveats: {len(caveats)}")
+            console(f"⚠️ Cascade integrity caveats: {len(caveats)}")
             for c in caveats:
-                print(f"   - {c}")
+                console(f"   - {c}")
             if hasattr(self, '_sim_btn') and self._sim_btn:
                 self._sim_btn.setText(f"Cascade caveats: {len(caveats)}")
             new_msg = self._last_caveat_msg != caveat_str
@@ -4199,7 +4152,7 @@ class ParameterWindow(QMainWindow):
 
         self.config1_checks = []
         config1_bits = [
-            ("Ext Mag", 0), ("Autoland", 1), ("Use Mag", 2),
+            ("Ext Mag", 0), ("Autoland", 1), ("Unused 1-2", 2, True),
             ("Emulation", 3, True, "Emulation disabled — commissioning is real flight only."),
             ("AH Alarm", 4), ("GPS Alt", 5),
             ("Unused 1-6", 6, True), ("Clamp", 7),
@@ -4220,7 +4173,7 @@ class ParameterWindow(QMainWindow):
         self.config2_checks = []
         config2_bits = [
             ("Batt Comp", 0), ("Unused 2-1", 1, True), ("Unused 2-2", 2, True),
-            ("Have GPS", 3), ("Prop In", 4), ("Turn WP", 5), ("Beep WP", 6),
+            ("Unused 2-3", 3, True), ("Prop In", 4), ("Turn WP", 5), ("Beep WP", 6),
             ("Unused 2-7", 7, True),
         ]
         for i, item in enumerate(config2_bits):
@@ -4229,16 +4182,18 @@ class ParameterWindow(QMainWindow):
             cb = QCheckBox(name)
             cb.setProperty("bit", bit)
             cb.stateChanged.connect(lambda s, b=bit: self.bit_changed(ParamIndex.CONFIG2_BITS, b, s))
-            if name == "Have GPS":
-                cb.setToolTip("Sets/clears FC HaveGPS (drives InitialisingGPS / no-GPS boot):\n"
-                              "bit SET = GPS required (waits for a fix),\n"
-                              "bit CLEAR = no GPS - FC skips InitialisingGPS and flies without a satellite fix")
-            elif bit == 1:
+            if bit == 1:
                 cb.setEnabled(False)
                 cb.setToolTip("Unused — free config bit (Config2 bit 1), was Fast Start.\n"
                               "FastStart only skipped the gyro grab; the grab now always runs "
                               "and falls back on the stored bias, and a never-calibrated FC is "
                               "blocked from arming by the FC instead.")
+            elif bit == 3:
+                cb.setEnabled(False)
+                cb.setToolTip("Unused — free config bit (Config2 bit 3), was Have GPS.\n"
+                              "A receiver is used when one is wired and speaks UBX; the FC "
+                              "latches presence from the first valid packet, so there is no "
+                              "permission bit. To fly without GPS, disconnect it.")
             elif unused:
                 cb.setEnabled(False)
                 cb.setToolTip(f"Unused — free config bit (Config2 bit {bit}). Available for a future feature.")
@@ -4347,7 +4302,14 @@ class ParameterWindow(QMainWindow):
         if idx_int in ONE_DECIMAL_LIMIT_TAGS:
             step = 0.1
             dec = 1
-        dec = self._min_decimals(idx_int, dec)
+        # Degree rows (radians displayed as degrees) step 0.5°; percent rows step 1%
+        if abs(mult - 57.29577951308231) < 1e-9:
+            step = 0.5
+            dec = max(dec, 1)
+        elif mult == 100:
+            step = 1.0
+            dec = max(dec, 0)
+        step, dec = self._gain_step(idx_int, step, dec)
         # Built-in default is expressed in unified (normal) display units;
         # project it through the classic scaling so the initial value matches
         # this box's (possibly legacy-scaled) range.  Untagged params are
@@ -4450,9 +4412,10 @@ class ParameterWindow(QMainWindow):
         """Current value of a config-bitmask parameter, or None if unknown.
 
         Other windows need this to mirror FC gate conditions that depend on
-        config bits - e.g. the calibration window must know whether UseMag is
-        set before it can say an uncalibrated mag "blocks arming", because the
-        FC's CalibrationSufficient() only demands it when MagInUse() holds.
+        config bits - e.g. the calibration window must know whether a mag is
+        fitted before it can say an uncalibrated mag "blocks arming", because
+        the FC's PreflightBlocks() only demands mag calibration when MagInUse()
+        holds.
         Returns None rather than 0 when the value has not been read back yet,
         so a caller can tell "not known" from "known to be clear".
         """
@@ -4602,7 +4565,8 @@ class ParameterWindow(QMainWindow):
             if widget is not None:
                 if isinstance(widget, QDoubleSpinBox):
                     mult = self._display_mult(i)
-                    vals.append(widget.value() / mult)
+                    vals.append(af_module.require_finite(
+                        i, widget.value() / mult, "param save"))
                 elif isinstance(widget, QComboBox):
                     data = widget.itemData(widget.currentIndex())
                     if data is None:
@@ -4610,9 +4574,11 @@ class ParameterWindow(QMainWindow):
                             f"Combo param {i} selection has no data "
                             f"(index {widget.currentIndex()}) — refusing to save "
                             f"a positional index as the value")
-                    vals.append(float(data))
+                    vals.append(af_module.require_finite(i, float(data),
+                                                         "param save"))
                 elif isinstance(widget, QSpinBox):
-                    vals.append(float(widget.value()))
+                    vals.append(af_module.require_finite(i, float(widget.value()),
+                                                         "param save"))
                 else:
                     vals.append(0.0)
             else:
@@ -4653,15 +4619,68 @@ class ParameterWindow(QMainWindow):
                 image.append(float(self._fc_readback_float[i]))
             else:
                 image.append(0.0)
-        return image
+        return self._clamp_image_to_rows(image)
+
+    @staticmethod
+    def _row_safe_value(idx: int, value: float) -> float:
+        """Return `value` as the FC could actually store it: finite, inside the
+        ParamTable row.
+
+        This is the single choke point for the "the GCS can never send the FC a
+        value outside its own bounds" guarantee. It matters because the row is
+        the FC's clamp: a value outside it would be silently substituted on
+        arrival, and the post-commit tag-71 comparison would then report a
+        mismatch as a WRITE alarm even though nothing was wrong with flash.
+        Non-finite values have no valid clamp at all (a NaN compares false
+        against both bounds), so they are replaced rather than clamped.
+        """
+        lo, hi = PARAM_LIMITS.get(idx, (0.0, 255.0))
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return min(max(0.0, lo), hi)
+        if not math.isfinite(v):
+            return min(max(0.0, lo), hi)
+        if v < lo:
+            return lo
+        if v > hi:
+            return hi
+        return v
+
+    def _clamp_image_to_rows(self, image: List[float]) -> List[float]:
+        """Force a whole commit image inside the ParamTable rows, reporting what
+        moved. A silent clamp would hide a real .af or estimator defect, so any
+        adjustment is logged; an unadjusted image logs nothing.
+        """
+        moved = []
+        out = []
+        for i, raw in enumerate(image):
+            v = self._row_safe_value(i, raw)
+            if not (v == raw):
+                moved.append((i, raw, v))
+            out.append(v)
+        if moved:
+            def fmt(x):
+                return "nan/inf" if not math.isfinite(float(x)) else ("%.7g" % x)
+            shown = ", ".join("%d: %s->%s" % (i, fmt(a), fmt(b))
+                              for i, a, b in moved[:8])
+            extra = "" if len(moved) <= 8 else " (+%d more)" % (len(moved) - 8)
+            self._log("  [!] Commit image forced inside ParamTable rows: %s%s"
+                      % (shown, extra))
+        return out
 
     def _apply_airframe_limits(self):
         """Re-apply spinbox ranges from the current .af [LIMITS] block (raw
-        limits × display mult), falling back to the class-ceiling PARAM_LIMITS
-        for tags without a [LIMITS] entry. If a loaded value already sits
-        outside the new range the bound is widened to contain it, never the
-        value silently clamped (setRange would otherwise inflate/deflate a
-        stale .af gain into the range — the Shadow 'way too high' trap).
+        limits × display mult), falling back to the ParamTable row for tags
+        without a [LIMITS] entry.
+
+        If a loaded value already sits outside that range the WIDGET bound is
+        widened to contain it, never the value silently clamped: setRange would
+        otherwise inflate/deflate a stale .af gain on display (the Shadow 'way
+        too high' trap). Widening is DISPLAY ONLY and confers no write authority
+        — build_raw_image() clamps the commit image to the ParamTable row and
+        logs whatever it moved, so a widened spinbox can never put a value
+        outside the FC's own clamp on the wire.
         """
         for idx, widget in self.params.items():
             if not isinstance(widget, QDoubleSpinBox):
@@ -4686,7 +4705,16 @@ class ParameterWindow(QMainWindow):
             if idx_int in (84, 85) and step > 0.01:
                 step = 0.01
                 dec = 2
-            dec = self._min_decimals(idx_int, dec)
+            if idx_int in ONE_DECIMAL_LIMIT_TAGS:
+                step = 0.1
+                dec = 1
+            if abs(mult - 57.29577951308231) < 1e-9:
+                step = 0.5
+                dec = max(dec, 1)
+            elif mult == 100:
+                step = 1.0
+                dec = max(dec, 0)
+            step, dec = self._gain_step(idx_int, step, dec)
             current = widget.value()
             if current < lo:
                 lo = current
@@ -4707,7 +4735,16 @@ class ParameterWindow(QMainWindow):
             if idx_int in (84, 85) and step > 0.01:
                 step = 0.01
                 dec = 2
-            dec = self._min_decimals(idx_int, dec)
+            if idx_int in ONE_DECIMAL_LIMIT_TAGS:
+                step = 0.1
+                dec = 1
+            if abs(mult - 57.29577951308231) < 1e-9:
+                step = 0.5
+                dec = max(dec, 1)
+            elif mult == 100:
+                step = 1.0
+                dec = max(dec, 0)
+            step, dec = self._gain_step(idx_int, step, dec)
             widget.blockSignals(True)
             widget.setRange(lo, hi)
             widget.setDecimals(dec)
@@ -4855,17 +4892,18 @@ class ParameterWindow(QMainWindow):
             self._log(f"  ❌ Airframe file not found: {path}")
             return
 
-        reply = QMessageBox.question(
-            self,
-            "Airframe Defaults",
-            f"Load defaults for \"{name}\"?\n\n"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Airframe Defaults")
+        box.setText(f"Load defaults for \"{name}\"?")
+        box.setInformativeText(
             "This replaces the current parameter values in the UI only —\n"
             "nothing is sent to the flight controller yet. Press Commit to\n"
-            "write the new set to flash and restart the FC.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        if reply == QMessageBox.No:
+            "write the new set to flash and restart the FC.")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        self._place_at_main(box)
+        if box.exec_() == QMessageBox.No:
             return
 
         try:
@@ -4898,7 +4936,7 @@ class ParameterWindow(QMainWindow):
         self.reset_write_button()
         self.reset_read_button()
 
-        # Widen every spinbox to the class ceiling FIRST so no loaded value is
+        # Widen every spinbox to the ParamTable row FIRST so no loaded value is
         # clamped by the previous-load (stale) or factory range, THEN set
         # values, then narrow to the .af [LIMITS] tuning range (the shrink
         # guard in _apply_airframe_limits keeps any out-of-range stale value
@@ -4906,7 +4944,7 @@ class ParameterWindow(QMainWindow):
         self._airframe_limits = {}
         self._apply_airframe_limits()
         self._set_widgets_from_raw(raw_values)
-        # Apply .af [LIMITS] tuning ranges (fallback = class-ceiling PARAM_LIMITS)
+        # Apply .af [LIMITS] tuning ranges (fallback = the ParamTable row)
         self._airframe_limits = dict(meta.get('LIMITS', {}) or {})
         self._apply_airframe_limits()
         self.update_config_display()
@@ -5181,8 +5219,6 @@ class ParameterWindow(QMainWindow):
 
     def save_params(self):
         from datetime import datetime
-        raw_vals = self._raw_float_values()
-        raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
         
         # Generate physics summary for filename
         phys_meta = self._phys_to_metadata()
@@ -5216,6 +5252,8 @@ class ParameterWindow(QMainWindow):
         if not path.lower().endswith(".af"):
             path += ".af"
         try:
+            raw_vals = self._raw_float_values()
+            raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
             metadata = {}
             if self._character_slider:
                 metadata['Character'] = str(self._character_slider.value())
@@ -5239,12 +5277,26 @@ class ParameterWindow(QMainWindow):
         flash on connect, or the file just loaded)."""
         self._user_dir = workspace.airframes_dir()
         dialog = AfLoadDialog(self, classify_fn=self._category_for_af_file)
+        self._place_at_main(dialog)
         if dialog.exec_() != QDialog.Accepted:
             return
         path = dialog.get_selected_path()
         if not path:
             return
         self._load_airframe(path)
+
+    def _place_at_main(self, dialog):
+        """Put a modal dialog at this window's top-left before it is shown.
+
+        Qt leaves a parented dialog wherever the window manager decides, so
+        the airframe prompts landed in an arbitrary spot on the screen
+        instead of where the operator is working. adjustSize() first so the
+        move is to the final size and the WM has nothing left to re-centre.
+        """
+        win = self.window()
+        if win is not None:
+            dialog.adjustSize()
+            dialog.move(win.geometry().topLeft())
 
     def _get_param_value(self, idx):
         """Safely get parameter value from widget"""
@@ -5417,13 +5469,11 @@ class ParameterWindow(QMainWindow):
                     combo.blockSignals(False)
         
         # Defaults: Config1 = RTHDescend|AltHoldAlarm, mirroring the FC's
-        # DEFAULT_CONFIG1 in params.c. It was EnforceDriveSymmetry|UsingMag here,
-        # which disagreed with both the FC default and Config1Bits.DEFAULT - the
-        # two GCS sites had drifted. eUsingMag is dropped for the arming-deadlock
-        # reason recorded at Config1Bits.DEFAULT; Config2 = Batt Comp + GPS +
-        # Nav Beep (matches the fleet-wide retune sweep).
+        # DEFAULT_CONFIG1 in params.c; Config2 = Batt Comp + Nav Beep, mirroring
+        # DEFAULT_CONFIG2. Both the Use Mag and Have GPS permission bits are
+        # retired — presence of the device decides, not a declaration.
         self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.eUseRTHDescend | Config1Bits.eUseAltHoldAlarm))
-        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseGPS | Config2Bits.eUseNavBeep))
+        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseNavBeep))
         
         self.update_config_display()
         self.update_rc_display()
@@ -5512,6 +5562,11 @@ class ParameterWindow(QMainWindow):
             self._apply_retry_pending = True
             self._log("⚠️ Apply & Reboot already in progress — queued; will run when the current commit cycle resolves")
             self.status_label.setText("⏳ Commit in progress — apply queued (waiting)")
+            self.status_label.setStyleSheet("color: #f39c12;")
+            return
+        if getattr(self.parent_window, '_tx_muted', False):
+            self._log("  🔇 FC still booting (no tag 79 yet) - commit refused")
+            self.status_label.setText("🔇 FC booting — commit once it is up")
             self.status_label.setStyleSheet("color: #f39c12;")
             return
         if not (self.parent_window and getattr(self.parent_window, 'connected', False)):

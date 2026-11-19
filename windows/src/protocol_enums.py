@@ -29,25 +29,22 @@ class PacketTag(IntEnum):
     UNUSED_ENVIRONMENT = 11
     UNUSED_BEACON = 12
     # UAVX packets start at 13
+    # --- Flight / Nav / Control / RC / Config ---
     FLIGHT = 13
     NAV_UAVX = 14
     UNUSED_STATS = 15
     CONTROL = 16
-    PARAM = 17
     MIN = 18
     ORIGIN = 19
     WP = 20
     UNUSED_MISSION = 21
     RC_CHANNELS = 22
-
+    # --- Parameter block (write / readback / commit / image) ---
+    PARAM = 17
     PARAM_TAGGED_READ = 71
     PARAM_COMMIT = 72
-    TEST_REQUEST = 73
-    TEST_RESPONSE = 74
-    AFNAME_SET = 75
-    I2C_ERRORS = 76
     PARAM_IMAGE = 77
-    REBOOT = 78
+    # --- Miscellaneous / request-response ---
     REQUEST = 50
     ACK = 51
     MISC = 52
@@ -56,8 +53,15 @@ class PacketTag(IntEnum):
     UNUSED_INERTIAL = 55
     UNUSED_MINIMOSD = 56
     TUNING = 57
-    UNUSED_UKF = 58
+    META_REQ = 58
     GUIDANCE = 59
+    # --- Test / setup ---
+    TEST_REQUEST = 73
+    TEST_RESPONSE = 74
+    AFNAME_SET = 75
+    I2C_ERRORS = 76
+    REBOOT = 78
+    STATE = 79  # flight/boot-state breadcrumb, one byte, emitted on change
     UNUSED_ALTITUDE_CONTROL = 60
     UNUSED_SOARING = 61
     CALIBRATION = 62
@@ -96,7 +100,7 @@ class MiscCommand(IntEnum):
     CAL_MAG = 1           # Calibrate Magnetometer
     LB = 2                # Loopback test
     UNUSED = 3            # Unused
-    BB_DUMP = 4           # Dump Black Box
+    BB_DUMP_UNUSED = 4    # slot retained: black-box dump removed with Trace 2026-11-19
     GPS_PASS_THRU_UNUSED = 5   # Slot retained: GPS pass-through removed
     CAL_ACC = 6           # Calibrate Accelerometer only
     # Slot 7 retained, retired 2026-09-28. Was the blocking two-temperature
@@ -110,7 +114,8 @@ class MiscCommand(IntEnum):
     # Slot 9 = GPS_INIT reserved (removed: blocked the FC main loop ~9.4s → IWDG reset)
     FORCE_DEFAULTS = 10   # Reset all params to embedded defaults
     SET_NAV_MODE = 11     # Set NavMode RC channel value: 0=Low(PIC), 1=Middle(Hold/Mission), 2=High(RTH)
-    CYCLE_BB_LOG = 12     # Cycle black box log type
+    # Slot 12 retained: black-box log cycling removed with the black-box remnants 2026-11-19. Wire value kept so ESC_PROG=13 does not shift.
+    CYCLE_BB_LOG_UNUSED = 12
     ESC_PROG = 13         # Enter ESC programming (4way/MSP runtime feed-through)
 
 
@@ -134,18 +139,6 @@ class TelemetryType(IntEnum):
 
 
 # ============================================================================
-# In-Flight Logs (from telem.h inflightLogs enum)
-# ============================================================================
-class InflightLog(IntEnum):
-    """In-flight log types - matches telem.h inflightLogs"""
-    eLogUAVX = 0
-    eLogAltitude = 1
-    eLogPitch = 2
-    eLogRoll = 3
-    eLogYaw = 4
-
-
-# ============================================================================
 # RC Controls (from params.h RCControls enum)
 # ============================================================================
 class RCControl(IntEnum):
@@ -159,7 +152,7 @@ class RCControl(IntEnum):
     eNavModeRC = 6
     ePassThruRC = 7
     eDiveRC = 8
-    eTraceRC = 9
+    eAux2ServoRC = 9
     eTransitionRC = 10
     eAux1CamPitchRC = 11
     eNullRC = 12
@@ -173,6 +166,18 @@ RC_DEFAULT_US = (1000, 1500, 1500, 1500, 1000, 1000, 1000, 1000,
                  1000, 1000, 1500, 1500, 1000, 1000, 1000, 1000)
 RC_FAILSAFE_US = (1000, 1500, 1500, 1500, 1000, 1000, 2000, 1000,
                   1000, 1000, 1500, 1500, 1000, 1000, 1000, 1000)
+
+
+# ============================================================================
+# Serial port selectors (from harness.h SerialPortSelectors)
+# ============================================================================
+class SerialPort(IntEnum):
+    USB = 0
+    USART1 = 1
+    USART2 = 2
+    USART3 = 3
+    UART4 = 4
+    UART5 = 5
 
 
 # ============================================================================
@@ -601,7 +606,6 @@ class Config1Bits(IntFlag):
     """Config1 bit masks - matches params.h Config1"""
     eUseInvertMag = 0x01           # bit 0
     eUseRTHDescend = 0x02          # bit 1
-    eUsingMag = 0x04              # bit 2
     eEmulationEnable = 0x08         # bit 3
     eUseAltHoldAlarm = 0x10       # bit 4
     eUseOffsetHome = 0x20          # bit 5
@@ -613,11 +617,16 @@ class Config1Bits(IntFlag):
     eUnused1_6 = 0x40
     eTestMission = eUnused1_6      # legacy .af token — do not re-use
 
+    # bit 2 — FREE (was Use Mag). A magnetometer is used when one is fitted and
+    # answers its probe (F.HaveMag); presence alone decides fusion,
+    # so there is no permission to withdraw. Absent an override bit a pilot who
+    # does not want the compass disconnects it, which is the physical statement
+    # of the same intent. eUsingMag is kept as an alias because every
+    # generic/*.af carries CONFIG1_BITS=eUseRTHDescend|eUsingMag.
+    eUnused1_2 = 0x04
+    eUsingMag = eUnused1_2         # legacy .af token — do not re-use
+
     # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm.
-    # eUsingMag is NOT in the default (2026-09-29): most target boards have no
-    # magnetometer fitted, and with the bit set the FC's arming gate demands a
-    # mag calibration that cannot be obtained. The bit remains settable as an
-    # operator override to ignore a present-but-untrustworthy mag.
     DEFAULT = eUseRTHDescend | eUseAltHoldAlarm
 
 
@@ -636,14 +645,18 @@ class Config2Bits(IntFlag):
     eUnused2_2 = 0x04              # bit 2 — FREE (was UseESCProg). ESC-Prog is now
                                    # runtime-triggered via the GCS ESC button (miscESCProg),
                                    # so it needs no config bit. Available for a future feature.
-    eUseGPS = 0x08             # bit 3
+    eUnused2_3 = 0x08              # bit 3 — FREE (was Have GPS). A receiver is
+                                   # used when one is wired and speaks UBX; the
+                                   # FC latches presence from the first valid
+                                   # packet. eUseGPS kept as a legacy .af token.
+    eUseGPS = eUnused2_3           # legacy .af token — do not re-use
     ePropsInwards = 0x10           # bit 4 — SET = front two props rotate INWARDS (usual convention)
     eUseTurnToWP = 0x20           # bit 5
     eUseNavBeep = 0x40             # bit 6
     eUnused2_7 = 0x80              # bit 7 — FREE. Available for a future feature.
 
-    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|GPS|NavBeep
-    DEFAULT = eUseBatteryComp | eUseGPS | eUseNavBeep
+    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|NavBeep
+    DEFAULT = eUseBatteryComp | eUseNavBeep
 
 
 # ============================================================================
@@ -728,7 +741,7 @@ class ParamIndex(IntEnum):
     YAW_RATE_KP = 10           # 11
     ROLL_RATE_KD = 11          # 12
     IMU_FILT_TYPE = 12         # 13
-    BB_LOG_TYPE = 13           # 14
+    UNUSED_14 = 13            # 14 (was BB_LOG_TYPE; black-box removed 2026-11-19)
     RX_TYPE = 14               # 15
     CONFIG1_BITS = 15          # 16
     RX_THROTTLE_CH = 16        # 17
@@ -744,18 +757,18 @@ class ParamIndex(IntEnum):
     SERVO_LPF_HZ = 26          # 27
     PITCH_RATE_KD = 27         # 28
     NAV_VEL_KP = 28            # 29
-    UNUSED_ALT_VEL_KP = 29     # 30
+    ALT_ROC_KD = 29            # 30
     HORIZON = 30               # 31
     MADGWICK_KP_MAG = 31       # 32
     NAV_RTH_ALT = 32           # 33
     NAV_MAG_VAR = 33           # 34
     UNUSED_SENSOR_HINT = 34    # 35
     ESC_TYPE = 35              # 36
-    RC_CHANNELS = 36           # 37
+    UNUSED_37 = 36             # 37
     RX_ROLL_CH = 37            # 38
     MADGWICK_KP_ACC = 38       # 39
     ROLL_CAM_TRIM = 39         # 40
-    NAV_POS_INT_LIMIT = 40     # 41
+    NAV_MAX_VELOCITY = 40      # 41
     RX_PITCH_CH = 41           # 42
     RX_YAW_CH = 42             # 43
     AF_TYPE = 43               # 44
@@ -772,7 +785,7 @@ class ParamIndex(IntEnum):
     RX_AUX2_CH = 54            # 55 - RCMap3
     RX_AUX3_CH = 55            # 56 - RCMap4
     NAV_POS_KP = 56            # 57
-    ALT_LPF = 57               # 58
+    UNUSED_58 = 57             # 58
     BALANCE = 58               # 59
     RX_AUX4_CH = 59            # 60 - RCMap5
     NAV_POS_KI = 60            # 61
@@ -807,7 +820,7 @@ class ParamIndex(IntEnum):
     ACC_LPF_SEL = 89           # 90
     YAW_RATE_KD = 90           # 91
     UNUSED_92 = 91             # 92
-    THROTTLE_GAIN_RATE = 92    # 93
+    UNUSED_93 = 92             # 93
     RX_AUX5_CH = 93            # 94 - RCMap6
     RX_AUX6_CH = 94            # 95 - RCMap7
     RX_AUX7_CH = 95            # 96 - RCMap8
@@ -816,15 +829,15 @@ class ParamIndex(IntEnum):
     YAW_ANGLE_Q_INT_LIMIT = 98   # 99
     ALT_POS_INT_LIMIT = 99     # 100
     MOTOR_STOP_SEL = 100       # 101
-    UNUSED_ALT_VEL_KI = 101    # 102
+    ALT_ROC_KI = 101           # 102
     ALT_THROTTLE_COMP_LIMIT = 102  # 103
     VRS_ROC = 103     # 104
     UNUSED_105 = 104           # 105
     AH_ROC_WINDOW_MPS = 105    # 106
     NAV_PROX_ALT_M = 106       # 107
     NAV_PROX_RADIUS_M = 107    # 108
-    YAW_RATE_KI = 108          # 109 — yaw rate-loop integral gain (heading hold)
-    YAW_RATE_INT_LIM = 109     # 110 — yaw rate-loop integral limit
+    UNUSED_109 = 108           # 109
+    UNUSED_110 = 109           # 110
     UNUSED_111 = 110          # 111 — was KFBaroVar (tracked live in state.c)
     UNUSED_112 = 111         # 112 — was KFAccUVar (tracked live in state.c)
     FW_THR_RAMP_PS = 112      # 113 — FW throttle re-open slew limit (%/s)
@@ -840,7 +853,7 @@ class ParamIndex(IntEnum):
     RUDDER_MOTOR_FF = 122          # 123
     SPIRAL_DESCENT_BAND_M = 123      # 124 — residual altitude (m) that triggers MR spiral-orbit descent
     FW_PITCH_AUTHORITY = 124  # 125 — stabilised FW pitch output scale (was FS_CONFIG_BITS)
-    TRACE_TYPE = 125   # trace capture selector (TraceTypes: 0=None 1=Rate 2=Attitude 3=AltHold 4=Actuator 5=IMU)
+    UNUSED_126 = 125   # slot retained: trace capture selector removed 2026-11-19
     FW_YAW_AUTHORITY = 126  # 127 — stabilised FW yaw output scale
     POWER_RESET_CAUSE = 127
 
@@ -882,7 +895,7 @@ RC_MAPPING_NAMES = {
     ParamIndex.RX_AUX1_CH: "AttMode",
     ParamIndex.RX_AUX2_CH: "Arming",
     ParamIndex.RX_AUX3_CH: "CamPitch",
-    ParamIndex.RX_AUX4_CH: "Trace",
+    ParamIndex.RX_AUX4_CH: "Aux2",
     ParamIndex.RX_AUX5_CH: "Aux5",
     ParamIndex.RX_AUX6_CH: "Aux6",
     ParamIndex.RX_AUX7_CH: "Aux7",
@@ -1074,15 +1087,6 @@ ACC_LPF_NAMES = {
     4: "20",
     5: "10",
     6: "5",
-}
-
-BB_LOG_NAMES = {
-    0: "Off",
-    1: "Altitude",
-    2: "Pitch",
-    3: "Roll",
-    4: "Yaw",
-    5: "Attitude",
 }
 
 MOTOR_STOP_NAMES = {

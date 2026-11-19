@@ -29,7 +29,7 @@ class _WrappedLabel(QLabel):
 
 _TAG_NAMES = {
     15: "Stats", 21: "Mission", 50: "Request", 52: "Misc", 53: "Unused",
-    54: "BB", 55: "Unused", 56: "Unused", 57: "Tuning", 58: "Unused",
+    54: "Unused", 55: "Unused", 56: "Unused", 57: "Tuning", 58: "Unused",
     59: "Guidance", 60: "Unused", 61: "Unused", 64: "Wind", 65: "Unused",
     67: "ExecTime", 68: "Unused", 74: "TestRsp",
     76: "I2CErrors",

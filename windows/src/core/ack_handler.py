@@ -5,6 +5,7 @@ ACK/NACK handler for UAVX telemetry
 
 from PyQt5.QtCore import QTimer, QObject, pyqtSignal
 from PyQt5.QtWidgets import QPushButton, QMenu
+from core.console import console
 
 
 class AckHandler(QObject):
@@ -37,7 +38,7 @@ class AckHandler(QObject):
         if self.debug_callback:
             self.debug_callback(msg)
         else:
-            print(f"[ACK] {msg}")
+            console(f"[ACK] {msg}")
     
     def register_button(self, tag: int, button: QPushButton, callback=None):
         """Register a button for ACK/NACK feedback - returns request_id"""

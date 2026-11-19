@@ -21,20 +21,21 @@ from protocol_enums import PacketTag
 from protocol_constants import NAV_STATE_NAMES
 from packet_parser import OriginData
 from models.waypoint import Waypoint, WP_ACTION_VALUES, WP_ACTIONS
+from core.console import console
 
 try:
     import folium
     from folium import plugins
     FOLIUM_AVAILABLE = True
 except ImportError as e:
-    print(f"WARNING: Folium not available: {e}")
+    console(f"WARNING: Folium not available: {e}")
     FOLIUM_AVAILABLE = False
 
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
     WEBENGINE_AVAILABLE = True
 except ImportError as e:
-    print(f"WARNING: PyQtWebEngine not available: {e}")
+    console(f"WARNING: PyQtWebEngine not available: {e}")
     WEBENGINE_AVAILABLE = False
     QWebEngineView = None
 
@@ -83,7 +84,7 @@ class NavWindow(QMainWindow):
         self.setWindowTitle("UAVX Navigation - Mission Planning")
         self.setMinimumSize(1320, 845)
 
-        print(f"Folium available: {FOLIUM_AVAILABLE}")
+        console(f"Folium available: {FOLIUM_AVAILABLE}")
 
         self.setup_ui()
         self.setup_connections()
@@ -1134,7 +1135,7 @@ class NavWindow(QMainWindow):
                     <p style="color: #666; font-size: 12px;">Check that folium is properly installed.</p>
                 </body></html>
             """)
-            print(f"Map error: {e}")
+            console(f"Map error: {e}")
 
     def load_mission(self):
         path, _ = QFileDialog.getOpenFileName(

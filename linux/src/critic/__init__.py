@@ -2,15 +2,16 @@
 
 Stage 1a of the live auto-tuning roadmap: the metric definitions and the
 pass/fail criteria used by the Python-side PID critique, extracted from
-``tests/test_pid_sim.py`` so the FC (``trace.c`` captures) and the sim critic
-measure a step response identically and judge it against identical limits.
+``tests/test_pid_sim.py`` so they are stated once and judged against identical
+limits across every study.
 
 Layout
   metrics.py   raw measurement over time series (times, values) -> metrics.
-               No criteria knowledge. FC port lives here (in C).
+               No criteria knowledge.
   criteria.py  pass/fail thresholds (CRITERIA tables), verdict helpers, and
                the ANSI console report renderers (critique*/recommend/check).
-               No measurement knowledge. Criteria maps 1:1 to C constants.
+               No measurement knowledge. Criteria maps 1:1 to the published
+               study limits.
 
 The test script retains ownership of the sim physics and the airframe data;
 it imports the measurement, verdict, and report logic from here.

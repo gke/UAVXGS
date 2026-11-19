@@ -2,27 +2,29 @@
 """
 Always-on raw telemetry log writer.
 
-Captures every byte that arrives from the serial port, stamped with the
-millisecond offset since the file was opened. The FreeFlight-style framing
-is deliberately trivial:
+Captures every serial byte, stamped with the millisecond offset since the
+file was opened, in BOTH directions:
 
-    magic  8 bytes  b"UAVXRAW\\x01"
-    chunk  12 bytes header + payload, per serial read:
-            marker byte 0xAA            (resync anchor)
+    magic  8 bytes  b"UAVXRAW\x01"
+    chunk  12 bytes header + payload, per serial read or write:
+            marker byte 0xAA (FC->GCS) or 0xAB (GCS->FC)
             u32 LE offset ms since open
             u32 LE payload length
-            payload bytes (the exact raw serial read)
+            payload bytes (the exact serial read/write)
 
 The raw stream is the complete UAVX wire format, ESC-stuffed packets AND
-printable diagnostics interleaved, exactly as delivered at the byte level.
-A GCS replay feeds these same bytes through the shared `FrameDecoder`, so
-what is captured is, byte for byte, what a live connection decoded.
+printable diagnostics interleaved, exactly as delivered at the byte level,
+with the GCS's own transactions in the same timeline so their temporal
+ordering against FC traffic is visible. A GCS replay feeds only the 0xAA
+chunks through the shared FrameDecoder, so replay stays byte-identical
+to a live FC->GCS link.
 
 Never captures replay output: the writer is driven exclusively from the
-serial thread's `raw_bytes` signal, and `write()` additionally refuses
-while the GCS is in replay mode (belt and braces so no second log can ever
-be produced from a replay).
+serial thread's raw_bytes signal (RX) and the telemetry thread's
+tx_bytes signal (TX), and write()/write_tx() additionally refuse
+while replaying.
 """
+
 
 import os
 import re
@@ -32,7 +34,8 @@ __all__ = ["RawLogWriter"]
 
 
 MAGIC = b"UAVXRAW\x01"
-MARKER = 0xAA
+MARKER = 0xAA      # FC -> GCS
+MARKER_TX = 0xAB   # GCS -> FC
 
 
 def _safe_name(name):
@@ -83,18 +86,27 @@ class RawLogWriter:
             self.rename(airframe)
 
     def write(self, data):
-        """Append one serial read with its ms offset since log start.
+        """Append one FC->GCS serial read with its ms offset since log start.
 
         Refuses while `forbidden` (replay mode): the replay path feeds
         `process_packet` directly and never goes through `raw_bytes`, so
         this guard is belt-and-braces against any path that might tee bytes
         into the log from a non-serial source."""
+        self._write_chunk(MARKER, data)
+
+    def write_tx(self, data):
+        """Append one GCS->FC serial write. Same chunk layout, direction
+        marker 0xAB so a reader can tell the two apart and replay can skip
+        the GCS's own traffic."""
+        self._write_chunk(MARKER_TX, data)
+
+    def _write_chunk(self, marker, data):
         if self._file is None or self._forbidden:
             return
         try:
             ms = int((time.monotonic() - self._t0) * 1000) & 0xFFFFFFFF
             payload = bytes(data)
-            self._file.write(bytes((MARKER,)))
+            self._file.write(bytes((marker,)))
             self._file.write(ms.to_bytes(4, "little"))
             self._file.write(len(payload).to_bytes(4, "little"))
             self._file.write(payload)

@@ -11,7 +11,7 @@ import struct
 import time
 import math
 import zlib
-from datetime import datetime
+from dataclasses import replace
 from typing import Optional
 
 from PyQt5.QtWidgets import *
@@ -21,17 +21,20 @@ from PyQt5.QtGui import *
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol_constants import *
-from protocol_enums import PacketTag, ParamIndex, FlightState, NavState, Config1Bits, Config2Bits, MiscCommand, AirframeType
+from protocol_enums import PacketTag, ParamIndex, FlightState, NavState, Config1Bits, Config2Bits, MiscCommand, AirframeType, SerialPort
 from packet_parser import *
 from widgets.attitude_indicator import AttitudeIndicator, ExecTimeBar
 from widgets.anomaly_box import AnomalyBox
 
 from core.data_manager import data_manager
 from core.packet_logger import packet_logger
+from core.console import console
 from core.ack_handler import ack_handler
 
 from ui.parameter_window import ParameterWindow
-from parameters import PARAM_DISPLAY_MULT, PARAM_TYPES
+from parameters import (PARAM_DISPLAY_MULT, PARAM_TYPES,
+                        PARAMETER_DEFS, PARAM_LIMITS,
+                        PARAM_BOOT_REQUIRED, PARAM_META_DIGEST)
 import workspace
 from ui.nav_window import NavWindow
 from ui.calibration_window import CalibrationWindow
@@ -42,33 +45,11 @@ from logger.logger import AnomalyLogger
 from logger.rawlog import RawLogWriter
 from core.frame_decoder import FrameDecoder
 from ui.replay_window import ReplayWindow
-from ui.trace_viewer import TraceViewer
 from ui.identify_window import IdentifyWindow
 
 
 FLAG_USING_GPS_ALT = 1
 FLAG_USING_RANGEFINDER_ALT = 22
-
-# Trace-type combo sync-state styling: the selector's BACKGROUND goes green when
-# the FC has confirmed the value (download readback or upload ACK), orange while
-# a locally-chosen value still awaits confirmation, default when unknown.
-_TRACE_STATE_STYLE = {
-    'neutral': (
-        "QComboBox { background-color: #ffffff; color: #101418; }"
-        "QComboBox::drop-down { border: none; background: transparent; }"
-        "QComboBox QAbstractItemView { background: #ffffff; color: #101418; "
-        "selection-background-color: #4a90d9; selection-color: #ffffff; }"),
-    'synced': (
-        "QComboBox { background-color: #27ae60; color: #0d1216; border: 1px solid #1f7a45; }"
-        "QComboBox::drop-down { border: none; background: transparent; }"
-        "QComboBox QAbstractItemView { background: #ffffff; color: #101418; "
-        "selection-background-color: #4a90d9; selection-color: #ffffff; }"),
-    'pending': (
-        "QComboBox { background-color: #e67e22; color: #0d1216; border: 1px solid #b45f1b; }"
-        "QComboBox::drop-down { border: none; background: transparent; }"
-        "QComboBox QAbstractItemView { background: #ffffff; color: #101418; "
-        "selection-background-color: #4a90d9; selection-color: #ffffff; }"),
-}
 
 # Speak a compass/distance callout only when the FC's home-relative offset puts
 # the aircraft beyond this range, and only re-speak every N seconds while far.
@@ -135,7 +116,7 @@ FLAG_BIT_DEFS = {
     30: ('acc_z_bump', 'Bump', 'Acc Z Bump'),
     31: ('unused_dc_motors', 'unusedDCMotors', 'Reserved: F.DCMotorsDetected never set by FC'),
     32: ('unused_sat', 'unusedSat', 'Reserved: F.Saturation never set by FC'),
-    33: ('dump_bb', 'DumpBB', 'Dumping Black Box'),
+    33: ('unused33', 'unused33', 'Reserved: DumpingBlackBox removed with Trace 2026-11-19'),
     34: ('cfg_pend', 'CfgPend', 'Config uncommitted on FC (ConfigChanged set, not yet flashed)'),
     35: ('signal', 'Signal', 'Signal'),
     36: ('wp_nav', 'WPNav', 'WP Navigation'),
@@ -162,14 +143,14 @@ FLAG_BIT_DEFS = {
     56: ('yaw_active', 'YawActive', 'Yaw Active'),
     57: ('have_gps', 'HaveGPS', 'Have GPS'),
     58: ('fs', 'FS', 'Failsafe (LQ < 50%)'),
-    59: ('new_nav', 'NewNav', 'New Nav Update'),
+    59: ('unused59', 'unused59', 'Reserved: NewNavUpdate retired 2026-11-17 — the position clock moved to bit 66'),
     60: ('nv_mem', 'NVMem', 'Have NV Memory'),
     61: ('rapid_desc', 'Diving', 'Using Rapid Descent'),
     62: ('turn_wp', 'TurnWP', 'Using Turn To WP'),
     63: ('glide', 'Glide', 'Gliding'),
-    64: ('new_mag', 'NewMag', 'New Mag Values'),
+    64: ('unused64', 'unused64', 'Reserved: NewMag removed 2026-10-18'),
     65: ('alt_hold_alarm', 'AHAlarm', 'Using Alt Hold Alarm'),
-    66: ('new_gps_pos', 'NewGPSPos', 'New GPS Position'),
+    66: ('new_gps_pos', 'NewGPSPos', 'New GPS Position: a UBX position sentence (NAV-PVT / NAV-POSLLH) was parsed'),
     67: ('sio_fatal', 'SIOFatal', 'Serial I/O Fatal'),
     68: ('gps_pkt', 'GPSPkt', 'GPS Packet Received'),
     69: ('wind_est', 'WindEst', 'Wind Estimate Valid'),
@@ -179,37 +160,39 @@ FLAG_BIT_DEFS = {
     73: ('unused73', 'unused73', 'Reserved'),
     74: ('drive_sym', 'DriveSym', 'Enforce Drive Symmetry'),
     75: ('rssi', 'RSSI', 'RSSI (< -90 dBm)'),
-    76: ('ext_mag', 'ExtMag', 'External Mag Detected'),
+    76: ('ext_mag', 'ExtMag', 'Using External Mag (Config1 bit 0) — selects the external mag and its axis flip'),
     77: ('snr', 'SNR', 'SNR Low (< -10 dB)'),
     78: ('offset_home', 'OffsetHome', 'Using Offset Home'),
     79: ('gps_hdg', 'GPSHdg', 'Valid GPS Heading'),
     80: ('bad_bus', 'BadBus', 'Bad Bus Device Config'),
     81: ('dive_mode', 'Dive', 'Dive Mode'),
-    82: ('test_active', 'TestActive', 'Test Active'),
-    83: ('unused83', 'unused83', 'Reserved'),
-    84: ('unused84', 'unused84', 'Reserved'),
-    85: ('unused85', 'unused85', 'Reserved'),
-    86: ('unused86', 'unused86', 'Reserved'),
+    82: ('test_mission', 'TestMission', 'Test Mission Enabled'),
+    83: ('mag_yaw_disagree', 'YawDrift', 'Mag/Yaw Disagreement'),
+    84: ('gps_absent', 'NoGPS', 'No GPS receiver detected (port not wired, or nothing ever received on it)'),
+    # 85 = GPSActive: live UBX-frame-flowing flag, cleared by the nav timeout.
+    85: ('gps_active', 'GPSActive', 'UBX frames flowing (live; clears ~2 s after the last valid sentence)'),
+    86: ('gyros_erected', 'GyrosErected', 'Gyro bias grab succeeded this arming (used by the in-flight bias observer)'),
     87: ('unused87', 'unused87', 'Reserved'),
-    88: ('unused88', 'unused88', 'Reserved'),
+    88: ('baro_hot', 'BaroHot', 'Barometer warm: 200 samples or 10 s after boot'),
     89: ('unused89', 'unused89', 'Reserved'),
     90: ('unused90', 'unused90', 'Reserved'),
     91: ('unused91', 'unused91', 'Reserved'),
     92: ('unused92', 'unused92', 'Reserved'),
     93: ('unused93', 'unused93', 'Reserved'),
     94: ('unused94', 'unused94', 'Reserved'),
-    95: ('unused95', 'unused95', 'Reserved'),
+    95: ('mag_valid', 'MagValid', 'Mag usable: present, no fault, calibrated'),
 }
 
-# Logical groups (name -> FC bit numbers). Covers every bit 0..95 exactly once.
+# Logical groups (name -> FC bit numbers) for the flag-chip rows; a mapped bit
+# missing from every group renders nowhere.
 FLAG_GROUPS = [
     ('Attitude & Control', [12, 26, 4, 56]),
-    ('Altitude', [0, 14, 23, 21, 61, 2, 46, 65]),
+    ('Altitude', [0, 14, 23, 21, 61, 2, 46, 65, 88]),
     ('Navigation', [15, 36, 16, 17, 18, 19, 24, 70]),
     ('RTH / Landing', [20, 72, 45, 3, 30]),
     ('Origin / Home', [7, 28, 78]),
-    ('GPS', [6, 52, 79]),
-    ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22]),
+    ('GPS', [6, 52, 79, 57, 84, 85]),
+    ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22, 83, 95]),
     ('RC & Input', [35, 53, 75, 58, 77, 81]),
     ('Soaring / Glide', [51, 63, 69]),
     ('Flight Mode / Throttle', [25, 40, 13]),
@@ -233,9 +216,17 @@ class TelemetryThread(QThread):
     """Background thread for serial telemetry"""
     data_received = pyqtSignal(bytes)
     raw_bytes = pyqtSignal(bytes)
+    tx_bytes = pyqtSignal(bytes)
     connected = pyqtSignal(bool)
     error = pyqtSignal(str)
     
+    # Auto-reconnect pacing after a dropped CDC link. Applies ONLY inside a
+    # reboot window the GCS itself armed (send_reboot / send_param_commit);
+    # any other drop ends the session as the 2026-11-14 ruling requires.
+    _RECONNECT_BACKOFF_START_S = 1.0
+    _RECONNECT_BACKOFF_MAX_S = 5.0
+    _RECONNECT_WINDOW_S = 30.0
+
     def __init__(self, port: str, baud: int):
         super().__init__()
         self.port = port
@@ -243,12 +234,35 @@ class TelemetryThread(QThread):
         self.running = False
         self.serial = None
         self._is_closing = False
+        self.reboot_expected = False
+        self.reboot_deadline_s = 0.0
         self.verbose_serial = os.environ.get("UAVXGS_VERBOSE_SERIAL", "0") == "1"
 
-    # Auto-reconnect pacing after a dropped CDC link. A bench USB reset takes
-    # the port away for ~30 s (host re-enumeration); retry until it returns.
-    _RECONNECT_BACKOFF_START_S = 1.0
-    _RECONNECT_BACKOFF_MAX_S = 5.0
+    def arm_reboot_window(self):
+        """Caller (MainWindow) marks that the FC is about to be reset on the
+        GCS's say-so, so a drop inside the window is expected and the USB
+        link may be reopened automatically. Outside the window every drop
+        ends the session."""
+        self.reboot_expected = True
+        self.reboot_deadline_s = time.monotonic() + self._RECONNECT_WINDOW_S
+
+    def _reconnect_allowed(self):
+        return self.reboot_expected and time.monotonic() < self.reboot_deadline_s
+
+    def write(self, data):
+        """Write bytes to the FC and tee them to the rawlog as a GCS->FC
+        chunk (marker 0xAB). Raises if the port cannot take the write, so
+        callers' existing except handlers keep their old behaviour."""
+        port = self.serial
+        if port is None or not port.is_open:
+            raise RuntimeError("serial port not open")
+        n = port.write(data)
+        self.tx_bytes.emit(bytes(data))
+        return n
+
+    # No auto-reconnect outside a GCS-armed reboot window: a dropped link
+    # ends the session and the operator presses Connect. Inside a window
+    # (arm_reboot_window) the USB link reopens automatically.
     
     def run(self):
         import serial
@@ -276,11 +290,9 @@ class TelemetryThread(QThread):
                 return
 
             self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
-            # First successful open: signal the GUI connected NOW, not only on
-            # a later reopen. A reopen (line 274) exists for dropped CDC links;
-            # a stable UART adapter never drops, so without this the GUI stays
-            # stuck at "Connecting..." and never triggers the on_connected(True)
-            # param readback / rawlog start / read-lock release.
+            # Signal the GUI connected NOW, not only after the first byte: the
+            # on_connected(True) handler starts the rawlog session and the
+            # param readback. Without this the GUI stays at "Connecting...".
             self.connected.emit(True)
             self._link_loop(serial)
 
@@ -292,17 +304,16 @@ class TelemetryThread(QThread):
             self.connected.emit(False)
 
     def _link_loop(self, serial):
-        """Read/decode loop with automatic reconnect.
+        """Read/decode loop.
 
-        A vanished or stalled CDC device surfaces as OSError from read().
-        That is retryable: a bench USB reset takes the port away for ~30 s
-        while the host re-enumerates. We emit connected(False), close the
-        port, then keep trying to reopen with a bounded backoff until the
-        device returns (or stop()). A non-OSError exception is a decode or
-        logic bug - log it and stand down instead of hot-reopening a broken
-        loop forever. A dropped link never feeds bytes into the old rawlog:
-        the GUI's on_connected(False) already stopped it, and a successful
-        reopen starts a fresh rawlog session via on_connected(True).
+        A vanished or stalled device surfaces as OSError from read(). A GCS-
+        authorised reboot (tag-78, or the tag-72 commit) arms a 30 s window
+        via arm_reboot_window(): inside it a drop is expected and the port is
+        reopened with a bounded backoff, so a USB board that re-enumerates is
+        picked up without operator action. Outside the window the 2026-11-14
+        ruling holds — the link ends, the port stays closed, and Connect is
+        the only way back. A non-OSError exception is a decode or logic bug -
+        log it and stand down.
         """
         buffer = bytearray()
         packet = bytearray()
@@ -312,10 +323,12 @@ class TelemetryThread(QThread):
         while self.running and not self._is_closing:
             try:
                 if self.serial is None or not self.serial.is_open:
-                    # Port was dropped (or stop() is closing us). Try to
-                    # reopen the device; reopen failures are EXPECTED until
-                    # the USB stack re-enumerates, so they just pace the
-                    # backoff instead of killing the link.
+                    # Port dropped (or stop() is closing us). Reopen is only
+                    # attempted inside a GCS-armed reboot window; reopen
+                    # failures are expected until the USB stack re-enumerates,
+                    # so they pace the backoff instead of killing the link.
+                    if not self._reconnect_allowed():
+                        break
                     try:
                         self.serial = serial.Serial(
                             self.port, self.baud, timeout=0.1)
@@ -332,12 +345,12 @@ class TelemetryThread(QThread):
                     esc_flag = False
                     continue
 
-                if self.serial.in_waiting:
-                    data = self.serial.read(self.serial.in_waiting)
-                    if data and self.verbose_serial:
+                n = self.serial.in_waiting
+                data = self.serial.read(n if n else 1)
+                if data:
+                    if self.verbose_serial:
                         print(f"[SERIAL] Read {len(data)} bytes: {data[:20].hex()}{'...' if len(data) > 20 else ''}")
-                    if data:
-                        self.raw_bytes.emit(bytes(data))
+                    self.raw_bytes.emit(bytes(data))
                     buffer.extend(data)
                     
                     i = 0
@@ -361,9 +374,9 @@ class TelemetryThread(QThread):
                                 printable = all(32 <= b < 127 or b in (10, 13)
                                                 for b in packet)
                                 if printable:
-                                    print(f"[BOOT] {txt.strip()}")
+                                    console(f"[BOOT] {txt.strip()}")
                                 else:
-                                    print(f"[SERIAL] Discarding "
+                                    console(f"[SERIAL] Discarding "
                                           f"{len(packet)} bytes before SOH")
                             packet.clear()
                             packet.append(ch)
@@ -385,10 +398,14 @@ class TelemetryThread(QThread):
             except OSError as e:
                 if self._is_closing:
                     break
-                print(f"<telem> link error: {e!r} -> reconnecting", flush=True)
-                self.connected.emit(False)
-                self._close_port()
-                # The loop top reopens (or paces the backoff if not yet back)
+                if self._reconnect_allowed():
+                    print(f"<telem> link error: {e!r} -> reconnecting", flush=True)
+                    self.connected.emit(False)
+                    self._close_port()
+                else:
+                    print(f"<telem> link error: {e!r} -> link closed; press Connect",
+                          flush=True)
+                    break
                 
             except Exception as e:
                 if not self._is_closing:
@@ -477,6 +494,10 @@ class MainWindow(QMainWindow):
         self.config_labels = []
         self.config1_cache = 0
         self.config2_cache = 0
+        self._gps_absent = None
+        self._gps_absent_reports = 0
+        self._mag_absent = None
+        self._mag_absent_reports = 0
         
         self.param_window: Optional[ParameterWindow] = None
         self._pending_params = None
@@ -487,7 +508,6 @@ class MainWindow(QMainWindow):
         self.calib_window: Optional[CalibrationWindow] = None
         self.misc_window: Optional[MiscWindow] = None
         self.dfu_flasher_window: Optional[DfuFlasherWindow] = None
-        self._trace_viewer = None
         self._identify_window: Optional[IdentifyWindow] = None
         
         self.speech = SpeechController()
@@ -508,7 +528,6 @@ class MainWindow(QMainWindow):
         self._pending_flight_state = -1
         self._state_change_time = 0.0
         self.log_dir = None
-        self._bb_chunks = {}
         self._last_wp_data = None
         self._mag_live: Optional[list] = None
         self._param_write_list = []
@@ -543,11 +562,10 @@ class MainWindow(QMainWindow):
         self._last_tune = None
         self._last_rx_time = 0.0
         self._pf_term_mask = 0
+        self._last_fc_state = None
+        self._tx_muted = True
         self._log_level = "All"
         self._flight_log_only = False  # terminal: show only FLIGHT packets
-        self._trace_combo_loading = False
-        self._trace_fc_value = None
-        self._trace_write_pending = None
 
         self.setup_ui()
         self.setup_menu()
@@ -561,18 +579,25 @@ class MainWindow(QMainWindow):
         self.status_timer.timeout.connect(self.check_connection)
         self.status_timer.start(1000)
         
-        # BB dump watchdog: finalize when chunks stop arriving. The FC ends the
-        # dump after a final chunk that is either short (<128 B, e.g. trailer
-        # tail) OR exactly TRACE_HEADER_SIZE (128 B) when there is no capture —
-        # the all-zero header fills one whole chunk. A strict "last chunk <128"
-        # test never fires for that exact-128 case, so guard with idle time.
-        self._bb_dump_timer = QTimer(self)
-        self._bb_dump_timer.setSingleShot(True)
-        self._bb_dump_timer.timeout.connect(self._finalize_bb_dump)
-
         # Periodic tag-57 poll (~1 Hz) to keep the Identify window fresh.
         self._identify_poll_timer = QTimer(self)
         self._identify_poll_timer.timeout.connect(self._poll_tuning)
+
+        # Meta sweep (tag 58): on connect, request every ParamTable entry from
+        # the live FC and verify the generated schema against it. Read-only.
+        self._meta_sweep_idx = 0
+        self._meta_sweep_max = 0
+        self._meta_sweep_answered: set = set()
+        self._meta_sweep_drift = 0
+        self._meta_sweep_route = ""
+        self._meta_sweep_timer = QTimer(self)
+        self._meta_sweep_timer.timeout.connect(self._meta_sweep_tick)
+        # The digest is one request with a short deadline: no reply means an FC
+        # that predates the v2 record, and the full sweep is the fallback.
+        self._meta_digest_seen = False
+        self._meta_digest_timer = QTimer(self)
+        self._meta_digest_timer.setSingleShot(True)
+        self._meta_digest_timer.timeout.connect(self._meta_digest_timeout)
         
         self.setWindowTitle("UAVX Groundstation")
         self.setMinimumSize(1320, 990)
@@ -594,9 +619,6 @@ class MainWindow(QMainWindow):
         replay_action.setShortcut("Ctrl+R")
         replay_action.triggered.connect(self.open_replay)
         file_menu.addAction(replay_action)
-        trace_action = QAction("Open &Trace Dump…", self)
-        trace_action.triggered.connect(self.show_trace_viewer)
-        file_menu.addAction(trace_action)
         file_menu.addSeparator()
         exit_action = QAction("E&xit", self)
         exit_action.setShortcut("Ctrl+Q")
@@ -646,7 +668,7 @@ class MainWindow(QMainWindow):
     def show_parameter_window(self):
         if self.param_window is None:
             self.param_window = ParameterWindow(self)
-            print("🪟 Created new ParameterWindow")
+            console("🪟 Created new ParameterWindow")
             if self._pending_typed_params is not None:
                 self.param_window.update_params_from_typed(self._pending_typed_params)
                 self._pending_typed_params = None
@@ -670,32 +692,6 @@ class MainWindow(QMainWindow):
         self.replay_window.show()
         self.replay_window.raise_()
         self.replay_window.activateWindow()
-
-    def show_trace_viewer(self):
-        """File > Open Trace Dump… — open a TRAC snapshot dump off disk (e.g.
-        a synthetic sample from tests/trace_samples or a previously saved
-        dump). Live dumps arrive through _finalize_bb_dump instead."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Trace Dump", self._log_dir(),
-            "Trace Dumps (*.bin);;All Files (*)")
-        if not path:
-            return
-        with open(path, 'rb') as f:
-            data = f.read()
-        if data[:4] != b'TRAC':
-            QMessageBox.warning(
-                self, "Trace Viewer",
-                f"{path}\nis not a TRAC snapshot dump (magic != 'TRAC').")
-            return
-        try:
-            viewer = TraceViewer(data, source=os.path.basename(path))
-        except ValueError as e:
-            QMessageBox.warning(self, "Trace Viewer", str(e))
-            return
-        self._trace_viewer = viewer
-        viewer.show()
-        viewer.raise_()
-        viewer.activateWindow()
 
     def open_replay(self):
         """Enter replay mode: drop the live FC connection, then open the
@@ -828,7 +824,7 @@ class MainWindow(QMainWindow):
         self.esc_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
         toolbar.addWidget(self.esc_btn)
 
-        # Trace/Replay buttons hidden for now (redundant)
+        # Replay button hidden for now (redundant)
         self.replay_btn = QPushButton("Replay")
         self.replay_btn.setToolTip("Replay a raw telemetry log (Ctrl+R)")
         self.replay_btn.setFixedWidth(80)
@@ -836,33 +832,6 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.replay_btn)
 
         toolbar.addStretch()
-
-        self.trace_label = QLabel("Trace:")
-        self.trace_label.setVisible(False)
-        toolbar.addWidget(self.trace_label)
-        self.trace_type_combo = QComboBox()
-        for tt, label in ((0, 'None'), (1, 'Rate'), (2, 'Attitude'),
-                          (3, 'AltHold'), (4, 'Actuator'), (5, 'IMU')):
-            self.trace_type_combo.addItem(label, tt)
-        self.trace_type_combo.setCurrentIndex(0)  # None is the safe startup default; connect adopts the FC value
-        self.trace_type_combo.setFixedWidth(96)
-        self._trace_combo_tooltip = (
-            "Trace capture type (param 125, FC ParamTable U8 enum). "
-            "Green = value confirmed by the FC; orange = change awaiting "
-            "confirmation. Writes are sent live; flash persists on commit / "
-            "grounded config refresh.")
-        self._set_trace_combo_state('neutral')
-        self.trace_type_combo.setToolTip(self._trace_combo_tooltip)
-        self.trace_type_combo.currentIndexChanged.connect(self._on_trace_type_changed)
-        self.trace_type_combo.setVisible(False)
-        toolbar.addWidget(self.trace_type_combo)
-
-        self.dump_trace_btn = QPushButton("Dump")
-        self.dump_trace_btn.setToolTip("Dump trace / capture ring from flight controller (momentary)")
-        self.dump_trace_btn.setStyleSheet("font-weight: bold;")
-        self.dump_trace_btn.setFixedWidth(56)
-        self.dump_trace_btn.setVisible(False)
-        toolbar.addWidget(self.dump_trace_btn)
 
         self.status_label = QLabel("● Disconnected")
         self.status_label.setStyleSheet("color: red; font-weight: bold;")
@@ -1034,6 +1003,11 @@ class MainWindow(QMainWindow):
         self.pf_block_label.setStyleSheet("color: #cc0000; font-weight: bold;")
         self.pf_block_label.setVisible(False)
         state_layout.addWidget(self.pf_block_label, 2, 0, 1, 4)
+        self.nav_no_gps_label = QLabel("")
+        self.nav_no_gps_label.setWordWrap(True)
+        self.nav_no_gps_label.setStyleSheet("color: #b8860b; font-weight: bold;")
+        self.nav_no_gps_label.setVisible(False)
+        state_layout.addWidget(self.nav_no_gps_label, 3, 0, 1, 4)
         state_box.setLayout(state_layout)
         state_batt_row.addWidget(state_box)
         
@@ -1162,25 +1136,34 @@ class MainWindow(QMainWindow):
         imu_layout.addWidget(QLabel("D/U:"), 4, 5)
         imu_layout.addWidget(self.slew_acc_yaw, 4, 6)
 
-        imu_layout.addWidget(QLabel("Mag:"), 5, 0)
+        mag_row_widgets = [QLabel("Mag:")]
+        imu_layout.addWidget(mag_row_widgets[0], 5, 0)
         self.mag_x = QLabel("0")
         self.mag_y = QLabel("0")
         self.mag_z = QLabel("0")
         for lbl in (self.mag_x, self.mag_y, self.mag_z):
             lbl.setStyleSheet("font-weight: bold;")
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        imu_layout.addWidget(QLabel("Mx:"), 5, 1)
+        mag_row_widgets.append(QLabel("Mx:"))
+        imu_layout.addWidget(mag_row_widgets[-1], 5, 1)
         imu_layout.addWidget(self.mag_x, 5, 2)
-        imu_layout.addWidget(QLabel("My:"), 5, 3)
+        mag_row_widgets.append(QLabel("My:"))
+        imu_layout.addWidget(mag_row_widgets[-1], 5, 3)
         imu_layout.addWidget(self.mag_y, 5, 4)
-        imu_layout.addWidget(QLabel("Mz:"), 5, 5)
+        mag_row_widgets.append(QLabel("Mz:"))
+        imu_layout.addWidget(mag_row_widgets[-1], 5, 5)
         imu_layout.addWidget(self.mag_z, 5, 6)
+        mag_row_widgets.extend((self.mag_x, self.mag_y, self.mag_z))
 
-        imu_layout.addWidget(QLabel("Mag Hdg:"), 6, 0)
+        mag_hdg_label = QLabel("Mag Hdg:")
+        mag_row_widgets.append(mag_hdg_label)
+        imu_layout.addWidget(mag_hdg_label, 6, 0)
         self.mag_heading = QLabel("0.0°")
         self.mag_heading.setStyleSheet("font-weight: bold;")
         self.mag_heading.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         imu_layout.addWidget(self.mag_heading, 6, 1, 1, 2)
+        mag_row_widgets.append(self.mag_heading)
+        self._mag_row_widgets = mag_row_widgets
 
         imu_layout.addWidget(QLabel("Acc Conf:"), 6, 3)
         self.acc_confidence = QLabel("0")
@@ -1309,7 +1292,7 @@ class MainWindow(QMainWindow):
         self.gps_sacc = QLabel("---")
         self.gps_cacc = QLabel("---")
         self.gps_rate_label = QLabel("---")
-        
+
         for lbl in (self.gps_lat, self.gps_lon, self.gps_alt, self.gps_vel, self.gps_hacc,
                      self.gps_vacc, self.gps_sacc, self.gps_cacc):
             lbl.setStyleSheet("color: #e74c3c;")
@@ -1342,6 +1325,21 @@ class MainWindow(QMainWindow):
         gps_layout.addWidget(QLabel("cAcc:"), 5, 0)
         gps_layout.addWidget(self.gps_cacc, 5, 1)
 
+        self.gps_rx_bytes = QLabel("---")
+        self.gps_rx_packets = QLabel("---")
+        self.gps_rx_drops = QLabel("---")
+        self.gps_rx_note = QLabel("")
+        self.gps_rx_note.setStyleSheet("font-weight: bold; color: #e74c3c;")
+        for lbl in (self.gps_rx_bytes, self.gps_rx_packets, self.gps_rx_drops):
+            lbl.setStyleSheet("font-weight: bold;")
+        gps_layout.addWidget(QLabel("RX:"), 6, 0)
+        gps_layout.addWidget(self.gps_rx_bytes, 6, 1)
+        gps_layout.addWidget(QLabel("Pkts:"), 6, 2)
+        gps_layout.addWidget(self.gps_rx_packets, 6, 3)
+        gps_layout.addWidget(QLabel("Drops:"), 7, 0)
+        gps_layout.addWidget(self.gps_rx_drops, 7, 1)
+        gps_layout.addWidget(self.gps_rx_note, 7, 2, 1, 2)
+
         fm = self.gps_lat.fontMetrics()
         w_latlon = fm.horizontalAdvance("-123.456789") + 4
         w_num = fm.horizontalAdvance("-12345.6") + 4
@@ -1350,12 +1348,16 @@ class MainWindow(QMainWindow):
             lbl.setMinimumWidth(w_latlon)
         for lbl in (self.gps_alt, self.gps_vel, self.gps_sats, self.gps_fix,
                     self.gps_hacc, self.gps_sacc, self.gps_vacc, self.gps_cacc,
-                    self.gps_rate_label):
+                    self.gps_rate_label, self.gps_rx_bytes, self.gps_rx_packets,
+                    self.gps_rx_drops):
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lbl.setMinimumWidth(w_num)
 
         gps_box.setLayout(gps_layout)
         nav_gps_row.addWidget(gps_box)
+
+        self.nav_box = nav_box
+        self.gps_box = gps_box
 
         right_panel.addLayout(nav_gps_row)
         
@@ -1385,37 +1387,15 @@ class MainWindow(QMainWindow):
         link_layout.addWidget(self.link_failsafes, 2, 1)
         link_box.setLayout(link_layout)
         
-        # Serial Ports (side-by-side with Link Stats)
+        # Serial Ports — per-port grid: name, live baud, USART SR, TX/RX queued bytes
         serial_box = QGroupBox("Serial Ports")
         serial_box.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
-        serial_layout = QGridLayout()
-        serial_layout.setVerticalSpacing(1)
-        serial_layout.setHorizontalSpacing(4)
-        serial_layout.addWidget(QLabel(""), 0, 0)
-        serial_layout.addWidget(QLabel("TX"), 0, 1)
-        serial_layout.addWidget(QLabel("RX"), 0, 2)
-        serial_layout.addWidget(QLabel("Ov"), 0, 3)
-        bar_style = """
-            QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; height: 14px; font-size: 9px; }
-            QProgressBar::chunk { background: #3498db; border-radius: 2px; }
-        """
-        self.ser_telem_tx = QProgressBar(); self.ser_telem_tx.setStyleSheet(bar_style); self.ser_telem_tx.setRange(0, 512); self.ser_telem_tx.setValue(0); self.ser_telem_tx.setTextVisible(True)
-        self.ser_telem_rx = QProgressBar(); self.ser_telem_rx.setStyleSheet(bar_style); self.ser_telem_rx.setRange(0, 512); self.ser_telem_rx.setValue(0); self.ser_telem_rx.setTextVisible(True)
-        self.ser_telem_ov = QLabel("--")
-        self.ser_gps_tx = QProgressBar(); self.ser_gps_tx.setStyleSheet(bar_style); self.ser_gps_tx.setRange(0, 512); self.ser_gps_tx.setValue(0); self.ser_gps_tx.setTextVisible(True)
-        self.ser_gps_rx = QProgressBar(); self.ser_gps_rx.setStyleSheet(bar_style); self.ser_gps_rx.setRange(0, 512); self.ser_gps_rx.setValue(0); self.ser_gps_rx.setTextVisible(True)
-        self.ser_gps_ov = QLabel("--")
-        for ov in (self.ser_telem_ov, self.ser_gps_ov):
-            ov.setStyleSheet("font-weight: bold;")
-        serial_layout.addWidget(QLabel("Telem:"), 1, 0)
-        serial_layout.addWidget(self.ser_telem_tx, 1, 1)
-        serial_layout.addWidget(self.ser_telem_rx, 1, 2)
-        serial_layout.addWidget(self.ser_telem_ov, 1, 3)
-        serial_layout.addWidget(QLabel("GPS:"), 2, 0)
-        serial_layout.addWidget(self.ser_gps_tx, 2, 1)
-        serial_layout.addWidget(self.ser_gps_rx, 2, 2)
-        serial_layout.addWidget(self.ser_gps_ov, 2, 3)
-        serial_box.setLayout(serial_layout)
+        self.serial_layout = QGridLayout()
+        self.serial_layout.setVerticalSpacing(1)
+        self.serial_layout.setHorizontalSpacing(8)
+        # header row removed — no "Port | Baud | SR | TX/RX q | Ovfl" line
+        self._serial_widgets: dict[int, dict] = {}  # per-port widget dicts
+        serial_box.setLayout(self.serial_layout)
         
         link_serial_row = QHBoxLayout()
         link_serial_row.setSpacing(5)
@@ -1477,9 +1457,9 @@ class MainWindow(QMainWindow):
         
         self.config_labels = []
         self.config_flags = [
-            (1, 0, "Ext Mag"), (1, 1, "Autoland"), (1, 2, "Use Mag"), (1, 3, "Emulation"),
+            (1, 0, "Ext Mag"), (1, 1, "Autoland"), (1, 3, "Emulation"),
             (1, 4, "AH Alarm"), (1, 5, "GPS Alt"), (1, 7, "Clamp"),
-            (2, 0, "Batt Comp"), (2, 3, "Have GPS"), (2, 4, "Prop In"),
+            (2, 0, "Batt Comp"), (2, 4, "Prop In"),
             (2, 5, "Turn WP"), (2, 6, "Beep WP"),
         ]
         for which, bit, name in self.config_flags:
@@ -1631,24 +1611,12 @@ class MainWindow(QMainWindow):
         self.flash_btn.clicked.connect(self.show_dfu_flasher)
         self.ident_btn.clicked.connect(self.show_identify_window)
         self.esc_btn.clicked.connect(self.enter_esc_programming)
-        self.dump_trace_btn.clicked.connect(self.dump_black_box)
         self.replay_btn.clicked.connect(self.open_replay)
         self.speech_level_combo.currentIndexChanged.connect(self.speech_level_changed)
         
         for btn in [self.connect_btn]:
             btn.setProperty('original_text', btn.text())
         
-    def dump_black_box(self):
-        if self._trace_fc_value in (None, 0):
-            self.log_debug(
-                "Dump requested while the FC's trace type is None — the live "
-                "ring has no snapshot. Only a previously committed flash capture "
-                "(from a non-None type) would return data; otherwise expect the "
-                "'no snapshot' result.", "Warnings")
-        self._bb_chunks = {}
-        self.send_request(PacketTag.MISC, MiscCommand.BB_DUMP, 0)
-        self.log_debug("📤 Sent Dump Trace / capture ring command", "Info")
-
     def enter_esc_programming(self):
         if not self.connected:
             QMessageBox.information(self, "ESC Programming",
@@ -1695,55 +1663,6 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "ESC Programming",
                             "The FC refused ESC programming mode.\n\n"
                             "Disarm the aircraft and try again.")
-
-    def _finalize_bb_dump(self):
-        self._bb_dump_timer.stop()
-        if not self._bb_chunks:
-            return
-        seqs = sorted(self._bb_chunks.keys())
-        data = b''
-        for s in seqs:
-            data += self._bb_chunks[s]
-        self._bb_chunks = {}
-        # Trace dump with no capture: the FC streams an all-zero
-        # TRACE_HEADER_SIZE (128 B v2 / 32 B v1) header with no records. Detect
-        # any all-zero dump and report instead of offering a pointless save.
-        if not any(data) and len(data) >= 32:
-            msg = ("No trace capture on the FC.\n\n"
-                   "The FC returned an all-zero header. Possible causes:\n"
-                   "• Trace type is None (set the Trace combo to a probe type)\n"
-                   "• ch8 was never held in flight (capture needs the go-ahead)\n"
-                   "• no disarm commit since the capture\n\n"
-                   "Nothing was saved.")
-            self.log_debug(
-                "Trace dump has no capture: the FC returned the all-zero "
-                "header (trace type None on the FC, or ch8 never armed a "
-                "capture in flight, or no disarm commit). Nothing to save — "
-                "set the Trace type, fly, disarm, then dump again.", "Warnings")
-            QMessageBox.warning(self, "Trace Dump — No Capture", msg)
-            return
-        if data[:4] == b'TRAC':
-            try:
-                viewer = TraceViewer(data, source="live dump")
-            except ValueError as e:
-                QMessageBox.warning(self, "Trace Viewer", str(e))
-                return
-            self._trace_viewer = viewer
-            viewer.show()
-            viewer.raise_()
-            viewer.activateWindow()
-            self.log_debug(f"✅ TRAC snapshot ({len(data)}B) → Trace Viewer",
-                           "Info")
-            return
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Black Box Dump",
-            f"bb_dump_{timestamp}.bin",
-            "Binary Files (*.bin);;All Files (*)")
-        if path:
-            with open(path, 'wb') as f:
-                f.write(data)
-            self.log_debug(f"✅ BB dump saved ({len(data)}B) → {path}", "Info")
 
     def _log_dir(self):
         """Absolute directory for logs/KML. Never relative, so files never
@@ -1800,10 +1719,10 @@ class MainWindow(QMainWindow):
         self._last_reported_reset_cause = cause
         name = self._RESET_CAUSE_NAMES.get(cause, "unknown")
         if cause:
-            print(f"[RST] last reset cause: {cause} ({name})")
+            console(f"[RST] last reset cause: {cause} ({name})")
             self.log_debug(f"FC reset cause {cause} ({name}) on last boot", "Warnings")
         else:
-            print("[RST] no meaningful reset recorded (unknown/power-on)")
+            console("[RST] no meaningful reset recorded (unknown/power-on)")
             self.log_debug("No meaningful reset cause on last boot", "Info")
 
     def _report_boot_diag(self, parsed):
@@ -1830,14 +1749,141 @@ class MainWindow(QMainWindow):
         self._last_reported_boot_diag = code
         name = self._BOOT_DIAG_NAMES.get(code, "unknown")
         if code in (0, 1):
-            print(f"[BOOT] config load: {code} ({name})")
+            console(f"[BOOT] config load: {code} ({name})")
             self.log_debug(f"FC config load outcome {code}: {name}", "Info")
         else:
             msg = (f"FC reverted to compiled defaults on last boot - {name}. "
                    f"Config, airframe and calibration are gone; load an "
                    f"airframe, Apply & Reboot, then re-calibrate IMU and mag")
-            print(f"[BOOT] {msg}")
+            console(f"[BOOT] {msg}")
             self.log_debug(msg, "Warnings")
+
+    _GPS_ABSENT_CONFIRM_REPORTS = 3
+    _MAG_ABSENT_CONFIRM_REPORTS = 3
+
+    def _update_gps_rx(self, f):
+        """Surface the receiver's wire state, because nothing else can.
+
+        The FC parser accepts only a 0xB5 UBX preamble, so a module emitting
+        NMEA is discarded silently and F.GPSValid cannot tell "no bytes at all"
+        from "bytes we refuse to parse". These three counters are the whole
+        difference: bytes > 0 with packets == 0 is a protocol or baud mismatch;
+        bytes == 0 on a wired port is a dead or absent receiver.
+
+        The counters only exist on FC builds from 2026-11-11 onward, so an older
+        FC shows "---" rather than a row of zeroes that would read as a fault.
+        """
+        if not getattr(f, 'gps_rx_present', False):
+            for lbl in (self.gps_rx_bytes, self.gps_rx_packets, self.gps_rx_drops):
+                lbl.setText("---")
+            self.gps_rx_note.setText("")
+            return
+
+        self.gps_rx_bytes.setText(str(f.gps_rx_bytes))
+        self.gps_rx_packets.setText(str(f.gps_rx_packets))
+        self.gps_rx_drops.setText(str(f.gps_rx_drops))
+
+        if not f.gps_port_wired:
+            note = "port not wired on this board"
+        elif f.gps_rx_bytes == 0:
+            note = "wired, nothing received"
+        elif f.gps_rx_packets == 0:
+            note = "bytes but no UBX packets"
+        else:
+            note = ""
+        self.gps_rx_note.setText(note)
+
+        self._check_gps_absence()
+
+    def _check_gps_absence(self):
+        """Evaluate F.GPSAbsent from the last flag report.
+
+        The nav packet carries no flag block, so the flag bits arrive on a
+        different tag and are kept in current_flag_bits. Deciding only when
+        bit 84 is actually present keeps "not reported yet" from reading as
+        "present", which is the mistake the magnetometer tab made once.
+        """
+        bits = self.current_flag_bits
+        if len(bits) > 84:
+            self._set_gps_absence(bool(bits[84]))
+
+    def _set_gps_absence(self, absent):
+        """Retire the GPS and Navigation boxes when the FC reports no receiver.
+
+        Absence is a positive report (F.GPSAbsent): either the board has no GPS
+        port wired at all, or the port is wired and nothing has ever arrived on
+        it. It is never inferred from a lost fix, so a receiver that is present
+        but not yet locked keeps both boxes visible with their accuracy figures
+        red - that is information the pilot needs, not a missing device.
+
+        Debounced like the magnetometer tab, and latched once hidden: a receiver
+        that starts talking mid-session is a bench fault being cleared, not a
+        configuration change, and a box that reappeared would be a distraction
+        in flight. The FC clears its own flag, so a reboot restores the truth.
+        """
+        if self._gps_absent is True:
+            return
+        if not absent:
+            self._gps_absent_reports = 0
+            return
+        self._gps_absent_reports += 1
+        if self._gps_absent_reports < self._GPS_ABSENT_CONFIRM_REPORTS:
+            return
+        self._gps_absent = True
+        self.gps_box.setVisible(False)
+        self.nav_box.setVisible(False)
+        self.nav_no_gps_label.setText(
+            "No GPS: Hold and WP Nav are inert; RTH becomes an abortable "
+            "forced landing")
+        self.nav_no_gps_label.setVisible(True)
+        self.log_debug("No GPS receiver detected (FC telemetry bit 84) - "
+                       "GPS and Navigation boxes retired for this session", "Info")
+
+    def _check_mag_absence(self):
+        """Evaluate F.HaveMag from the last flag report.
+
+        There is no dedicated F.MagAbsent bit: presence is bit 38 itself,
+        so absence is bit 38 clear on a completed flag report. Deciding
+        only when bit 38 is actually present in the payload keeps "not
+        reported yet" from reading as "absent", the same mistake the
+        magnetometer tab made once.
+        """
+        bits = self.current_flag_bits
+        if len(bits) > 38:
+            self._set_mag_absence(not bool(bits[38]))
+
+    def _set_mag_absence(self, absent):
+        """Retire the mag displays when the FC reports no mag fitted.
+
+        The mag chips in the Flags box, the Mx/My/Mz/Mag Hdg row in the
+        IMU box and the Mag row of the anomaly box all show data that can
+        only ever be zero or stale without a fitted mag, and a permanently
+        red Mag chip or amber MagCal chip is noise the pilot cannot act
+        on. Hidden rather than grayed, like the magnetometer tab.
+
+        Debounced and latched once hidden, mirroring the GPS absence and
+        the magnetometer tab: a mag fitted later needs an FC reboot to be
+        seen, so a mid-session reappearance would be a lie.
+        """
+        if self._mag_absent is True:
+            return
+        if not absent:
+            self._mag_absent_reports = 0
+            return
+        self._mag_absent_reports += 1
+        if self._mag_absent_reports < self._MAG_ABSENT_CONFIRM_REPORTS:
+            return
+        self._mag_absent = True
+        for key in ('mag', 'mag_fail', 'mag_cal', 'ext_mag',
+                    'mag_yaw_disagree'):
+            flag_data = self.flag_labels.get(key)
+            if flag_data is not None:
+                flag_data['widget'].hide()
+        for w in self._mag_row_widgets:
+            w.hide()
+        self.anomaly_box.set_mag_absent()
+        self.log_debug("No magnetometer detected (FC telemetry bit 38) - "
+                       "mag displays retired for this session", "Info")
 
     def _verify_post_commit_config(self, parsed):
         """Gate the deferred post-commit readback on the FC's own reboot report.
@@ -1862,6 +1908,9 @@ class MainWindow(QMainWindow):
 
         self._pending_param_verification = False
         self._armed_boot_verify = False
+        if getattr(self, 'telemetry', None) is not None \
+                and hasattr(self.telemetry, 'arm_reboot_window'):
+            self.telemetry.reboot_expected = False
 
         # The FC has reported, so the reconnect watchdog has served its purpose
         # either way - a late arrival still needs releasing.
@@ -1894,7 +1943,7 @@ class MainWindow(QMainWindow):
             msg = (f"Commit verification FAILED - FC reports {reason}. The "
                    f"config block was not restored from flash, so the commit "
                    f"did not persist. Load an airframe, Apply & Reboot.")
-            print(f"[COMMIT] {msg}")
+            console(f"[COMMIT] {msg}")
             self.log_debug(msg, "Errors")
             return
 
@@ -1940,7 +1989,7 @@ class MainWindow(QMainWindow):
             name = self._IMU_FAULT_NAMES.get(code, "unknown")
             msg = (f"IMU integrity fault code={code} ({name}); detected {rec}x "
                    f"- NOT recovered (report-only), investigate the sensor path")
-            print(f"[IMU] {msg}")
+            console(f"[IMU] {msg}")
             self.log_debug(msg, "Errors")
 
     def _on_raw_bytes(self, data: bytes):
@@ -1948,6 +1997,12 @@ class MainWindow(QMainWindow):
         and printable alike)."""
         if self.raw_logger.active:
             self.raw_logger.write(data)
+
+    def _on_tx_bytes(self, data: bytes):
+        """Tee GCS->FC serial writes to the always-on raw log (direction
+        marker 0xAB), mirroring _on_raw_bytes for the uplink."""
+        if self.raw_logger.active:
+            self.raw_logger.write_tx(data)
 
     def select_workspace_folder(self):
         start = self.log_dir or workspace.workspace_dir()
@@ -2038,8 +2093,17 @@ class MainWindow(QMainWindow):
         self.telemetry = TelemetryThread(port, baud)
         self.telemetry.data_received.connect(self.process_packet)
         self.telemetry.raw_bytes.connect(self._on_raw_bytes)
+        self.telemetry.tx_bytes.connect(self._on_tx_bytes)
         self.telemetry.connected.connect(self.on_connected)
         self.telemetry.error.connect(self.on_error)
+        # Transmit stays muted port-open -> first tag-79 (eLive*): the FC is
+        # deep in boot and cannot service uplink before its main loop is up.
+        self._tx_muted = True
+        if getattr(self, 'param_window', None) is not None:
+            btn = getattr(self.param_window, 'commit_btn', None)
+            if btn is not None:
+                btn.setEnabled(False)
+        self.log_debug("🔇 Uplink muted until the FC reports its main loop (tag 79)", "Info")
         self.telemetry.start()
         
         self.connect_btn.setText("Connecting...")
@@ -2068,9 +2132,6 @@ class MainWindow(QMainWindow):
         self.connected = False
         self._in_flight = False
         self.raw_logger.stop()
-        self._trace_fc_value = None
-        self._trace_write_pending = None
-        self._set_trace_combo_state('neutral')
         self.connect_btn.setText("Connect")
         self.connect_btn.setStyleSheet("background-color: red; color: white; font-weight: bold;")
         self.connect_btn.setEnabled(True)
@@ -2098,38 +2159,47 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
             self.statusBar().showMessage("Connected to UAVX")
             self.log_debug("✅ Connected to UAVX", "Info")
-            # Skip the connect-time tag-71 when a commit's verification is
-            # outstanding - _verify_post_commit_config() issues that single
-            # readback once the first post-reconnect tag-67 reports the config
-            # block is valid. Avoids a racing double-read.
-            if self._pending_param_verification:
-                # Arm the tag-67 boot-edge trigger HERE, on the genuine
-                # post-reboot reconnection. The FC waits 500 ms before it
-                # resets, and the outgoing instance keeps streaming tag-67
-                # with the pre-commit boot_diag during that window; arming
-                # only on reconnect guarantees the readback is served by the
-                # FC that came back, not the one on its way down.
-                self._armed_boot_verify = True
-                # The FC sends tag 68 once at the end of InitHarness(), which is
-                # buffered and drained on either link - but on USB the host may
-                # still be mid-reopen backoff, so ask for it again. Free when
-                # nothing is pending verification.
-                self.send_request(PacketTag.REQUEST, PacketTag.REBOOT_INFO, 0)
-            else:
-                self.send_request(PacketTag.PARAM_TAGGED_READ, 255, 0, None)
-            self.send_request(PacketTag.MIN, 0, 0, None)
-            self.send_request(PacketTag.AFNAME, 0, 0, None)
-            self.send_request(PacketTag.TUNING, 0, 0, None)
-            self._identify_poll_timer.start(1000)
+            # The connect-time uplink only runs once the FC has proven its
+            # main loop is up (first tag-79); while muted, case 79 defers it.
+            if not self._tx_muted:
+                self._run_connect_burst()
         else:
             self._in_flight = False
             self.raw_logger.stop()
             self._identify_poll_timer.stop()
+            self._meta_sweep_timer.stop()
+            self._meta_digest_timer.stop()
             self.connect_btn.setText("Connect")
             self.connect_btn.setStyleSheet("background-color: red; color: white; font-weight: bold;")
             self.status_label.setText("● Disconnected")
             self.status_label.setStyleSheet("color: red; font-weight: bold;")
     
+    def _run_connect_burst(self):
+        # Connect-time uplink: readback + pollers. Only ever called once the
+        # FC is known alive (case 79 unmute, or on_connected with TX already
+        # unmuted). Skip the connect-time tag-71 when a commit's verification
+        # is outstanding - _verify_post_commit_config() issues that single
+        # readback once the first post-reconnect tag-67 reports the config
+        # block is valid. Avoids a racing double-read.
+        if self._pending_param_verification:
+            # Arm the tag-67 boot-edge trigger on the genuine post-reboot
+            # reconnection. The FC waits 500 ms before it resets, and the
+            # outgoing instance keeps streaming tag-67 with the pre-commit
+            # boot_diag during that window; arming only now guarantees the
+            # readback is served by the FC that came back.
+            self._armed_boot_verify = True
+            # The FC sends tag 68 once at the end of InitHarness(), which is
+            # buffered and drained on either link - but on USB the host may
+            # still be mid-reopen backoff, so ask for it again. Free when
+            # nothing is pending verification.
+            self.send_request(PacketTag.REBOOT_INFO, 0, 0)
+        else:
+            self.send_request(PacketTag.PARAM_TAGGED_READ, 255, 0, None)
+        self.send_request(PacketTag.AFNAME, 0, 0, None)
+        self.send_request(PacketTag.TUNING, 0, 0, None)
+        self._identify_poll_timer.start(1000)
+        self._start_meta_sweep()
+
     def on_error(self, error: str):
         self.connect_btn.setEnabled(True)
         self.statusBar().showMessage(f"Error: {error}")
@@ -2184,7 +2254,7 @@ class MainWindow(QMainWindow):
         send/verify outcomes are also printed to the console (stdout) where
         they survive for post-mortem alongside the rawlog."""
         self.log_debug(message, level)
-        print(message)
+        console(message)
 
     def _build_packet_with_checksum(self, data: bytes) -> bytes:
         packet = bytearray()
@@ -2210,6 +2280,9 @@ class MainWindow(QMainWindow):
         return bytes(packet)
     
     def send_request(self, tag: int, a1: int, a2: int, request_id=None):
+        if self._tx_muted:
+            self.log_debug("🔇 TX muted until tag 79 - request dropped", "Warnings")
+            return
         if not self.connected or not self.telemetry:
             self.log_debug("❌ Cannot send request - not connected", "Errors")
             return
@@ -2232,7 +2305,7 @@ class MainWindow(QMainWindow):
             self._pending_misc_command = a1
 
         try:
-            serial_port.write(packet)
+            self.telemetry.write(packet)
             req_data = {'request_tag': tag, 'a1': a1, 'a2': a2}
             packet_logger.log_sent(PacketTag.REQUEST, "REQUEST", req_data)
             self.log_debug(f"📤 Sent request: tag={tag}, a1={a1}, a2={a2}", "Info")
@@ -2251,6 +2324,9 @@ class MainWindow(QMainWindow):
     
     def send_raw_packet(self, tag: int, body: bytes):
         """Send an arbitrary packet with given tag and body"""
+        if self._tx_muted:
+            self.log_debug("🔇 TX muted until tag 79 - raw packet dropped", "Warnings")
+            return
         if not self.connected or not self.telemetry:
             self.log_debug("❌ Cannot send - not connected", "Errors")
             return
@@ -2263,7 +2339,7 @@ class MainWindow(QMainWindow):
         raw_data.extend(body)
         packet = self._build_packet_with_checksum(raw_data)
         try:
-            serial_port.write(packet)
+            self.telemetry.write(packet)
             self.log_debug(f"📤 Sent raw packet: tag={tag}, len={len(body)}", "Info")
         except Exception as e:
             self.log_debug(f"❌ Failed to send raw packet: {e}", "Errors")
@@ -2310,6 +2386,9 @@ class MainWindow(QMainWindow):
         flash write as the parameters — the single source of truth for the
         airframe the GCS displays after restart.
         """
+        if self._tx_muted:
+            self.log_debug("🔇 TX muted until tag 79 - AFName dropped", "Warnings")
+            return
         if not self.connected or not self.telemetry:
             self._trace("❌ [commit] Cannot send AFName - not connected", "Errors")
             return
@@ -2329,20 +2408,25 @@ class MainWindow(QMainWindow):
         raw_data.extend(body)
         packet = self._build_packet_with_checksum(raw_data)
         try:
-            n = serial_port.write(packet)
+            n = self.telemetry.write(packet)
             self._trace(f"📤 [commit] Sent AFName: {body.decode('ascii')!r} ({len(packet)} B wired, write()={n})", "Info")
         except Exception as e:
             self._trace(f"❌ [commit] Failed to send AFName: {e}", "Errors")
 
     def send_param_commit(self):
         """Tell FC to save current params to flash."""
+        if self._tx_muted:
+            self.log_debug("🔇 TX muted until tag 79 - param commit dropped", "Warnings")
+            return
         raw_data = bytearray([PacketTag.PARAM_COMMIT])
         raw_data.extend(struct.pack('<H', 0))
         packet = self._build_packet_with_checksum(raw_data)
         serial_port = getattr(self.telemetry, 'serial', None)
         if serial_port and serial_port.is_open:
+            if hasattr(self.telemetry, 'arm_reboot_window'):
+                self.telemetry.arm_reboot_window()
             try:
-                serial_port.write(packet)
+                self.telemetry.write(packet)
                 self.log_debug("📤 Sent param commit")
             except Exception as e:
                 self.log_debug(f"❌ Failed to send commit: {e}", "Errors")
@@ -2359,6 +2443,9 @@ class MainWindow(QMainWindow):
         has no widget for from the last full tag-71 readback so a block write can
         never zero a parameter the GCS does not manage.
         """
+        if self._tx_muted:
+            self.log_debug("🔇 TX muted until tag 79 - param image dropped", "Warnings")
+            return
         if not self.param_window:
             self._trace("❌ [commit] Cannot send param image - no parameter window", "Errors")
             return
@@ -2379,7 +2466,7 @@ class MainWindow(QMainWindow):
         raw_data.extend(struct.pack('<I', crc))
         packet = self._build_packet_with_checksum(raw_data)
         try:
-            n = serial_port.write(packet)
+            n = self.telemetry.write(packet)
             self._trace(
                 f"📤 [commit] Sent param image ({len(body)} B + CRC 0x{crc:08X}, "
                 f"{len(packet)} B wired, write()={n})")
@@ -2396,15 +2483,20 @@ class MainWindow(QMainWindow):
         ACK: the link drop and reconnect are the confirmation, and a reboot ACK
         would just re-enter the same post-reset race this handshake removes.
         """
+        if self._tx_muted:
+            self.log_debug("🔇 TX muted until tag 79 - reboot dropped", "Warnings")
+            return
         serial_port = getattr(self.telemetry, 'serial', None)
         if not serial_port or not serial_port.is_open:
             self._trace("❌ [commit] Cannot send reboot command - serial port not open", "Errors")
             return
+        if hasattr(self.telemetry, 'arm_reboot_window'):
+            self.telemetry.arm_reboot_window()
         raw_data = bytearray([PacketTag.REBOOT])
         raw_data.extend(struct.pack('<H', 0))
         packet = self._build_packet_with_checksum(raw_data)
         try:
-            n = serial_port.write(packet)
+            n = self.telemetry.write(packet)
             self._trace(f"📤 [commit] Sent reboot command ({len(packet)} B wired, write()={n})")
         except Exception as e:
             self._trace(f"❌ [commit] Failed to send reboot command: {e}", "Errors")
@@ -2431,8 +2523,6 @@ class MainWindow(QMainWindow):
                 self.config1_cache = int(parsed.entries[ParamIndex.CONFIG1_BITS][1])
             if ParamIndex.CONFIG2_BITS in parsed.entries:
                 self.config2_cache = int(parsed.entries[ParamIndex.CONFIG2_BITS][1])
-            if ParamIndex.TRACE_TYPE in parsed.entries:
-                self._sync_trace_combo(parsed.entries[ParamIndex.TRACE_TYPE][1])
             if self.param_window is not None:
                 self.param_window.update_params_from_typed(parsed)
             else:
@@ -2484,6 +2574,11 @@ class MainWindow(QMainWindow):
         acknowledged, so a caller about to commit a flash block can refuse
         rather than pack a partially applied image.
         """
+        if self._tx_muted:
+            self.log_debug("🔇 TX muted until tag 79 - param batch dropped", "Warnings")
+            if on_complete:
+                on_complete([])
+            return
         if not self.connected or not self.telemetry:
             on_complete and on_complete([])
             return
@@ -2529,6 +2624,10 @@ class MainWindow(QMainWindow):
             else:
                 skipped.append(i)
                 continue
+            if not math.isfinite(fval):
+                raise ValueError(
+                    f"Param {i} ({ParamIndex(i).name}) = {fval!r} is not finite "
+                    f"— refusing to write it")
             params.append((i, fval))
 
         if skipped:
@@ -2580,6 +2679,8 @@ class MainWindow(QMainWindow):
         cb and cb(unconfirmed)
 
     def _send_next_param(self):
+        if self._tx_muted:
+            return
         # One index in flight at a time: the next param is not sent until the
         # FC has echoed the current one (or the watchdog gives up on it).
         if self._param_write_await_idx is not None:
@@ -2611,7 +2712,7 @@ class MainWindow(QMainWindow):
             raw_data.append(idx)
             raw_data.extend(struct.pack('<f', fval))
             packet = self._build_packet_with_checksum(raw_data)
-            serial_port.write(packet)
+            self.telemetry.write(packet)
         except Exception as e:
             self.log_debug(f"❌ Failed to send param {idx}: {e}", "Errors")
             self._param_write_list = []
@@ -2725,13 +2826,16 @@ class MainWindow(QMainWindow):
     def _write_params_live(self, items):
         """Queue raw (idx, fc-float) param writes through the tag-17 sender.
 
-        Live-write path (debounced spinbox/combo changes and the trace combo):
+        Live-write path (debounced spinbox/combo changes):
         writes reach the FC's RAM image immediately; flash is a separate,
         explicit commit. If a batch is already in flight, append to its tail —
         the pump drains the list until empty, so nothing is dropped (the GCS
         commit path depends on every pending value landing in RAM before the
         flash commit packs the block).
         """
+        if self._tx_muted:
+            self.log_debug("🔇 Param write dropped - uplink muted until tag 79", "Warnings")
+            return
         if not items:
             return
         serial_port = getattr(self.telemetry, 'serial', None)
@@ -2766,46 +2870,6 @@ class MainWindow(QMainWindow):
         self._param_write_await_value = None
         self._param_write_ack_timer.start()
         self._send_next_param()
-
-    def _set_trace_combo_state(self, state):
-        style = _TRACE_STATE_STYLE.get(state)
-        self.trace_type_combo.setStyleSheet(style or "")
-        suffix = {
-            'pending': ' — orange: awaiting FC confirmation',
-            'synced': ' — green: value confirmed by the FC',
-        }.get(state, '')
-        self.trace_type_combo.setToolTip(self._trace_combo_tooltip + suffix)
-
-    def _set_trace_combo_value(self, idx):
-        if not 0 <= idx < self.trace_type_combo.count():
-            idx = 1
-        self._trace_combo_loading = True
-        self.trace_type_combo.setCurrentIndex(idx)
-        self._trace_combo_loading = False
-
-    def _on_trace_type_changed(self, index):
-        if self._trace_combo_loading or not self.connected:
-            return
-        tt = self.trace_type_combo.itemData(index)
-        if tt is None:
-            return
-        self._trace_write_pending = int(tt)
-        self._set_trace_combo_state('pending')
-        self.log_debug(f"🎚 Trace type set to {tt}", "Info")
-        self._write_param_direct(int(ParamIndex.TRACE_TYPE), float(tt))
-
-    def _sync_trace_combo(self, fc_val):
-        f = int(round(fc_val))
-        self._trace_fc_value = f
-        cur = self.trace_type_combo.currentData()
-        if cur == f:
-            self._trace_write_pending = None
-            self._set_trace_combo_state('synced')
-        elif self._trace_write_pending is not None:
-            self._set_trace_combo_state('pending')
-        else:
-            self._set_trace_combo_value(f)
-            self._set_trace_combo_state('synced')
 
     def _check_speech_events(self, f):
         batt = f.battery_volts
@@ -2899,12 +2963,12 @@ class MainWindow(QMainWindow):
         TAG_NAMES = {
             13: "Flight", 14: "Nav", 15: "Stats", 16: "Control", 17: "Param",
             18: "Min", 19: "Origin", 20: "WP", 21: "Mission", 22: "RC",
-            50: "Request", 51: "ACK", 52: "Misc", 53: "Unused", 54: "BB",
+            50: "Request", 51: "ACK", 52: "Misc", 53: "Unused", 54: "Unused",
             55: "Unused", 56: "Unused", 57: "Tuning", 58: "Unused", 59: "Guidance",
             60: "Unused", 61: "Unused", 62: "Calibration", 63: "AFName",
             64: "Wind", 65: "Unused", 66: "SerialPorts", 67: "ExecTime",
             68: "Unused", 69: "LinkStats", 70: "InitState", 71: "ParamRead",
-            76: "I2CErrors", 77: "ParamImage",
+            76: "I2CErrors", 77: "ParamImage", 79: "State",
         }
         tag_name = TAG_NAMES.get(tag, f"Unknown({tag})")
         tag_ok = "OK" if parsed is not None else "FAIL"
@@ -2914,9 +2978,9 @@ class MainWindow(QMainWindow):
         now_t = time.time()
         last = getattr(self, '_rx_print_t', {})
         interval = last.get(tag, 0.0)
-        if tag_ok == "FAIL" or tag > 68 or now_t - interval >= 0.8:
+        if tag_ok == "FAIL" or (tag > 68 and tag not in (79, 80)) or now_t - interval >= 0.8:
             detail = f" raw={data.hex()}" if tag_ok == "FAIL" else ""
-            print(f"[RX] tag={tag} ({tag_name}) {tag_ok} len={len(data)}B{detail}")
+            console(f"[RX] tag={tag} ({tag_name}) {tag_ok} len={len(data)}B{detail}")
         last[tag] = now_t
         self._rx_print_t = last
         if self.param_window and hasattr(self.param_window, 'retry_read_if_pending'):
@@ -2940,7 +3004,7 @@ class MainWindow(QMainWindow):
                             for i, v in enumerate(parsed.pwm)]
                 pwm_str = f" pwm={' '.join(pwm_vals)}"
             fs_name = FlightState.get_name(parsed.flight_state)
-            print(f"[FLIGHT] state={fs_name} "
+            console(f"[FLIGHT] state={fs_name} "
                   f"{'A' if fbok(29) else '_'}{'E' if fbok(27) else '_'}"
                   f"{'I' if fbok(37) else '_'}{'M' if fbok(38) else '_'}{'G' if fbok(6) else '_'}"
                   f" ang=({parsed.angle_roll*r2d:+6.1f},{parsed.angle_pitch*r2d:+6.1f},{parsed.angle_yaw*r2d:+6.1f})"
@@ -2950,27 +3014,27 @@ class MainWindow(QMainWindow):
                   f" acc=({parsed.acc_lr:+5.2f},{parsed.acc_fb:+5.2f},{parsed.acc_du:+5.2f})"
                   f" thr={parsed.desired_throttle:.3f} alt={parsed.altitude:.1f}{pwm_str}")
         elif tag == 14 and hasattr(parsed, 'gps_lat') and dump_ok:
-            print(f"[NAV] lat={parsed.gps_lat:.6f} lon={parsed.gps_lon:.6f}"
+            console(f"[NAV] lat={parsed.gps_lat:.6f} lon={parsed.gps_lon:.6f}"
                   f" spd={parsed.gps_vel:.1f} hdg={parsed.gps_heading * 57.2958:.1f}"
                   f" sats={parsed.gps_sats} fix={parsed.gps_fix}")
         elif tag == 16 and hasattr(parsed, 'angle_roll') and dump_ok:
             r2d = 57.2958
-            print(f"[CTRL] ang=({parsed.angle_roll*r2d:+6.1f},{parsed.angle_pitch*r2d:+6.1f},{parsed.angle_yaw*r2d:+6.1f})"
+            console(f"[CTRL] ang=({parsed.angle_roll*r2d:+6.1f},{parsed.angle_pitch*r2d:+6.1f},{parsed.angle_yaw*r2d:+6.1f})"
                   f" rate=({parsed.rate_roll*r2d:+6.2f},{parsed.rate_pitch*r2d:+6.2f},{parsed.rate_yaw*r2d:+6.2f})"
                   f" thr={parsed.desired_throttle:.3f}")
         elif tag == 22 and hasattr(parsed, 'rc_channels') and dump_ok:
             rc = parsed.rc_channels
             if rc:
                 def rc_name(i):
-                    return ["Thr","Rol","Pit","Yaw","Nav","Att","NQ","Cam","Trace","Trn","PT","Dive"][i]
+                    return ["Thr","Rol","Pit","Yaw","Nav","Att","NQ","Cam","Aux2","Trn","PT","Dive"][i]
                 parts = [f"{rc_name(i)}={round(rc[i]) if math.isfinite(rc[i]) else 'nan'}"
                          for i in range(min(len(rc), 12))]
-                print("[RC] " + " ".join(parts))
+                console("[RC] " + " ".join(parts))
         elif tag == 62 and isinstance(parsed, dict) and dump_ok:
             flags = parsed.get('flags', [])
             if len(flags) > 5:
                 imu   = bool(flags[4] & 32)  # bit 5 byte 4 = IMUActive
-                mag   = bool(flags[4] & 64)  # bit 6 byte 4 = MagnetometerActive
+                mag   = bool(flags[4] & 64)  # bit 6 byte 4 = F.HaveMag
                 imuc  = bool(flags[5] & 16)  # bit 4 byte 5 = IMUCal
                 magc  = bool(flags[5] & 2)   # bit 1 byte 5 = MagnetometerCalibrated
                 rb    = parsed.get('rate_bias', [])
@@ -2982,7 +3046,7 @@ class MainWindow(QMainWindow):
                 cfg   = (f"mag=[A={hx(parsed.get('mag_cfg_a'))} "
                          f"B={hx(parsed.get('mag_cfg_b'))} "
                          f"MODE={hx(parsed.get('mag_mode'))}]")
-                print(f"[CALIB] IMU={'Y' if imu else 'N'}{'C' if imuc else '_'}"
+                console(f"[CALIB] IMU={'Y' if imu else 'N'}{'C' if imuc else '_'}"
                       f" Mag={'Y' if mag else 'N'}{'C' if magc else '_'} {gs} {ids} {cfg}")
 
         if tag == 13:
@@ -3005,7 +3069,9 @@ class MainWindow(QMainWindow):
                                 "gps_type", "gps_update_rate",
                                 "curr_wp", "wp_bearing",
                                 "distance_to_wp", "cross_track_error",
-                                "mag_var_wmm")}
+                                "mag_var_wmm",
+                                "gps_port_wired", "gps_rx_present",
+                                "gps_rx_bytes", "gps_rx_packets", "gps_rx_drops")}
                 else:
                     old_pwm = None
                     old_rc = None
@@ -3048,7 +3114,9 @@ class MainWindow(QMainWindow):
                                  "gps_type", "gps_update_rate",
                                  "curr_wp", "wp_bearing", "cross_track_error",
                                  "nav_state", "alarm_state",
-                                 "mag_var_wmm"):
+                                 "mag_var_wmm",
+                                 "gps_port_wired", "gps_rx_present",
+                                 "gps_rx_bytes", "gps_rx_packets", "gps_rx_drops"):
                         setattr(self.flight_data, attr, getattr(parsed, attr, getattr(self.flight_data, attr)))
                     data_manager.update_flight_data(self.flight_data)
 
@@ -3104,7 +3172,11 @@ class MainWindow(QMainWindow):
                         ack_handler.handle_ack(at, ok)
 
                     cmd = getattr(self, '_pending_misc_command', None)
-                    if at == PacketTag.MISC and cmd is not None:
+                    # The FC calibration ACKs (IMU/Accel/Mag) go out with tag
+                    # 52, not with the MiscCommand sub-tag - the documented
+                    # contract for tag-52 acks. ESC_PROG acks with the sub-tag.
+                    # Accept both.
+                    if cmd is not None and (at == cmd or at == PacketTag.MISC):
                         self._pending_misc_command = None
                         if cmd == MiscCommand.ESC_PROG:
                             if ok:
@@ -3206,7 +3278,7 @@ class MainWindow(QMainWindow):
 
             case 66:
                 packet_logger.log_received(66, "SERIAL", parsed)
-                if isinstance(parsed, dict) and 'telemetry' in parsed:
+                if isinstance(parsed, dict) and 'ports' in parsed:
                     self.serial_ports = parsed
                     self.update_serial_ports_display()
 
@@ -3218,6 +3290,36 @@ class MainWindow(QMainWindow):
                 # detection (post-commit verification) is tag 68's job.
                 if parsed is not None and hasattr(parsed, 'pf_terms'):
                     self._pf_term_mask = parsed.pf_terms or 0
+
+            case 79:
+                # First eLive* (60+) means the FC finished boot and its main
+                # loop is up: lift the port-open transmit mute and run the
+                # connect burst on_connected deferred.
+                if (self._tx_muted and not self.replaying and parsed is not None
+                        and getattr(parsed, 'state', -1) >= FlightState.eLivePreflight):
+                    self._tx_muted = False
+                    self.log_debug("🔊 Uplink unmuted - FC main loop up (tag 79)", "Info")
+                    if getattr(self.param_window, '_commit_state', None) == 'pending':
+                        btn = getattr(self.param_window, 'commit_btn', None)
+                        if btn is not None:
+                            btn.setEnabled(True)
+                    self._run_connect_burst()
+                    self._send_next_param()
+                # One byte, emitted on change from inside the routine it names.
+                # Boot steps are 14..38 and are the load-bearing part: the last
+                # one before a reset names the routine that hung. The eLive*
+                # liveness markers (60..70) alternate with the real state every
+                # announce period, so they are stored but not logged - the raw
+                # log keeps them, and logging them would print ~20 lines a
+                # second forever.
+                if parsed is not None and hasattr(parsed, 'state'):
+                    prev_state = self._last_fc_state
+                    self._last_fc_state = parsed.state
+                    if (parsed.state < FlightState.eLivePreflight
+                            and parsed.state != prev_state):
+                        self.log_debug(
+                            f"  FC state {parsed.state} "
+                            f"({FlightState.get_name(parsed.state)})", "Info")
 
             case 67:
                 packet_logger.log_received(67, "EXEC", parsed)
@@ -3294,18 +3396,6 @@ class MainWindow(QMainWindow):
                 if self._identify_window is not None:
                     self._identify_window._refresh(parsed)
 
-            case 54:
-                packet_logger.log_received(54, "BB", parsed)
-                if isinstance(parsed, (bytes, bytearray)) and len(parsed) >= 4:
-                    seq_no = struct.unpack('<i', parsed[:4])[0]
-                    chunk = parsed[4:]
-                    self._bb_chunks[seq_no] = chunk
-                    total = len(self._bb_chunks) * 128
-                    self.log_debug(f"📦 BB chunk {seq_no} ({len(chunk)}B, ~{total}B total)", "Info")
-                    self._bb_dump_timer.start(500)
-                    if len(chunk) < 128:
-                        self._finalize_bb_dump()
-
             case 17:
                 packet_logger.log_received(17, "PARAM", parsed)
                 self._handle_param_packet(parsed)
@@ -3318,14 +3408,166 @@ class MainWindow(QMainWindow):
                 packet_logger.log_received(71, "PARAM_TAGGED", parsed)
                 self._handle_param_packet(parsed)
 
+            case 58:
+                packet_logger.log_received(58, "META_REQ", parsed)
+                # parse_packet hands every parse_* function the BODY. Handing
+                # this one the whole frame made parse_meta_packet read the SOH
+                # (0x01) as the meta tag, fail its length test and return None,
+                # so the import path was inert while looking wired. Reaching
+                # this arm means data[0] == SOH and the u16 length is in range,
+                # so the slice needs no further guard.
+                self._on_meta_packet(data[4:4 + extract_short(data, 2)])
+
             case _:
                 packet_logger.log_received(tag, f"TAG{tag}", parsed)
 
         MISC_TAGS = {15, 21, 50, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 65, 67, 68, 74, 76}
         if tag in MISC_TAGS and self.misc_window and self.misc_window.isVisible():
-            body = data[3:3+data[2]] if len(data) > 3 and data[0] == 0x01 else data
+            body = data[4:4 + extract_short(data, 2)]
             self.misc_window.add_packet(tag, parsed if parsed is not None else body, "R")
     
+    def _start_meta_sweep(self):
+        """Ask for the FC's schema digest first: one packet says whether the
+        generated projection is current, and the 128-tag sweep only runs when it
+        is not (or when the FC predates the v2 contract and cannot answer)."""
+        self._meta_sweep_timer.stop()
+        self._meta_sweep_idx = 0
+        self._meta_sweep_max = max(PARAMETER_DEFS) + 1
+        self._meta_sweep_answered = set()
+        self._meta_sweep_drift = 0
+        self._meta_sweep_route = ""
+        self._meta_digest_seen = False
+        self.send_request(PacketTag.META_REQ, 0xFF, 0)
+        self._meta_digest_timer.start(600)
+
+    def _on_meta_digest(self, digest):
+        self._meta_digest_timer.stop()
+        self._meta_digest_seen = True
+        if digest == PARAM_META_DIGEST:
+            self.log_debug(
+                f"param metadata: schema digest 0x{digest:08X} matches the FC - "
+                f"nothing to import", "Info")
+        else:
+            self.log_debug(
+                f"param metadata: schema digest differs (GCS 0x{PARAM_META_DIGEST:08X} "
+                f"vs FC 0x{digest:08X}) - importing the live ParamTable", "Warnings")
+            self._begin_meta_sweep("digest mismatch")
+
+    def _meta_digest_timeout(self):
+        if self._meta_digest_seen or not self.connected:
+            return
+        self.log_debug(
+            "param metadata: no digest reply within 600 ms - the FC either "
+            "predates contract v2 or the reply was lost; sweeping all tags", "Info")
+        self._begin_meta_sweep("digest unanswered")
+
+    def _begin_meta_sweep(self, route):
+        self._meta_sweep_route = route
+        self._meta_sweep_idx = 0
+        self._meta_sweep_timer.start(40)
+
+    def _meta_sweep_tick(self):
+        if not self.connected:
+            self._meta_sweep_timer.stop()
+            return
+        if self._meta_sweep_idx >= self._meta_sweep_max:
+            self._meta_sweep_finalise()
+            return
+        self.send_request(PacketTag.META_REQ, self._meta_sweep_idx, 0)
+        self._meta_sweep_idx += 1
+
+    def _meta_sweep_finalise(self):
+        self._meta_sweep_timer.stop()
+        n = self._meta_sweep_max
+        route = self._meta_sweep_route or "unspecified route"
+        unanswered = [i for i in range(n) if i not in self._meta_sweep_answered]
+        if unanswered:
+            preview = ", ".join(str(i) for i in unanswered[:12])
+            self._trace(
+                f"⚠ param metadata: {len(unanswered)}/{n} tag(s) unanswered "
+                f"after {route} (first: {preview})", "Errors")
+        else:
+            # _trace, not log_debug: the status bar line is transient and the
+            # very next tag overwrites it, so a drift would be visible for one
+            # frame only. stdout survives for post-mortem, needs no new widget,
+            # no dialog and no latch. Silent when the digest matched - a clean
+            # connect never sweeps, so this never fires on the good path.
+            self._trace(
+                f"param metadata: {n} tags verified after {route}, "
+                f"{self._meta_sweep_drift} drift(s)", "Info")
+        if self._meta_sweep_drift and self.param_window is not None:
+            # The adopted PARAM_LIMITS only reach the widgets through this -
+            # otherwise a drifted bound is a number in a table and nothing more.
+            self.param_window._apply_airframe_limits()
+            self.log_debug(
+                "param metadata: adopted FC name/limits/boot flags and refreshed "
+                "the spinbox ranges - regenerate parameters.py to silence this "
+                "(scripts/generate_params_from_fc.py --gen-gcs)", "Warnings")
+
+    def _on_meta_packet(self, body: bytes):
+        """Tag-58 response body: verify the generated schema against the live FC
+        ParamTable (the single arbiter), then adopt what drifted. The FC wins
+        at runtime; every drift is an Error trace so the GCS copy gets
+        regenerated.
+
+        `body` is the packet body, exactly as parse_packet passes it to every
+        other parse_* function - NOT the framed packet. The v2 contract begins
+        at the meta tag, so a frame would shift every field by four bytes.
+        """
+        from packet_parser import parse_meta_packet
+        meta = parse_meta_packet(body)
+        if not meta:
+            return
+        idx = meta.get("param_idx")
+        if idx == 0xFF:
+            self._on_meta_digest(meta.get("digest"))
+            return
+        if idx is None or idx not in PARAMETER_DEFS or idx not in PARAM_LIMITS:
+            return
+        self._meta_sweep_answered.add(idx)
+
+        def _close(w, g):
+            tol = 1e-4 * max(1.0, abs(g))
+            return abs(w - g) <= tol
+
+        issues = []
+        wname = meta.get("name") or ""
+        gname = PARAMETER_DEFS[idx].name
+        if wname != gname:
+            issues.append(f"name '{gname}' -> '{wname}'")
+
+        glo, ghi = PARAM_LIMITS[idx]
+        wlo = meta.get("min", glo)
+        whi = meta.get("max", ghi)
+        if not (_close(wlo, glo) and _close(whi, ghi)):
+            issues.append(f"limits ({glo}, {ghi}) -> ({wlo}, {whi})")
+
+        wtype = meta.get("type")
+        if wtype is not None:
+            gtype = "FLOAT" if PARAM_TYPES.get(idx) == "FLOAT" else "U8"
+            if (wtype == 3) != (gtype == "FLOAT"):
+                issues.append(f"type {gtype} -> {'FLOAT' if wtype == 3 else 'U8'}")
+
+        wboot = meta.get("boot")
+        if wboot is not None and bool(wboot) != (idx in PARAM_BOOT_REQUIRED):
+            issues.append(
+                f"boot-scoped {idx in PARAM_BOOT_REQUIRED} -> {bool(wboot)}")
+            if wboot:
+                PARAM_BOOT_REQUIRED.add(idx)
+            else:
+                PARAM_BOOT_REQUIRED.discard(idx)
+
+        if issues:
+            self._meta_sweep_drift += 1
+            for issue in issues:
+                self.log_debug(f"⚠ schema drift tag {idx}: {issue}", "Errors")
+
+        # Parameter is a frozen dataclass: rebind the slot, never mutate the field
+        # (in-place assignment raises FrozenInstanceError inside a Qt slot, which
+        # PyQt escalates to qFatal).
+        PARAMETER_DEFS[idx] = replace(PARAMETER_DEFS[idx], name=wname)
+        PARAM_LIMITS[idx] = (wlo, whi)
+
     def update_config_colors(self):
         """Update config bit display based on current parameters"""
         config1 = self.config1_cache
@@ -3448,7 +3690,7 @@ class MainWindow(QMainWindow):
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['vrs', 'rc_map_fail', 'fence_alarm', 'excess_lift', 'snr', 'ext_mag', 'imu_fault_lat', 'cfg_pend']:
+                elif flag_key in ['vrs', 'rc_map_fail', 'fence_alarm', 'excess_lift', 'snr', 'ext_mag', 'imu_fault_lat', 'cfg_pend', 'mag_yaw_disagree']:
                     color = "#f39c12"
                     text_color = "white"
                     font_weight = "bold"
@@ -3456,7 +3698,7 @@ class MainWindow(QMainWindow):
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['gps_ok', 'origin', 'gps_alt', 'alt_hold', 'hold_alt', 'signal']:
+                elif flag_key in ['gps_ok', 'gps_active', 'origin', 'gps_alt', 'alt_hold', 'hold_alt', 'signal']:
                     color = "#27ae60"
                     text_color = "white"
                     font_weight = "bold"
@@ -3473,7 +3715,7 @@ class MainWindow(QMainWindow):
                     text_color = "white"
                     font_weight = "bold"
             else:
-                if flag_key in ['gps_ok', 'baro', 'imu', 'mag']:
+                if flag_key in ['gps_ok', 'gps_active', 'baro', 'imu', 'mag']:
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
@@ -3568,6 +3810,8 @@ class MainWindow(QMainWindow):
         if hasattr(f, 'flag_bits') and f.flag_bits:
             self.current_flag_bits = f.flag_bits
             self.update_flag_colors(f.flag_bits)
+            self._check_gps_absence()
+            self._check_mag_absence()
         elif self.current_flag_bits:
             self.update_flag_colors(self.current_flag_bits)
         
@@ -3703,6 +3947,7 @@ class MainWindow(QMainWindow):
             self.gps_vacc.setText(f"{f.gps_vacc:.1f}")
             self.gps_sacc.setText(f"{f.gps_sacc:.1f}")
             self.gps_cacc.setText(f"{f.gps_cacc:.1f}")
+
             color = "#27ae60" if gps_valid else "#e74c3c"
             self.gps_lat.setStyleSheet(f"color: {color}; font-weight: bold;")
             self.gps_lon.setStyleSheet(f"color: {color}; font-weight: bold;")
@@ -3712,6 +3957,8 @@ class MainWindow(QMainWindow):
             self.gps_vacc.setStyleSheet(f"color: {color};")
             self.gps_sacc.setStyleSheet(f"color: {color};")
             self.gps_cacc.setStyleSheet(f"color: {color};")
+
+            self._update_gps_rx(f)
         
         if hasattr(f, 'gps_update_rate') and f.gps_update_rate > 0:
             self.gps_rate_label.setText(f"{f.gps_update_rate:.0f} Hz")
@@ -3862,31 +4109,138 @@ class MainWindow(QMainWindow):
             for bar in self.control_bars:
                 bar.setValue(0)
 
+    def _clear_serial_rows(self):
+        for w in self._serial_widgets.values():
+            for key in ('name', 'baud', 'flags', 'queue', 'ovfl'):
+                lbl = w.get(key)
+                if lbl is not None:
+                    self.serial_layout.removeWidget(lbl)
+                    lbl.deleteLater()
+        self._serial_widgets.clear()
+
+    def _build_serial_rows(self, ports):
+        for i, p in enumerate(ports):
+            port_id = p.get('id', i)
+            try:
+                port_name = SerialPort(port_id).name
+            except ValueError:
+                port_name = f"P{i + 1}"
+            name_lbl = QLabel(port_name)
+            name_lbl.setStyleSheet("font-size: 12px;")
+            baud_lbl = QLabel("--")
+            baud_lbl.setStyleSheet("font-size: 12px;")
+            flags_lbl = QLabel("--")
+            flags_lbl.setStyleSheet("font-size: 12px; font-family: monospace; font-weight: bold;")
+            queue_lbl = QLabel("-- / --")
+            queue_lbl.setStyleSheet("font-size: 12px; font-family: monospace;")
+            ovfl_lbl = QLabel("--")
+            ovfl_lbl.setStyleSheet("font-size: 12px; font-family: monospace; font-weight: bold;")
+            self.serial_layout.addWidget(name_lbl, i + 1, 0)
+            self.serial_layout.addWidget(baud_lbl, i + 1, 1)
+            self.serial_layout.addWidget(flags_lbl, i + 1, 2)
+            self.serial_layout.addWidget(queue_lbl, i + 1, 3)
+            self.serial_layout.addWidget(ovfl_lbl, i + 1, 4)
+            self._serial_widgets[i] = {
+                'index': i, 'name': name_lbl, 'baud': baud_lbl,
+                'flags': flags_lbl, 'queue': queue_lbl, 'ovfl': ovfl_lbl,
+            }
+
     def update_serial_ports_display(self):
-        if not self.serial_ports:
+        if not self.serial_ports or not self.serial_ports.get('ports'):
             return
-        buf_size = self.serial_ports.get('buffer_size', 512)
-        def _set(port_key, tx_bar, rx_bar, ov_lbl):
-            p = self.serial_ports.get(port_key)
-            if not p:
-                return
-            tx_bar.setRange(0, buf_size)
-            tx_bar.setValue(p['tx_q'])
-            tx_bar.setFormat(f"{p['tx_q']}")
-            rx_bar.setRange(0, buf_size)
-            rx_bar.setValue(p['rx_q'])
-            rx_bar.setFormat(f"{p['rx_q']}")
-            ov = []
-            if p['tx_overflow']: ov.append("TX")
-            if p['rx_overflow']: ov.append("RX")
-            if ov:
-                ov_lbl.setText("/".join(ov))
-                ov_lbl.setStyleSheet("font-weight: bold; color: #e74c3c;")
-            else:
-                ov_lbl.setText("--")
-                ov_lbl.setStyleSheet("font-weight: bold;")
-        _set('telemetry', self.ser_telem_tx, self.ser_telem_rx, self.ser_telem_ov)
-        _set('gps', self.ser_gps_tx, self.ser_gps_rx, self.ser_gps_ov)
+        ports = self.serial_ports['ports']
+
+        if len(self._serial_widgets) != len(ports):
+            self._clear_serial_rows()
+            self._build_serial_rows(ports)
+
+        for i, p in enumerate(ports):
+            self._update_port(i, p, self.serial_ports.get('buffer_size', 512))
+
+    def _update_port(self, index, p, buf):
+        """Refresh a single serial-port row given a parsed port dict from parser."""
+        w = self._serial_widgets.get(index)
+        if w is None:
+            return
+
+        port_id = p.get('id', index)
+        try:
+            port_name = SerialPort(port_id).name
+        except ValueError:
+            port_name = f"P{index + 1}"
+
+        baud = p.get('baud', 0)
+        if baud <= 0:
+            baud_text = "\u2014"
+            baud_tip = ("No baud reported: the FC never initialised this port, "
+                        "so SerialLiveBaud is 0")
+        elif baud >= 1000:
+            baud_text = f"{baud * 0.001:.1f}k"
+            baud_tip = f"Live baud rate reported by the FC ({baud} bps)"
+        else:
+            baud_text = str(baud)
+            baud_tip = f"Live baud rate reported by the FC ({baud} bps)"
+
+        if port_id == SerialPort.USB:
+            sr_text = "\u2014"
+            sr_tip = "USB VCP link - no USART, no status register, no baud rate"
+            if baud <= 0:
+                baud_tip = "USB VCP link - a baud rate does not apply"
+        else:
+            sr_text = f"{p.get('usart_sr', 0):08b}"
+            sr_tip = ("USART status register, binary, bit 7 (left) to bit 0 (right):\n"
+                      "7=TXE  6=TC  5=RXNE  4=IDLE  3=ORE  2=NF  1=FE  0=PE\n"
+                      "ORE = overrun, FE = framing, NF = noise, PE = parity.\n"
+                      "A healthy idle UART reads 11000000 (TXE and TC set).")
+
+        tx_ovfl = bool(p.get('tx_overflow', False))
+        rx_ovfl = bool(p.get('rx_overflow', False))
+        if tx_ovfl and rx_ovfl:
+            ovfl_text = "TX+RX"
+        elif tx_ovfl:
+            ovfl_text = "TX"
+        elif rx_ovfl:
+            ovfl_text = "RX"
+        else:
+            ovfl_text = "OK"
+        ovfl_latched = tx_ovfl or rx_ovfl
+        ovfl_colour = "#c62828" if ovfl_latched else "#2e7d32"
+        ovfl_tip = (
+            "Sticky ring-buffer overflow, set by the FC and cleared only by an "
+            "FC reboot.\n"
+            "OK (green) = neither ring has ever overflowed.\n"
+            "TX (red) = the FC's transmit ring filled and a byte was dropped.\n"
+            "RX (red) = the receive ring filled and a byte was lost.")
+
+        tx_q = p.get('tx_q', 0)
+        rx_q = p.get('rx_q', 0)
+
+        queue_tip = (
+            f"TX / RX ring occupancy, in bytes, at the instant the FC "
+            f"answered the status request (ring size {buf} bytes).\n"
+            "TX is bytes queued and still waiting for the DMA (or, on USB, "
+            "for the host to drain), so it reads 0-2 in normal operation.\n"
+            "RX is bytes received and not yet parsed. A sustained high value "
+            "means the port cannot keep up with its device; TX near the ring "
+            "size means the link is not draining at all.")
+        if port_id == SerialPort.USB:
+            queue_tip += ("\nThe USB VCP link is polled directly, so its RX "
+                          "ring is not used and RX always reads 0.")
+
+        w['name'].setText(port_name)
+        w['baud'].setText(baud_text)
+        w['flags'].setText(sr_text)
+        w['queue'].setText(f"{tx_q} / {rx_q}")
+        w['ovfl'].setText(ovfl_text)
+        w['ovfl'].setStyleSheet(
+            f"font-size: 9px; font-family: monospace; font-weight: bold; "
+            f"color: {ovfl_colour};")
+
+        w['name'].setToolTip(f"Serial port id {port_id} ({port_name})")
+        w['baud'].setToolTip(baud_tip)
+        w['flags'].setToolTip(sr_tip)
+        w['queue'].setToolTip(queue_tip)
+        w['ovfl'].setToolTip(ovfl_tip)
 
     def check_connection(self):
         now = time.monotonic()

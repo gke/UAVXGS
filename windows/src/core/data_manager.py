@@ -6,6 +6,7 @@ Singleton pattern to share telemetry data
 
 from typing import Optional
 from packet_parser import FlightData
+from core.console import console
 
 
 class DataManager:
@@ -69,7 +70,7 @@ class DataManager:
             try:
                 callback(self.flight_data)
             except Exception as e:
-                print(f"Error notifying observer: {e}")
+                console(f"Error notifying observer: {e}")
 
 # Global instance
 data_manager = DataManager()

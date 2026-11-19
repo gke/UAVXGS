@@ -1,25 +1,17 @@
 """Shared PID-tuning critic: metric measurement.
 
-Stage 1a of the live auto-tuning roadmap: the response-shape measurement
-definitions used by the Python-side PID critique, lifted out of
-``tests/test_pid_sim.py`` so the FC (``trace.c`` probe captures) and the sim
-critic measure a step response IDENTICALLY.
+The response-shape measurement definitions used by the Python-side PID
+critique, lifted out of ``tests/test_pid_sim.py`` so they are stated once and
+judged against one set of limits. Measurements and criteria tables share this
+package, so the same thresholds are applied to every step series.
 
 Scope: pure measurement. Given ``(times, values)`` time series, produce the
 quantities the criteria tables (@see :mod:`critic.criteria`) are judged
 against. No criteria knowledge here, no rendering, no Qt, no sim imports.
 
-FC-porting contract
-  The FC port implements these three functions (plus ``count_zero_crossings``)
-  on its ``eTraceRate`` capture rows: tick (ms) -> s is the time base, Rate
-  (rad/s) is ``values`` for a rate-step, and the same thresholds below
-  (10/90 % rise, ±2 % settle band, windowed settle) apply verbatim.
-
-  ``not_reached_s`` is the sentinel for a phase that never completes within
-  the measurement window. The sim's window is SIM_TIME = 8.0 s; an FC capture
-  is ~2.7 s at 500 Hz, so the FC passes its own capture duration and a phase
-  never reached reports exactly that. The sentinel is deliberately a
-  parameter, because "did not reach" must mean "within MY window".
+``not_reached_s`` is the sentinel for a phase that never completes within the
+measurement window. It is deliberately a parameter, because "did not reach"
+must mean "within MY window".
 """
 
 from dataclasses import dataclass
@@ -35,8 +27,8 @@ class StepMetrics:
 
     rise_time_s / overshoot_pct / settling_time_s come from the shared
     measurement functions; the remaining fields are plant diagnostics the
-    sim keeps from its internal state (and the FC reads straight from the
-    trace record): integrator utilization, peak/max rate, final angle.
+    sim keeps from its internal state: integrator utilization, peak/max rate,
+    final angle.
     """
     axis_name: str = ""
     rise_time_s: float = 0.0
@@ -149,7 +141,7 @@ def step_metrics_persist(times, values, setpoint, deadtime_s=1.0, dt=0.001,
     """Rise / overshoot / settle over a step series (persist-until-end survey).
 
     The definition used by the altitude-hold and navigation (linear, meters)
-    tests, and by the FC's future ``eTraceAltHold`` capture:
+    tests:
 
     - rise time: first sample with ``abs(value) >= 0.9·abs(setpoint)``.
     - settling:  the start of the FINAL contiguous run of samples that stay

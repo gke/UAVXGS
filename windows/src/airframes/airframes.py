@@ -15,6 +15,7 @@ Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 import os
+import math
 import re
 import struct
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,7 +26,7 @@ from protocol_enums import (
     IMUFilterType, Config1Bits, Config2Bits, FailsafeAction,
     AIRFRAME_NAMES, ESC_TYPE_NAMES, RX_TYPE_NAMES, ARMING_MODE_NAMES,
     RF_TYPE_NAMES, AS_SENSOR_TYPE_NAMES,
-    MOTOR_STOP_NAMES, BB_LOG_NAMES, FAILSAFE_ACTION_NAMES,
+    MOTOR_STOP_NAMES, FAILSAFE_ACTION_NAMES,
 )
 from parameters import PARAM_DISPLAY_MULT
 
@@ -40,20 +41,6 @@ AIRFRAMES_DIR = os.path.join(os.path.dirname(__file__))
 
 LINE_RE = re.compile(r'^\s*(\w+)\s*=\s*(.+?)\s*$')
 
-# Transitional bridge for .af files saved under the pre-rename 128-param
-# schema: params moved out of the param block into the FC Config struct were
-# renamed to UNUSED_NN. Their values are still meaningful in old files (e.g.
-# the sim cruise baseline), so map the old names forward instead of dropping
-# them. Pass-through only — a re-save writes them under the UNUSED_NN names.
-_LEGACY_PARAM_NAME_TO_TAG = {
-    'EST_CRUISE_THR': 19,       # → Unused20 (FC Config.CruiseThrottleFF)
-    'KF_ACC_U_BIAS_VAR': 72,    # → Unused73
-    'KF_BARO_VAR': 110,         # → Unused111
-    'KF_ACC_U_VAR': 111,        # → Unused112
-}
-
-
-
 ENUM_MAP: Dict[str, type] = {
     'AF_TYPE': AirframeType,
     'ESC_TYPE': ESCType,
@@ -66,9 +53,11 @@ ENUM_MAP: Dict[str, type] = {
     'CONFIG1_BITS': Config1Bits,
     'CONFIG2_BITS': Config2Bits,
     'FAILSAFE_ACTION': FailsafeAction,
-    'BB_LOG_TYPE': None,
+    'UNUSED_14': None,
     'SERVO_SENSE': None,
-    'THROTTLE_GAIN_RATE': None,
+    'UNUSED_37': None,
+    'UNUSED_58': None,
+    'UNUSED_93': None,
     'MOTOR_STOP_SEL': None,
     'VOLT_SCALE': None,
     'CURRENT_SCALE': None,
@@ -86,7 +75,6 @@ _COMBO_ENUM_MAP: Dict[int, tuple] = {
     ParamIndex.RF_SENSOR_TYPE: (RangefinderType, RF_TYPE_NAMES),
     ParamIndex.AS_SENSOR_TYPE: (AirspeedSensorType, AS_SENSOR_TYPE_NAMES),
     ParamIndex.MOTOR_STOP_SEL: (None, MOTOR_STOP_NAMES),
-    ParamIndex.BB_LOG_TYPE: (None, BB_LOG_NAMES),
     ParamIndex.FAILSAFE_ACTION: (FailsafeAction, FAILSAFE_ACTION_NAMES),
 }
 
@@ -102,68 +90,11 @@ def _enum_for_param(param_name: str):
         return None
     return None
 
-_LEGACY_ENUM_TOKENS = {
-    cls_name: {old: new for old, new in m.items()}
-    for cls_name, m in {
-        'AirframeType': {
-            'TRI': 'eTriAF', 'TRI_COAX': 'eTriCoaxAF', 'VTAIL': 'eVTailAF',
-            'QUAD': 'eQuadAF', 'QUAD_X': 'eQuadXAF', 'QUAD_COAX': 'eQuadCoaxAF',
-            'QUAD_COAX_X': 'eQuadCoaxXAF', 'HEX': 'eHexAF', 'HEX_X': 'eHexXAF',
-            'OCT': 'eOctAF', 'OCT_X': 'eOctXAF', 'HELI_90': 'eHeli90AF',
-            'BI': 'eBiAF', 'ELEVON': 'eElevonAF', 'DELTA': 'eDeltaAF',
-            'AILERON': 'eAileronAF', 'AILERON_SPOILER_FLAPS': 'eAileronSpoilerFlapsAF',
-            'AILERON_VTAIL': 'eAileronVTailAF', 'RUDDER_ELEVATOR': 'eRudderElevatorAF',
-            'DIFFERENTIAL_TWIN': 'eDifferentialTwinAF', 'VTOL': 'eVTOLAF',
-            'VTOL2': 'eVTOL2AF', 'TRACKED': 'eTrackedAF', 'FOUR_WHEEL': 'eFourWheelAF',
-            'TWO_WHEEL': 'eTwoWheelAF', 'INSTRUMENTATION': 'eInstrumentation',
-            'UNKNOWN': 'eAFUnknown',
-        },
-        'ESCType': {'FAST_PWM': 'eESCPWM', 'DC_MOTORS': 'eDCMotors',
-                    'DRIVES_DISARMED': 'eMotorsOff'},
-        'RxType': {'CPPM': 'eCPPMRx', 'FUTABA_SBUS': 'eFutabaSBusRx',
-                   'SPEKTRUM_1024': 'eSpektrum1024Rx', 'SPEKTRUM_2048': 'eSpektrum2048Rx',
-                   'CRSF': 'eCRSFRx', 'UNKNOWN': 'eUnknownRx'},
-        'ArmingMode': {'TX_ARMING': 'eTxArming', 'SWITCH_ARMING': 'eSwitchArming',
-                       'UNUSED_ARMING_2': 'eUnusedArming2',
-                       'UNUSED_ARMING_3': 'eUnusedArming3'},
-        'TelemetryType': {'UAVX_DJT': 'eUAVXDJTTelemetry', 'INAV_LUA': 'eINavLUATelemetry',
-                          'NO_TELEMETRY': 'eNoTelemetry', 'U4': 'eU4Telemetry',
-                          'U5': 'eU5Telemetry', 'U6': 'eU6Telemetry', 'U7': 'eU7Telemetry',
-                          'U8': 'eU8Telemetry'},
-        'RangefinderType': {'MAX_SONAR_CM': 'eMaxSonarcm', 'SRF_I2C_CM': 'eSRFI2Ccm',
-                            'MAX_SONAR_I2C_CM': 'eMaxSonarI2Ccm',
-                            'SHARP_IR_GP2Y0A02YK': 'eSharpIRGP2Y0A02YK',
-                            'SHARP_IR_GP2Y0A710K': 'eSharpIRGP2Y0A710K', 'NO_RF': 'eNoRF'},
-        'AirspeedSensorType': {'MS4525D0_I2C': 'eMS4525D0I2C',
-                               'MPXV7002DP_ANALOG': 'eMPXV7002DPAnalog',
-                               'AS_THERMOPILE_ANALOG': 'eASThermopileAnalog',
-                               'AS_GPS_DERIVED': 'eASGPSDerived', 'NO_AS': 'eNoAS'},
-        'IMUFilterType': {'LPFILT': 'eLP2Filt', 'MPUFILT': 'eHDLPFilt',
-                          'PT1FILT': 'eF1', 'IMU_FILT_3': 'eF2', 'IMU_FILT_4': 'eF3',
-                          'IMU_FILT_5': 'eF4'},
-        'Config1Bits': {'USE_INVERT_MAG': 'eUseInvertMag', 'USE_RTH_DESCEND': 'eUseRTHDescend',
-                        'DISABLE_LEDS_IN_FLIGHT': 'eUsingMag',
-                        'USE_MAG': 'eUsingMag',
-                        'EMULATION_ENABLE': 'eEmulationEnable',
-                        'USE_ALT_HOLD_ALARM': 'eUseAltHoldAlarm',
-                        'USE_OFFSET_HOME': 'eUseOffsetHome',
-                        'TEST_MISSION': 'eUnused1_6',
-                        'ENFORCE_DRIVE_SYMMETRY': 'eEnforceDriveSymmetry'},
-        'Config2Bits': {'USE_BATTERY_COMP': 'eUseBatteryComp', 'USE_FAST_START': 'eUnused2_1',
-                        'USE_ESC_PROG': 'eUnused2_2', 'USE_BLHELI': 'eUnused2_2', 'USE_HAVE_GPS': 'eUseGPS',
-                        'USE_PROP_SENSE': 'ePropsInwards', 'USE_TURN_TO_WP': 'eUseTurnToWP',
-                        'USE_NAV_BEEP': 'eUseNavBeep'},
-        'FailsafeAction': {'FS_RTH': 'eFsRth', 'FS_Land': 'eFsLand',
-                           'FS_MOTORS_OFF': 'eFsMotorsOff'},
-    }.items()
-}
-
-
 def _resolve_enum_member(enum_cls, token: str):
     """Resolve an .af enum token to an enum member.
 
-    Order: exact match -> case-insensitive match -> legacy UPPER token -> None.
-    Handles both new e-* tokens and pre-sweep UPPER-SNAKE tokens.
+    Order: exact match -> case-insensitive match -> None. An unresolvable token
+    is an error: .af files carry canonical member names.
     """
     if enum_cls is None:
         return None
@@ -175,12 +106,6 @@ def _resolve_enum_member(enum_cls, token: str):
     for name, member in enum_cls.__members__.items():
         if name.lower() == t.lower():
             return member
-    legacy = _LEGACY_ENUM_TOKENS.get(enum_cls.__name__)
-    if legacy and t in legacy:
-        try:
-            return enum_cls[legacy[t]]
-        except (KeyError, ValueError):
-            pass
     return None
 
 
@@ -268,6 +193,26 @@ def _format_value(param_name: str, raw_value: float) -> str:
     return f'{raw_value:.8g}'
 
 
+def require_finite(tag: int, value: float, context: str) -> float:
+    """Refuse a non-finite parameter value at the GCS boundary.
+
+    Python's float() silently accepts 'nan'/'inf'/'-inf', so a corrupted or
+    hand-edited .af loads clean today and re-ships on every save. The GCS is
+    a source of badness as well as a display sink; this is the guard for
+    that role. Raises ValueError with the offending parameter so the caller
+    can report and refuse the load/write. Never masks or substitutes.
+    """
+    try:
+        ok = math.isfinite(value)
+    except TypeError:
+        ok = False
+    if not ok:
+        raise ValueError(
+            f"{context}: {ParamIndex(tag).name} (tag {tag}) = {value!r} "
+            f"is not finite — refusing to use it")
+    return value
+
+
 def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
     """Parse .af file text → (name, {tag: raw_float_value}, metadata_dict).
 
@@ -275,11 +220,13 @@ def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
       - 'Name', 'Character' from '# Key: Value' comment lines
       - 'PHYS_*' keys from PHYS_* = value lines (physical descriptors)
       - 'LIMITS': {tag: (lo, hi)} from an optional [LIMITS] block (raw units)
+      - 'UNKNOWN_KEYS': [param_name, ...] keys absent from the current ParamIndex
     """
     name = 'Unknown'
     values: Dict[int, float] = {}
     metadata: Dict[str, Any] = {}
     limits: Dict[int, Tuple[float, float]] = {}
+    unknown: List[str] = []
     in_limits = False
     for line in text.splitlines():
         line = line.strip()
@@ -306,11 +253,11 @@ def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
         if param_name.startswith('PHYS_'):
             metadata[param_name] = value_text
             continue
-        tag = None
         try:
             tag = ParamIndex[param_name].value
         except KeyError:
-            tag = _LEGACY_PARAM_NAME_TO_TAG.get(param_name)
+            unknown.append(param_name)
+            continue
         if tag is None:
             continue
         if in_limits:
@@ -318,14 +265,19 @@ def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
             if len(parts) != 2:
                 continue
             try:
-                limits[tag] = (float(parts[0].strip()), float(parts[1].strip()))
+                lo = float(parts[0].strip())
+                hi = float(parts[1].strip())
             except ValueError:
                 continue
+            limits[tag] = (require_finite(tag, lo, f".af '{name}' [LIMITS]"),
+                           require_finite(tag, hi, f".af '{name}' [LIMITS]"))
             continue
         val = _parse_value(param_name, value_text)
-        values[tag] = val
+        values[tag] = require_finite(tag, val, f".af '{name}'")
     if limits:
         metadata['LIMITS'] = limits
+    if unknown:
+        metadata['UNKNOWN_KEYS'] = unknown
     return name, values, metadata
 
 

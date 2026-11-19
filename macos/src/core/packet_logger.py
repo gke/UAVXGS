@@ -8,7 +8,7 @@ from typing import Any
 _TAG_NAMES = {
     13: "FLIGHT", 14: "NAV", 15: "STATS", 16: "CONTROL", 17: "PARAM",
     18: "MIN", 19: "ORIGIN", 20: "WP", 21: "MISSION", 22: "RC",
-    50: "REQUEST", 51: "ACK", 52: "MISC", 53: "UNUSED", 54: "BB",
+    50: "REQUEST", 51: "ACK", 52: "MISC", 53: "UNUSED", 54: "UNUSED",
     55: "UNUSED", 56: "UNUSED", 57: "TUNING", 58: "UNUSED", 59: "GUIDANCE",
     60: "UNUSED", 61: "UNUSED", 62: "CALIB", 63: "AFNAME",
     64: "WIND", 65: "UNUSED", 66: "SERIAL", 67: "EXEC",

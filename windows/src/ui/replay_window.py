@@ -39,6 +39,8 @@ import workspace
 RAWLOG_MAGIC = b"UAVXRAW\x01"
 MAX_CHUNK = 1 << 20
 
+from logger.rawlog import MARKER as RAWLOG_MARKER_RX, MARKER_TX as RAWLOG_MARKER_TX
+
 
 class ReplayWindow(QMainWindow):
     TICK_MS = 20
@@ -233,7 +235,13 @@ class ReplayWindow(QMainWindow):
         ts = 0
         while p + 8 <= len(data):
             marker = data[p]
-            if marker != 0xAA:
+            if marker == RAWLOG_MARKER_TX:
+                n_tx = int.from_bytes(data[p+5:p+9], "little")
+                if p + 9 + n_tx > len(data):
+                    break
+                p += 9 + n_tx
+                continue
+            if marker != RAWLOG_MARKER_RX:
                 p += 1
                 continue
             ts = int.from_bytes(data[p+1:p+5], "little")

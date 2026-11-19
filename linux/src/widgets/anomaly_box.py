@@ -58,7 +58,10 @@ class AnomalyBox(QGroupBox):
             ("Baro", "sio_baro", "sio_baro_avg", "sio_baro_peak"),
         ]
         for row, (name, cnt_attr, avg_attr, peak_attr) in enumerate(dev_lines, start=3):
-            lay.addWidget(QLabel(name), row, 0)
+            name_lbl = QLabel(name)
+            lay.addWidget(name_lbl, row, 0)
+            if name == "Mag":
+                self.sio_mag_name = name_lbl
             lbl = QLabel("0")
             lbl.setStyleSheet("font-weight: bold;")
             lbl.setAlignment(Qt.AlignCenter)
@@ -74,7 +77,8 @@ class AnomalyBox(QGroupBox):
                 lay.addWidget(t_lbl, row, col)
                 setattr(self, val_attr, t_lbl)
 
-        lay.addWidget(QLabel("Mag fault"), 6, 0)
+        self.mag_fault_name = QLabel("Mag fault")
+        lay.addWidget(self.mag_fault_name, 6, 0)
         self.mag_fault = QLabel("-")
         self.mag_fault.setStyleSheet("font-weight: bold;")
         self.mag_fault.setAlignment(Qt.AlignLeft)
@@ -82,6 +86,20 @@ class AnomalyBox(QGroupBox):
 
         self.setLayout(lay)
         self._alert = False
+        self._mag_absent = False
+
+    def set_mag_absent(self):
+        """Retire the Mag row and Mag fault row once absence is confirmed.
+
+        Called once, from the main window's latched absence path; the row
+        would otherwise keep showing zero counts and zero timings for a
+        device that is not fitted, and probe-NACK SIO errors logged at
+        boot by a magless board would read as a live fault.
+        """
+        self._mag_absent = True
+        for w in (self.sio_mag_name, self.sio_mag, self.sio_mag_avg,
+                  self.sio_mag_peak, self.mag_fault_name, self.mag_fault):
+            w.hide()
 
     def update_exec(self, imu_rejects: int, exec_avg_us: int = 0, exec_peak_us: int = 0):
         """Refresh the IMU-reject / exec time fields from the execution-time packet."""
@@ -107,7 +125,8 @@ class AnomalyBox(QGroupBox):
         else:
             self.mag_fault.setText("-")
             self.mag_fault.setStyleSheet("font-weight: bold;")
-        if d.imu_errors or d.mag_errors or d.baro_errors or reason:
+        mag_fault = (not self._mag_absent) and (d.mag_errors or reason)
+        if d.imu_errors or d.baro_errors or mag_fault:
             self.set_alert(True)
 
     def set_alert(self, on: bool):

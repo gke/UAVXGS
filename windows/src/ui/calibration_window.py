@@ -18,9 +18,10 @@ from PyQt5.QtGui import *
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol_constants import *
-from protocol_enums import PacketTag, MiscCommand, ParamIndex, Config1Bits
+from protocol_enums import PacketTag, MiscCommand
 from packet_parser import *
 from core.data_manager import data_manager
+from core.console import console
 from orientation_solver import classify as ori_classify, next_knobs as ori_next_knobs
 
 ORI_PROBE_TIMEOUT_TICKS = 150  # 15 s to complete the maneuver
@@ -58,13 +59,13 @@ class CalibrationWindow(QMainWindow):
         self.mag_calibration_timeout = 120000  # 2 minute safety timeout
 
         # Magnetometer presence as reported by the FC (telemetry bit 38,
-        # F.MagnetometerActive). Most boards in the target set have no mag
+        # F.HaveMag). Most boards in the target set have no mag
         # fitted, and offering a Magnetometer tab that can never succeed is
         # worse than not offering it: the FC's arming gate requires
         # MagCal.Calibrated whenever a mag is required, and CalibSessionStart()
         # only runs a sweep when a mag actually answers, so a pilot on a
         # magless board has no way to arm. The FC probes presence
-        # unconditionally in InitMagnetometer() (before any UsingMag test), so
+        # unconditionally in InitMagnetometer(), so
         # this bit is a true hardware-presence signal independent of config.
         # None = not yet known; only False (a completed flag report) hides the tab.
         self._mag_present = None
@@ -77,6 +78,7 @@ class CalibrationWindow(QMainWindow):
         # _mag_present latch (see _set_mag_presence), so it needs no separate
         # provenance guard.
         self._mag_warn_logged = False
+        self._cal_nan_logged = False
         
         # RC calibration state
         self.rc_calibrating = False
@@ -103,7 +105,21 @@ class CalibrationWindow(QMainWindow):
         """Send debug message to parent window's log if available"""
         if self.parent_window and hasattr(self.parent_window, 'log_debug'):
             self.parent_window.log_debug(msg, "Info")
-        print(msg)
+        console(msg)
+
+    def _raw_count(self, value):
+        """A raw FC count as text; non-finite becomes "---", never int(nan).
+
+        NaN here is the FC's fault, so it is reported rather than masked:
+        int() on it raises inside a Qt slot and PyQt turns that into qFatal.
+        """
+        if math.isfinite(value):
+            self._cal_nan_logged = False
+            return str(int(round(value)))
+        if not self._cal_nan_logged:
+            self._cal_nan_logged = True
+            self._log("⚠️ FC calibration data holds non-finite values (NaN/Inf)")
+        return "---"
     
     def setup_ui(self):
         """Create the calibration UI"""
@@ -680,7 +696,7 @@ class CalibrationWindow(QMainWindow):
         self.rc_us_labels = {}
         
         channel_names = ["Throttle", "Roll", "Pitch", "Yaw", "Arming", "AttMode",
-                         "NavMode", "PassThru", "Dive", "Trace", "RateGain", "CamPitch"]
+                         "NavMode", "PassThru", "Dive", "Aux2", "RateGain", "CamPitch"]
         
         for i in range(12):
             row = i + 1
@@ -777,24 +793,15 @@ class CalibrationWindow(QMainWindow):
                   "magnetometer calibration retired for this session")
 
     def _mag_in_use(self) -> Optional[bool]:
-        """Whether the FC's MagInUse() holds, or None if UseMag is not known.
+        """Whether the FC's MagInUse() holds, or None if presence is unknown.
 
-        Mirrors MagInUse() == (UsingMag && F.MagnetometerActive). Only the
-        UsingMag half is available here; F.MagnetometerActive arrives with the
-        flag report the caller already has, and it combines them at the call
-        site. Returns None when the Parameters page has never been opened or
-        the config has not been read back, so the caller can avoid claiming an
-        arming consequence it cannot substantiate.
+        MagInUse() is now exactly F.HaveMag: a fitted magnetometer is
+        always used, so presence and use are the same fact and there is no
+        permission bit left to consult. Returns None rather than a claim when the
+        caller has no flag report, so an arming consequence is never asserted
+        from an unknown.
         """
-        if not self.parent_window:
-            return None
-        param_window = getattr(self.parent_window, 'param_window', None)
-        if param_window is None:
-            return None
-        value = param_window.config_bits(ParamIndex.CONFIG1_BITS)
-        if value is None:
-            return None
-        return bool(value & int(Config1Bits.eUsingMag))
+        return self._mag_present
 
     def _set_mag_state(self, present, calibrated, failed):
         """Apply the two-flag device model to the Magnetometer tab.
@@ -822,18 +829,10 @@ class CalibrationWindow(QMainWindow):
             self.mag_cal_status.setText("Mag: FAILED - recalibrate")
             self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #c0392b; color: white; font-weight: bold; border-radius: 4px;")
         elif not calibrated:
-            # UNCAL only blocks arming when the FC would actually demand it.
-            # CalibrationSufficient() is `MagInUse() && !MagCal.Calibrated`, so
-            # with UseMag clear the mag is present but unused and arming is not
-            # blocked. Asserting "blocks arming" there would be a false claim on
-            # exactly the bench case a pilot hits first - mag fitted, UseMag off.
-            in_use = self._mag_in_use()
-            if in_use:
-                text = "Mag: fitted, NOT calibrated - BLOCKS ARMING"
-            elif in_use is False:
-                text = "Mag: fitted, NOT calibrated (mag not in use - arming OK)"
-            else:
-                text = "Mag: fitted, NOT calibrated"
+            # A fitted magnetometer is always in use, so an uncalibrated one
+            # always blocks arming: CalibrationSufficient() is
+            # `MagInUse() && !MagCal.Calibrated` and MagInUse() is now presence.
+            text = "Mag: fitted, NOT calibrated - BLOCKS ARMING"
             self.mag_cal_status.setText(text)
             self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #f39c12; color: white; font-weight: bold; border-radius: 4px;")
         self.mag_start_btn.setEnabled(True)
@@ -851,7 +850,6 @@ class CalibrationWindow(QMainWindow):
             MiscCommand.CAL_MAG: "CAL_MAG",
             MiscCommand.CAL_ACC: "CAL_ACC",
             MiscCommand.LB: "LB",
-            MiscCommand.BB_DUMP: "BB_DUMP",
             MiscCommand.GPS_PASS_THRU_UNUSED: "GPS_PASS_THRU",
             MiscCommand.BOOTLOADER: "BOOTLOADER",
         }
@@ -905,7 +903,7 @@ class CalibrationWindow(QMainWindow):
         if len(flags) >= 6:
             imu_cal = bool(flags[5] & 16)   # bit 4 = IMUCal
             mag_cal = bool(flags[5] & 2)    # bit 1 = MagnetometerCalibrated
-            mag_active = bool(flags[4] & 64) if len(flags) >= 5 else False  # bit 38 = MagnetometerActive
+            mag_active = bool(flags[4] & 64) if len(flags) >= 5 else False  # bit 38 = F.HaveMag
             mag_fail = bool(flags[1] & 4) if len(flags) >= 2 else False     # bit 10 = MagnetometerFailure
             self._mag_active = mag_active
             self._imu_active = bool(flags[4] & 32) if len(flags) >= 5 else False  # bit 37 = IMUActive
@@ -965,9 +963,9 @@ class CalibrationWindow(QMainWindow):
             self.acc_x_offset.setText(f"{ab[0] * asc[0] / imu_1g * GRAVITY_MPS_S:.3f}")
             self.acc_y_offset.setText(f"{ab[1] * asc[1] / imu_1g * GRAVITY_MPS_S:.3f}")
             self.acc_z_offset.setText(f"{ab[2] * asc[2] / imu_1g * GRAVITY_MPS_S:.3f}")
-            self.mag_bias_x.setText(str(int(round(mb[0]))))
-            self.mag_bias_y.setText(str(int(round(mb[1]))))
-            self.mag_bias_z.setText(str(int(round(mb[2]))))
+            self.mag_bias_x.setText(self._raw_count(mb[0]))
+            self.mag_bias_y.setText(self._raw_count(mb[1]))
+            self.mag_bias_z.setText(self._raw_count(mb[2]))
 
             # Update octant bargraphs from calibration packet data
             octants = cal_data['octants']

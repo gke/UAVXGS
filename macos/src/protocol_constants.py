@@ -37,7 +37,6 @@ from protocol_enums import (
     IMU_FILTER_NAMES,
     GYRO_LPF_NAMES,
     ACC_LPF_NAMES,
-    BB_LOG_NAMES,
 )
 
 # Protocol framing constants
@@ -132,7 +131,7 @@ __all__ = [
     'AIRFRAME_NAMES', 'ESC_TYPE_NAMES', 'RX_TYPE_NAMES',
     'ARMING_MODE_NAMES', 'TELEMETRY_TYPE_NAMES',
     'RF_TYPE_NAMES', 'AS_SENSOR_TYPE_NAMES', 'IMU_FILTER_NAMES',
-    'GYRO_LPF_NAMES', 'ACC_LPF_NAMES', 'BB_LOG_NAMES',
+    'GYRO_LPF_NAMES', 'ACC_LPF_NAMES',
     # State names (backward compat)
     'FLIGHT_STATE_NAMES', 'NAV_STATE_NAMES',
     # Flight state constants (backward compat)
