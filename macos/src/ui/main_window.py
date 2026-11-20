@@ -187,17 +187,17 @@ FLAG_BIT_DEFS = {
 # missing from every group renders nowhere.
 FLAG_GROUPS = [
     ('Attitude & Control', [12, 26, 4, 56]),
-    ('Altitude', [0, 14, 23, 21, 61, 2, 46, 65, 88]),
+    ('Altitude', [0, 14, 23, 21, 61, 2, 46, 65]),
     ('Navigation', [15, 36, 16, 17, 18, 19, 24, 70]),
     ('RTH / Landing', [20, 72, 45, 3, 30]),
     ('Origin / Home', [7, 28, 78]),
     ('GPS', [6, 52, 79, 57, 84, 85]),
-    ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22, 83, 95]),
+    ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22, 83, 95, 88]),
     ('RC & Input', [35, 53, 75, 58, 77, 81]),
     ('Soaring / Glide', [51, 63, 69]),
     ('Flight Mode / Throttle', [25, 40, 13]),
     ('Arming / Power', [29, 39, 5]),
-    ('System / Debug', [33, 34, 67, 49, 80]),
+    ('System / Debug', [34, 67, 49, 80]),
 ]
 
 # The neutral look of a flag label: name shown, no state asserted. Defined
@@ -665,7 +665,14 @@ class MainWindow(QMainWindow):
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
     
-    def show_parameter_window(self):
+    def ensure_param_window(self):
+        """Create the ParameterWindow on first use, seeding any state that
+        arrived before it existed, and return it.
+
+        Other windows read live parameter values from its widgets (Identify
+        reads the current rate gains), so they must be able to obtain it
+        without forcing it on screen.
+        """
         if self.param_window is None:
             self.param_window = ParameterWindow(self)
             console("🪟 Created new ParameterWindow")
@@ -679,6 +686,10 @@ class MainWindow(QMainWindow):
                 self.param_window.set_configuration_required(
                     self._pending_configuration_required)
                 self._pending_configuration_required = None
+        return self.param_window
+
+    def show_parameter_window(self):
+        self.ensure_param_window()
 
         self._pending_configuration_required = None
 
@@ -1246,6 +1257,8 @@ class MainWindow(QMainWindow):
         alt_layout.setHorizontalSpacing(4)
         self.alt_kf = QLabel("0.0")
         self.alt_roc = QLabel("0.0")
+        self.alt_baro = QLabel("0.0")
+        self.alt_gps = QLabel("---")
         self.alt_baro_var = QLabel("0.01")
 
         self.alt_accu_var = QLabel("0.10")
@@ -1254,12 +1267,16 @@ class MainWindow(QMainWindow):
         self.alt_desired = QLabel("0.0")
         self.alt_baro_temp = QLabel("0.0")
         self.alt_baro_press = QLabel("0.0")
-        for lbl in (self.alt_kf, self.alt_roc, self.alt_baro_var, self.alt_accu_var, self.alt_accu_bias_var, self.alt_desired, self.alt_baro_temp, self.alt_baro_press):
+        for lbl in (self.alt_kf, self.alt_roc, self.alt_baro, self.alt_gps, self.alt_baro_var, self.alt_accu_var, self.alt_accu_bias_var, self.alt_desired, self.alt_baro_temp, self.alt_baro_press):
             lbl.setStyleSheet("font-weight: bold;")
         alt_layout.addWidget(QLabel("KF Alt:"), 0, 0)
         alt_layout.addWidget(self.alt_kf, 0, 1)
         alt_layout.addWidget(QLabel("ROC:"), 0, 2)
         alt_layout.addWidget(self.alt_roc, 0, 3)
+        alt_layout.addWidget(QLabel("Baro Alt:"), 1, 0)
+        alt_layout.addWidget(self.alt_baro, 1, 1)
+        alt_layout.addWidget(QLabel("GPS Alt:"), 1, 2)
+        alt_layout.addWidget(self.alt_gps, 1, 3)
         alt_layout.addWidget(QLabel("Temp:"), 2, 2)
         alt_layout.addWidget(self.alt_baro_temp, 2, 3)
         alt_layout.addWidget(QLabel("Press:"), 3, 2)
@@ -3856,6 +3873,7 @@ class MainWindow(QMainWindow):
             self.slew_acc_yaw.setText(f"{y:.2f}")
 
         self.alt_kf.setText(f"{f.baro_altitude:.2f}")
+        self.alt_baro.setText(f"{f.raw_baro_altitude:.2f}")
         self.alt_roc.setText(f"{f.roc:.1f}")
         self.alt_baro_var.setText(f"{f.baro_variance:.3f}")
         self.alt_baro_temp.setText(f"{f.baro_temp:.1f}°C")
@@ -3942,6 +3960,7 @@ class MainWindow(QMainWindow):
                 gps_valid = (f.gps_fix >= 3 and f.gps_sats >= 6)
             gps_alt_display = (f.gps_fix >= 3)
             self.gps_alt.setText(f"{f.gps_altitude:.1f}" if gps_alt_display else "---")
+            self.alt_gps.setText(f"{f.gps_altitude:.1f}" if gps_alt_display else "---")
             self.gps_vel.setText(f"{f.gps_vel:.1f}")
             self.gps_hacc.setText(f"{f.gps_hacc:.1f}")
             self.gps_vacc.setText(f"{f.gps_vacc:.1f}")

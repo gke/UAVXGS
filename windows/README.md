@@ -1,8 +1,7 @@
 # UAVX Ground Station — Windows Kit
 
 This kit contains everything needed to run the **UAVX Ground Station (GCS)** on
-Windows 11, together with a prebuilt **UAVXArmQ** firmware image for STM32F4
-flight controllers.
+Windows 11.
 
 ## What's in the kit
 
@@ -15,7 +14,6 @@ flight controllers.
 | `GCS_Guide.md` | Screen-by-screen user guide |
 | `What_Is_Different_GCS.md` | Full old-vs-new GCS change list |
 | `What_Is_Different_FC.md` | Full old-vs-new firmware change list |
-| `UAVXF4V3Q_r0.bin` / `.elf` | Prebuilt flight-controller firmware |
 
 ## Quick start
 
@@ -40,11 +38,12 @@ See [HOWTO.md](HOWTO.md) for details.
 
 ## Flight-controller firmware
 
-The kit bundles `UAVXF4V3Q_r0.bin`. Put the board into DFU mode (hold **BOOT0**,
-tap reset, release) and flash:
+The GCS is firmware-independent. Prebuilt UAVXArmQ firmware is published per
+target in the [UAVXArmQ repository](https://github.com/gke/UAVXArmQ) as hex
+images only. Flash with
 
 ```
-dfu-util -a 0 -s 0x08000000:leave -D UAVXF4V3Q_r0.bin
+dfu-util -a 0 -s 0x08000000:leave -D <target>Q_r0.hex
 ```
 
 The GCS **BOOTLOAD** button can also enter the bootloader over USB.

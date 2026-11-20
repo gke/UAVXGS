@@ -157,6 +157,7 @@ class FlightData:
     desired_altitude: float = 0.0
     roc: float = 0.0
     baro_altitude: float = 0.0
+    raw_baro_altitude: float = 0.0
     gps_altitude: float = 0.0
     rangefinder_altitude: float = 0.0
     heading: float = 0.0
@@ -496,7 +497,8 @@ def parse_flight_packet(data: bytes, voltage_trim: float = 1.0) -> Optional[Flig
       [83-84] BaroTemp C          [85-88] BaroPressure Pa f32
       [89-92] KF.Altitude m f32   [93-96][97-100][101-104] KF variances f32
       [105-106] MagHeading rad    [107-108] IMUTemp C
-      [109-110] RateEnergy slot (reserved, 0.0 since 2026-09-17)  [111-112] GlideOffsetRad f16
+      [109-110] Baro.DensityAltitude m f16 (absolute, KF-independent; the
+                reserved slot until 2026-11-20)  [111-112] GlideOffsetRad f16
       [113]    NavState
       [114]    CurrMaxPWMOutputs, then RawPW[] f16 (normalized, 1.0=1000uS),
                then drive balance[] f16 fraction, then mSClock(3)
@@ -568,6 +570,7 @@ def parse_flight_packet(data: bytes, voltage_trim: float = 1.0) -> Optional[Flig
     f.baro_temp = extract_half(data, 83)
     f.baro_pressure = extract_real32(data, 85) * 0.01  # Pa -> hPa
     f.baro_altitude = extract_real32(data, 89)
+    f.raw_baro_altitude = extract_half(data, 109)
     f.baro_variance = extract_real32(data, 93)
     f.accu_variance = extract_real32(data, 97)
     f.accu_bias_variance = extract_real32(data, 101)
@@ -1444,8 +1447,13 @@ def parse_control_packet(data: bytes) -> Optional[ControlData]:
 def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[object], int]:
     """
     Parse a packet based on its tag.
-    Input: full buffer [SOH, tag, len(u16 LE), body..., checksum, EOT]
-    Strips framing and validates checksum (XOR of tag + len + body).
+    Input: full buffer [SOH, tag, len(u16 LE), body..., checksum]
+    (ESC-unstuffed by FrameDecoder; EOT terminates the frame and is not part of it).
+    A frame whose checksum byte does not verify is rejected with (None, tag).
+    The checksum is the FC's emission semantic: XOR of every byte between SOH
+    and the final checksum byte. The length field is NOT used in the check —
+    the FC ships tag-63 with a stale length field (fixed 2026-11-19) and the
+    deployed fleet emits it that way until re-flashed.
     """
     if len(data) < 6:
         return None, 0
@@ -1458,6 +1466,12 @@ def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[objec
 
     if len(data) < 4 + body_length + 1:
         return None, 0
+
+    checksum = 0
+    for b in data[1:-1]:
+        checksum ^= b
+    if data[-1] != checksum:
+        return None, tag
     body = data[4:4 + body_length]
 
     match tag:

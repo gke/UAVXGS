@@ -32,14 +32,21 @@ _ASSUMED_TAU_FW = 0.08
 
 _AXES = ("Roll", "Pitch", "Yaw")
 
-# Per-axis colors (match CalibrationWindow: Roll/X=blue, Pitch/Y=green, Yaw/Z=red)
-_AXIS_COLORS = ("#3498db", "#2ecc71", "#e74c3c")
+# One colour vocabulary for every value cell, three states and no more:
+#   unknown   -> "--" in grey   (no data for that axis yet)
+#   tracking  -> orange         (values present, not converged)
+#   converged -> black          (values present and trustworthy)
+# The axis is identified by its column header, never by colour: the old
+# per-axis blue/green/red collided with the convergence colours and made the
+# grid unreadable (Greg, 2026-11-20).
+_VAL_BASE = "font-weight: bold; font-size: 14px; color: %s;"
+_ST_UNKNOWN = _VAL_BASE % "#888888"
+_ST_TRACK = _VAL_BASE % "#a15500"
+_ST_CONV = _VAL_BASE % "#000000"
+_HL = " background-color: #fff9c4;"
 
 # Styling constants (match calibration panel aesthetic)
 _LBL_STYLE = "font-weight: bold; font-size: 12px;"
-_VAL_STYLE = "font-weight: bold; font-size: 14px;"
-_VAL_STYLE_GREEN = "font-weight: bold; font-size: 14px; color: #1f7a45;"
-_VAL_STYLE_AMBER = "font-weight: bold; font-size: 14px; color: #a15500;"
 _TITLE_STYLE = "font-size: 18px; font-weight: bold;"
 _GROUP_STYLE = "QGroupBox { font-weight: bold; }"
 
@@ -126,31 +133,26 @@ class IdentifyWindow(QMainWindow):
             ("Step rise/settle", "_ident_step"),
         ]
 
-        # Header row: label + one column per axis (centred, per-axis color).
+        # Header row: label + one column per axis (centred). The axis is named
+        # here and nowhere else; value colour carries state, not axis.
         grid.addWidget(QLabel(""), 0, 0)
         for c, ax in enumerate(_AXES, start=1):
             hdr = QLabel("<b>%s</b>" % ax)
-            hdr.setStyleSheet("font-weight: bold; font-size: 14px; color: %s;" % _AXIS_COLORS[c-1])
+            hdr.setStyleSheet("font-weight: bold; font-size: 14px;")
             hdr.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
             grid.addWidget(hdr, 0, c)
 
         for r, (label, attr) in enumerate(rows, start=1):
-            # Special highlight for the Revised Kp row (the key result)
+            # The Revised Kp row is the key result: it is highlighted, not
+            # coloured, so its state colour still reads the same way.
             is_revised_kp = (attr == "_ident_pk")
-            if is_revised_kp:
-                lbl = QLabel("<b>%s</b>" % label)
-                lbl.setStyleSheet(_LBL_STYLE + " background-color: #fff9c4;")
-                grid.addWidget(lbl, r, 0)
-            else:
-                lbl = QLabel("<b>%s</b>" % label)
-                lbl.setStyleSheet(_LBL_STYLE)
-                grid.addWidget(lbl, r, 0)
+            lbl = QLabel("<b>%s</b>" % label)
+            lbl.setStyleSheet(_LBL_STYLE + (_HL if is_revised_kp else ""))
+            grid.addWidget(lbl, r, 0)
             for c in range(1, 4):
                 val_lbl = QLabel("--")
-                if is_revised_kp:
-                    val_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: %s; background-color: #fff9c4;" % _AXIS_COLORS[c-1])
-                else:
-                    val_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: %s;" % _AXIS_COLORS[c-1])
+                val_lbl.setStyleSheet(
+                    _ST_UNKNOWN + (_HL if is_revised_kp else ""))
                 val_lbl.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
                 grid.addWidget(val_lbl, r, c)
             setattr(self, attr, [None] * 3)
@@ -176,7 +178,8 @@ class IdentifyWindow(QMainWindow):
             "respond like the assumed model at your current Kp "
             "(matches current when plant is as assumed; slower plant "
             "needs more Kp). "
-            "Green = converged (n\u2265200, sig < 0.01)."
+            "Black = converged, orange = still tracking, grey -- = no data "
+            "(n\u2265200, sig < 0.01 to converge)."
         )
         expl.setWordWrap(True)
         expl.setStyleSheet("color: #555; font-size: 12px;")
@@ -187,36 +190,46 @@ class IdentifyWindow(QMainWindow):
         self._clear_all()
 
     # ------------------------------------------------------------------
+    def _param_window(self):
+        """The parameter window, created on demand but never shown.
+
+        MainWindow builds ParameterWindow lazily in show_parameter_window(),
+        so opening Identify first used to find no widgets and blanked the
+        current-gain rows. ensure_param_window() seeds any pending state the
+        same way the normal show path does.
+        """
+        ensure = getattr(self.parent_window, "ensure_param_window", None)
+        if ensure is not None:
+            return ensure()
+        return getattr(self.parent_window, "param_window", None)
+
     def _curve_axis_gains(self):
         """Current (Rate Kp, Rate Kd) per axis from the param window's live
         widgets, or (None, None) if the window/values are unavailable."""
         gains = {}
-        pw = getattr(self.parent_window, "param_window", None)
+        pw = self._param_window()
         if pw is None:
             return gains
         from protocol_enums import ParamIndex
         idx = {0: (ParamIndex.ROLL_RATE_KP, ParamIndex.ROLL_RATE_KD),
                1: (ParamIndex.PITCH_RATE_KP, ParamIndex.PITCH_RATE_KD),
                2: (ParamIndex.YAW_RATE_KP, ParamIndex.YAW_RATE_KD)}
+
+        def raw_value(tag):
+            w = pw.param_widget(int(tag))
+            if isinstance(w, QDoubleSpinBox):
+                mult = pw._display_mult(int(tag)) if hasattr(pw, "_display_mult") else 1.0
+                return w.value() / mult if mult else None
+            if isinstance(w, QSpinBox):
+                return float(w.value())
+            return None
+
         for ax, (kpi, kdi) in idx.items():
-            kp = kd = None
-            w = pw.params.get(int(kpi))
-            if isinstance(w, QDoubleSpinBox):
-                kp = (w.value() / pw._display_mult(int(kpi))
-                      if hasattr(pw, "_display_mult") else w.value())
-            elif isinstance(w, QSpinBox):
-                kp = float(w.value())
-            w = pw.params.get(int(kdi))
-            if isinstance(w, QDoubleSpinBox):
-                kd = (w.value() / pw._display_mult(int(kdi))
-                      if hasattr(pw, "_display_mult") else w.value())
-            elif isinstance(w, QSpinBox):
-                kd = float(w.value())
-            gains[ax] = (kp, kd)
+            gains[ax] = (raw_value(kpi), raw_value(kdi))
         return gains
 
     def _assumed_tau(self):
-        pw = getattr(self.parent_window, "param_window", None)
+        pw = self._param_window()
         if pw and hasattr(pw, "_current_af_category"):
             try:
                 cat = pw._current_af_category()
@@ -227,7 +240,7 @@ class IdentifyWindow(QMainWindow):
         return _ASSUMED_TAU_FW
 
     def _clear_all(self):
-        """Set every value label to '--' with per-axis base colors."""
+        """Set every value label to '--' (unknown state)."""
         for r in range(3):
             for attr in ("_gains_kp", "_gains_kd", "_gains_tau",
                          "_ident_a", "_ident_b", "_ident_sa", "_ident_sb",
@@ -235,10 +248,7 @@ class IdentifyWindow(QMainWindow):
                          "_ident_pk", "_ident_step"):
                 arr = getattr(self, attr)
                 arr[r].setText("--")
-                if attr == "_ident_pk":
-                    arr[r].setStyleSheet("font-weight: bold; font-size: 14px; color: %s; background-color: #fff9c4;" % _AXIS_COLORS[r])
-                else:
-                    arr[r].setStyleSheet("font-weight: bold; font-size: 14px; color: %s;" % _AXIS_COLORS[r])
+                arr[r].setStyleSheet(_ST_UNKNOWN + (_HL if attr == "_ident_pk" else ""))
 
     # ------------------------------------------------------------------
     def _refresh(self, tune):
@@ -279,25 +289,31 @@ class IdentifyWindow(QMainWindow):
             a, b, sa, sb, n = ident[r]
             kp, kd = gains.get(r, (None, None))
 
-            # --- Current gains & assumed plant ---
-            base_style = "font-weight: bold; font-size: 14px; color: %s;" % _AXIS_COLORS[r]
-            self._gains_kp[r].setText(_fmt(kp))
-            self._gains_kp[r].setStyleSheet(base_style)
-            self._gains_kd[r].setText(_fmt(kd))
-            self._gains_kd[r].setStyleSheet(base_style)
+            # The ident block is only meaningful once the axis has been
+            # excited: n == 0 means no samples, and a/b are still their
+            # initial zeros. Those cells read "--", not "0.0000".
+            known = n > 0
+            is_converged = known and _identify_state(sa, sb, n) == "Converged"
+            if is_converged:
+                n_converged += 1
+            st = _ST_CONV if is_converged else (_ST_TRACK if known else _ST_UNKNOWN)
+
+            # --- Current gains & assumed plant: known unless the parameter
+            # window could not supply them, so they are never state-coloured.
+            for attr, val in (("_gains_kp", kp), ("_gains_kd", kd)):
+                arr = getattr(self, attr)
+                arr[r].setText(_fmt(val))
+                arr[r].setStyleSheet(_ST_CONV if val is not None else _ST_UNKNOWN)
             self._gains_tau[r].setText("%.3f" % assumed_tau)
-            self._gains_tau[r].setStyleSheet(base_style)
+            self._gains_tau[r].setStyleSheet(_ST_CONV)
 
             # --- Identified plant ---
             tau_f = k_f = prop_kp_f = None
-            is_converged = _identify_state(sa, sb, n) == "Converged"
-            if is_converged:
-                n_converged += 1
 
-            if 0.0 < a < 1.0:
+            if known and 0.0 < a < 1.0:
                 tau_f = -_IDENTIFY_DT / math.log(a)
-                k_f = b / (1.0 - a) if a != 1.0 else None
-                if (k_f is not None and math.isfinite(k_f) and k_f > 0):
+                k_f = b / (1.0 - a)
+                if math.isfinite(k_f) and k_f > 0:
                     # Proposed Kp: make the IDENTIFIED plant respond like the
                     # ASSUMED model does with the current Kp.
                     # Assumed closed-loop pole: a_as - b_as*Kp_current, where
@@ -310,29 +326,18 @@ class IdentifyWindow(QMainWindow):
                             and -1.0 < pole_target < 1.0):
                         prop_kp_f = (a - pole_target) / b
 
-            # Raw identified parameters: per-axis color
-            raw_style = "font-weight: bold; font-size: 14px; color: %s;" % _AXIS_COLORS[r]
-            self._ident_a[r].setText(_fmt(a, ".4f"))
-            self._ident_a[r].setStyleSheet(raw_style)
-            self._ident_b[r].setText(_fmt(b, ".4f"))
-            self._ident_b[r].setStyleSheet(raw_style)
-            self._ident_sa[r].setText(_fmt(sa, ".6f"))
-            self._ident_sa[r].setStyleSheet(raw_style)
-            self._ident_sb[r].setText(_fmt(sb, ".6f"))
-            self._ident_sb[r].setStyleSheet(raw_style)
+            for attr, val, fmt_s in (("_ident_a", a if known else None, ".4f"),
+                                     ("_ident_b", b if known else None, ".4f"),
+                                     ("_ident_sa", sa if known else None, ".6f"),
+                                     ("_ident_sb", sb if known else None, ".6f"),
+                                     ("_ident_tau", tau_f, ".3f"),
+                                     ("_ident_k", k_f, ".3f"),
+                                     ("_ident_pk", prop_kp_f, ".4f")):
+                arr = getattr(self, attr)
+                arr[r].setText(_fmt(val, fmt_s))
+                arr[r].setStyleSheet(st + (_HL if attr == "_ident_pk" else ""))
             self._ident_n[r].setText(str(int(n)))
-            self._ident_n[r].setStyleSheet(raw_style)
-
-            # Derived/convergence-sensitive rows: green/amber
-            conv_style = (_VAL_STYLE_GREEN if is_converged
-                          else _VAL_STYLE_AMBER if n > 0
-                          else raw_style)
-            self._ident_tau[r].setText(_fmt(tau_f, ".3f"))
-            self._ident_tau[r].setStyleSheet(conv_style)
-            self._ident_k[r].setText(_fmt(k_f, ".3f"))
-            self._ident_k[r].setStyleSheet(conv_style)
-            self._ident_pk[r].setText(_fmt(prop_kp_f, ".4f"))
-            self._ident_pk[r].setStyleSheet(conv_style)
+            self._ident_n[r].setStyleSheet(st)
 
             # Step response: current Kp through identified vs assumed plant.
             step_txt = "--"
@@ -350,7 +355,8 @@ class IdentifyWindow(QMainWindow):
                 except Exception:
                     step_txt = "--"
             self._ident_step[r].setText(step_txt)
-            self._ident_step[r].setStyleSheet(conv_style)
+            self._ident_step[r].setStyleSheet(
+                st if step_txt != "--" else _ST_UNKNOWN)
 
 # Status line
         labels = []
@@ -361,11 +367,11 @@ class IdentifyWindow(QMainWindow):
         if labels:
             self.status.setText(
                 "Converged: %s  |  target \u03c4=%.2f s  |  "
-                "green = n\u2265%d, sig < %.3f"
+                "black = n\u2265%d, sig < %.3f"
                 % (", ".join(labels), assumed_tau,
                    IDENTIFY_MIN_SAMPLES, IDENTIFY_CONV_SIG))
             self.status.setStyleSheet(
-                "color: #1f7a45; font-weight: bold; font-size: 12px;")
+                "color: #000000; font-weight: bold; font-size: 12px;")
         elif any(ident[r][4] > 0 for r in range(3)):
             self.status.setText(
                 "Tracking (no axis converged yet)  |  "
