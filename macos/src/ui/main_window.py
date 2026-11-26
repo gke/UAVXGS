@@ -158,7 +158,7 @@ FLAG_BIT_DEFS = {
     71: ('nav_enabled', 'NavEnabled', 'Navigation Enabled'),
     72: ('forced_landing', 'ForcedLan', 'Forced Landing'),
     73: ('unused73', 'unused73', 'Reserved'),
-    74: ('drive_sym', 'DriveSym', 'Enforce Drive Symmetry'),
+    74: ('yaw_clamp', 'YawClamp', 'Yaw Clamp: MR only — yaw differential limited to the throttle headroom so yaw yields before roll/pitch'),
     75: ('rssi', 'RSSI', 'RSSI (< -90 dBm)'),
     76: ('ext_mag', 'ExtMag', 'Using External Mag (Config1 bit 0) — selects the external mag and its axis flip'),
     77: ('snr', 'SNR', 'SNR Low (< -10 dB)'),
@@ -461,6 +461,7 @@ PF_TERM_DEFS = {
     8: ('baro', 'Baro', 'Baro not active'),
     9: ('mag', 'Mag', 'Mag in use but not calibrated/active'),
     10: ('batt', 'Batt/Nav', 'Low battery, serial fatal, RTH or navigation active'),
+    11: ('gps_unsupported', 'GPS', 'GPS receiver unsupported (pre-M8 UBX)'),
 }
 
 
@@ -475,6 +476,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.flight_data: FlightData = FlightData()
         self.nav_data: Optional[FlightData] = None
+        self.gps_detail: GPSDetailData = GPSDetailData()
         self.link_stats: Optional[LinkStatsData] = None
         self.wind_data: Optional[WindData] = None
         self.serial_ports: Optional[dict] = None
@@ -496,6 +498,7 @@ class MainWindow(QMainWindow):
         self.config2_cache = 0
         self._gps_absent = None
         self._gps_absent_reports = 0
+        self._gps_report_start: Optional[float] = None
         self._mag_absent = None
         self._mag_absent_reports = 0
         
@@ -785,9 +788,23 @@ class MainWindow(QMainWindow):
         
         toolbar.addWidget(QLabel("Baud:"))
         self.baud_combo = QComboBox()
-        self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200", "128000"])
-        self.baud_combo.setCurrentText("115200")
+        self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200", "128000", "230400", "460800", "921600"])
+        self.baud_combo.setCurrentText("921600")
         toolbar.addWidget(self.baud_combo)
+
+        toolbar.addWidget(QLabel("Diag:"))
+        self.diag_axis_combo = QComboBox()
+        self.diag_axis_combo.addItem("Off", 0)
+        self.diag_axis_combo.addItem("Pitch", 2)
+        self.diag_axis_combo.addItem("Roll", 1)
+        self.diag_axis_combo.addItem("Yaw", 3)
+        self.diag_axis_combo.addItem("Roll+Pitch", 4)
+        self.diag_axis_combo.setCurrentIndex(1)
+        self.diag_axis_combo.setToolTip(
+            "In-flight diagnostic stream. When not Off, FC sends only high-rate "
+            "diag packets while State==eInFlight (normal telemetry resumes outside)."
+        )
+        toolbar.addWidget(self.diag_axis_combo)
         
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
@@ -994,6 +1011,7 @@ class MainWindow(QMainWindow):
         state_box = QGroupBox("State")
         state_box.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
         state_layout = QGridLayout()
+        state_layout.setVerticalSpacing(1)
         self.flight_state_label = QLabel("Unknown")
         self.flight_state_label.setStyleSheet("font-weight: bold;")
         self.nav_state_label = QLabel("Unknown")
@@ -1026,6 +1044,7 @@ class MainWindow(QMainWindow):
         batt_box = QGroupBox("Battery")
         batt_box.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
         batt_layout = QHBoxLayout()
+        batt_layout.setSpacing(1)
         self.batt_volts = QLabel("0.00 V")
         self.batt_volts.setStyleSheet("font-size: 16px; font-weight: bold;")
         self.batt_current = QLabel("0.0 A")
@@ -1345,17 +1364,21 @@ class MainWindow(QMainWindow):
         self.gps_rx_bytes = QLabel("---")
         self.gps_rx_packets = QLabel("---")
         self.gps_rx_drops = QLabel("---")
+        self.gps_ubx_version = QLabel("---")
         self.gps_rx_note = QLabel("")
         self.gps_rx_note.setStyleSheet("font-weight: bold; color: #e74c3c;")
-        for lbl in (self.gps_rx_bytes, self.gps_rx_packets, self.gps_rx_drops):
+        for lbl in (self.gps_rx_bytes, self.gps_rx_packets, self.gps_rx_drops,
+                    self.gps_ubx_version):
             lbl.setStyleSheet("font-weight: bold;")
         gps_layout.addWidget(QLabel("RX:"), 6, 0)
         gps_layout.addWidget(self.gps_rx_bytes, 6, 1)
         gps_layout.addWidget(QLabel("Pkts:"), 6, 2)
         gps_layout.addWidget(self.gps_rx_packets, 6, 3)
-        gps_layout.addWidget(QLabel("Drops:"), 7, 0)
-        gps_layout.addWidget(self.gps_rx_drops, 7, 1)
-        gps_layout.addWidget(self.gps_rx_note, 7, 2, 1, 2)
+        gps_layout.addWidget(QLabel("UBX:"), 7, 0)
+        gps_layout.addWidget(self.gps_ubx_version, 7, 1)
+        gps_layout.addWidget(QLabel("Drops:"), 7, 2)
+        gps_layout.addWidget(self.gps_rx_drops, 7, 3)
+        gps_layout.addWidget(self.gps_rx_note, 8, 0, 1, 4)
 
         fm = self.gps_lat.fontMetrics()
         w_latlon = fm.horizontalAdvance("-123.456789") + 4
@@ -1366,7 +1389,7 @@ class MainWindow(QMainWindow):
         for lbl in (self.gps_alt, self.gps_vel, self.gps_sats, self.gps_fix,
                     self.gps_hacc, self.gps_sacc, self.gps_vacc, self.gps_cacc,
                     self.gps_rate_label, self.gps_rx_bytes, self.gps_rx_packets,
-                    self.gps_rx_drops):
+                    self.gps_rx_drops, self.gps_ubx_version):
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lbl.setMinimumWidth(w_num)
 
@@ -1475,7 +1498,7 @@ class MainWindow(QMainWindow):
         self.config_labels = []
         self.config_flags = [
             (1, 0, "Ext Mag"), (1, 1, "Autoland"), (1, 3, "Emulation"),
-            (1, 4, "AH Alarm"), (1, 5, "GPS Alt"), (1, 7, "Clamp"),
+            (1, 4, "AH Alarm"), (1, 5, "GPS Alt"), (1, 7, "Yaw Clamp"),
             (2, 0, "Batt Comp"), (2, 4, "Prop In"),
             (2, 5, "Turn WP"), (2, 6, "Beep WP"),
         ]
@@ -1629,11 +1652,18 @@ class MainWindow(QMainWindow):
         self.ident_btn.clicked.connect(self.show_identify_window)
         self.esc_btn.clicked.connect(self.enter_esc_programming)
         self.replay_btn.clicked.connect(self.open_replay)
+        self.diag_axis_combo.currentIndexChanged.connect(self._on_diag_axis_changed)
         self.speech_level_combo.currentIndexChanged.connect(self.speech_level_changed)
         
         for btn in [self.connect_btn]:
             btn.setProperty('original_text', btn.text())
         
+    def _on_diag_axis_changed(self, _index: int = 0):
+        axis = int(self.diag_axis_combo.currentData() or 0)
+        if self.connected:
+            self.send_request(PacketTag.MISC, MiscCommand.SET_DIAG_AXIS, axis)
+            self.log_debug(f"📤 Diag axis set to {self.diag_axis_combo.currentText()} ({axis})", "Info")
+
     def enter_esc_programming(self):
         if not self.connected:
             QMessageBox.information(self, "ESC Programming",
@@ -1776,6 +1806,7 @@ class MainWindow(QMainWindow):
             self.log_debug(msg, "Warnings")
 
     _GPS_ABSENT_CONFIRM_REPORTS = 3
+    _GPS_HAVE_GRACE_S = 1.0
     _MAG_ABSENT_CONFIRM_REPORTS = 3
 
     def _update_gps_rx(self, f):
@@ -1790,6 +1821,16 @@ class MainWindow(QMainWindow):
         The counters only exist on FC builds from 2026-11-11 onward, so an older
         FC shows "---" rather than a row of zeroes that would read as a fault.
         """
+        major = getattr(f, 'gps_ubx_major', 0)
+        legacy = 0 < major < 8
+        self.gps_ubx_version.setText(
+            f"v{major} legacy" if legacy else f"v{major}" if major else "---")
+        self.gps_ubx_version.setStyleSheet(
+            "font-weight: bold; color: #e74c3c;" if legacy
+            else "font-weight: bold;")
+        self.gps_ubx_version.setToolTip(
+            "pre-M8 UBX: legacy, unsupported" if legacy else "")
+
         if not getattr(f, 'gps_rx_present', False):
             for lbl in (self.gps_rx_bytes, self.gps_rx_packets, self.gps_rx_drops):
                 lbl.setText("---")
@@ -1813,25 +1854,33 @@ class MainWindow(QMainWindow):
         self._check_gps_absence()
 
     def _check_gps_absence(self):
-        """Evaluate F.GPSAbsent from the last flag report.
+        """Evaluate receiver absence from the last flag report.
 
         The nav packet carries no flag block, so the flag bits arrive on a
-        different tag and are kept in current_flag_bits. Deciding only when
-        bit 84 is actually present keeps "not reported yet" from reading as
-        "present", which is the mistake the magnetometer tab made once.
+        different tag and are kept in current_flag_bits. HaveGPS (bit 57) is
+        the presence question; F.GPSAbsent (bit 84) is the FC's no-packets
+        deadline. Either one may retire the boxes, but only after bit 57 has
+        actually been reported - "not reported yet" is not "absent".
         """
         bits = self.current_flag_bits
-        if len(bits) > 84:
-            self._set_gps_absence(bool(bits[84]))
+        if len(bits) <= 57:
+            return
+        now = time.monotonic()
+        if self._gps_report_start is None:
+            self._gps_report_start = now
+        have_gps = bool(bits[57])
+        explicit_absent = len(bits) > 84 and bool(bits[84])
+        grace_done = (now - self._gps_report_start) >= self._GPS_HAVE_GRACE_S
+        self._set_gps_absence(explicit_absent or (not have_gps and grace_done))
 
     def _set_gps_absence(self, absent):
         """Retire the GPS and Navigation boxes when the FC reports no receiver.
 
-        Absence is a positive report (F.GPSAbsent): either the board has no GPS
-        port wired at all, or the port is wired and nothing has ever arrived on
-        it. It is never inferred from a lost fix, so a receiver that is present
-        but not yet locked keeps both boxes visible with their accuracy figures
-        red - that is information the pilot needs, not a missing device.
+        Absence is HaveGPS clear after the boot grace, or the FC's positive
+        F.GPSAbsent deadline. It is never inferred from a lost fix: a receiver
+        that is present but not yet locked keeps both boxes visible with their
+        accuracy figures red - that is information the pilot needs, not a
+        missing device.
 
         Debounced like the magnetometer tab, and latched once hidden: a receiver
         that starts talking mid-session is a bench fault being cleared, not a
@@ -1853,7 +1902,7 @@ class MainWindow(QMainWindow):
             "No GPS: Hold and WP Nav are inert; RTH becomes an abortable "
             "forced landing")
         self.nav_no_gps_label.setVisible(True)
-        self.log_debug("No GPS receiver detected (FC telemetry bit 84) - "
+        self.log_debug("No GPS receiver detected (HaveGPS clear / FC bit 84) - "
                        "GPS and Navigation boxes retired for this session", "Info")
 
     def _check_mag_absence(self):
@@ -2040,7 +2089,7 @@ class MainWindow(QMainWindow):
         if not saved_port.startswith("/dev/") and saved_port != "auto":
             saved_port = "auto"
         self.port_combo.setCurrentText(saved_port)
-        self.baud_combo.setCurrentText(settings.value("baud", "115200"))
+        self.baud_combo.setCurrentText(settings.value("baud", "921600"))
         # Speech level: default is OFF (2026-09-04, Greg). The operator opts in by
         # selecting a level from the status-bar combo; the persisted choice is
         # honoured, but a never-chosen GCS defaults to silenced.
@@ -2164,6 +2213,7 @@ class MainWindow(QMainWindow):
         
         if connected:
             self._in_flight = False
+            self.gps_detail = GPSDetailData()
             self.esc_btn.setEnabled(True)
             self.esc_btn.setText("ESC")
             self.esc_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
@@ -2176,6 +2226,7 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
             self.statusBar().showMessage("Connected to UAVX")
             self.log_debug("✅ Connected to UAVX", "Info")
+            self._on_diag_axis_changed()
             # The connect-time uplink only runs once the FC has proven its
             # main loop is up (first tag-79); while muted, case 79 defers it.
             if not self._tx_muted:
@@ -2214,6 +2265,7 @@ class MainWindow(QMainWindow):
             self.send_request(PacketTag.PARAM_TAGGED_READ, 255, 0, None)
         self.send_request(PacketTag.AFNAME, 0, 0, None)
         self.send_request(PacketTag.TUNING, 0, 0, None)
+        self.send_request(PacketTag.INIT_STATE, 0, 0, None)
         self._identify_poll_timer.start(1000)
         self._start_meta_sweep()
 
@@ -2973,6 +3025,24 @@ class MainWindow(QMainWindow):
             self.speech.speak_alarm(alarm_name)
             self._last_spoken_alarm_state = alarm
 
+    def _merge_gps_detail(self, parsed):
+        if not isinstance(parsed, GPSDetailData):
+            return
+        if parsed.page == 0:
+            self.gps_detail.satellites.clear()
+            self.gps_detail.signals = []
+            self.gps_detail.constellations = parsed.constellations
+            self.gps_detail.ubx_messages = parsed.ubx_messages
+            self.gps_detail.sat_count = parsed.sat_count
+            self.gps_detail.used_sats = parsed.used_sats
+            self.gps_detail.constellation_count = parsed.constellation_count
+            self.gps_detail.ubx_msg_count = parsed.ubx_msg_count
+            self.gps_detail.signal_count = parsed.signal_count
+        else:
+            self.gps_detail.satellites.update(parsed.satellites)
+            self.gps_detail.signals = parsed.signals
+        self.gps_detail.page = parsed.page
+
     def process_packet(self, data: bytes):
         self._last_rx_time = time.monotonic()
         parsed, tag = parse_packet(data, 1.0)
@@ -2985,7 +3055,8 @@ class MainWindow(QMainWindow):
             60: "Unused", 61: "Unused", 62: "Calibration", 63: "AFName",
             64: "Wind", 65: "Unused", 66: "SerialPorts", 67: "ExecTime",
             68: "Unused", 69: "LinkStats", 70: "InitState", 71: "ParamRead",
-            76: "I2CErrors", 77: "ParamImage", 79: "State",
+            76: "I2CErrors", 77: "ParamImage", 79: "State", 81: "GPSDetail",
+            82: "DiagAxis",
         }
         tag_name = TAG_NAMES.get(tag, f"Unknown({tag})")
         tag_ok = "OK" if parsed is not None else "FAIL"
@@ -2995,7 +3066,7 @@ class MainWindow(QMainWindow):
         now_t = time.time()
         last = getattr(self, '_rx_print_t', {})
         interval = last.get(tag, 0.0)
-        if tag_ok == "FAIL" or (tag > 68 and tag not in (79, 80)) or now_t - interval >= 0.8:
+        if tag_ok == "FAIL" or (tag > 68 and tag not in (79, 80, 81)) or now_t - interval >= 0.8:
             detail = f" raw={data.hex()}" if tag_ok == "FAIL" else ""
             console(f"[RX] tag={tag} ({tag_name}) {tag_ok} len={len(data)}B{detail}")
         last[tag] = now_t
@@ -3006,7 +3077,8 @@ class MainWindow(QMainWindow):
         # Terminal dump of decoded packet contents (same ~1 Hz rate gate as
         # the [RX] header above so high-rate telemetry stops flooding the
         # console; FAIL frames always show). Uses the pre-update interval.
-        dump_ok = (tag_ok == "FAIL" or tag > 68 or now_t - interval >= 0.8)
+        dump_ok = (tag_ok == "FAIL" or (tag > 68 and tag not in (79, 80, 81))
+                   or now_t - interval >= 0.8)
         if tag == 13 and hasattr(parsed, 'flag_bits') and dump_ok:
             fb = parsed.flag_bits
             def fbok(i): return fb[i] if len(fb) > i else False
@@ -3047,6 +3119,16 @@ class MainWindow(QMainWindow):
                 parts = [f"{rc_name(i)}={round(rc[i]) if math.isfinite(rc[i]) else 'nan'}"
                          for i in range(min(len(rc), 12))]
                 console("[RC] " + " ".join(parts))
+        elif tag == 82 and dump_ok and hasattr(parsed, 'axis_sel'):
+            axis_names = {0: 'Off', 1: 'Roll', 2: 'Pitch', 3: 'Yaw', 4: 'Roll+Pitch'}
+            parts = [f"[DIAG] sel={axis_names.get(parsed.axis_sel, parsed.axis_sel)} state={parsed.state} t={parsed.time_ms}ms"]
+            for s in parsed.samples:
+                nm = ['Roll', 'Pitch', 'Yaw'][s.axis] if 0 <= s.axis <= 2 else str(s.axis)
+                parts.append(f"{nm} dr={s.desired_rate:+.3f} r={s.rate:+.3f} da={s.desired_angle:+.3f} a={s.angle:+.3f}")
+            if parsed.pwm:
+                parts.append("pwm=" + ",".join(f"{p:+.3f}" for p in parsed.pwm))
+            parts.append(f"thr={parsed.desired_throttle:.3f} altc={parsed.alt_comp:.3f} acc={parsed.acc_confidence:.3f}")
+            console(" ".join(parts))
         elif tag == 62 and isinstance(parsed, dict) and dump_ok:
             flags = parsed.get('flags', [])
             if len(flags) > 5:
@@ -3083,7 +3165,7 @@ class MainWindow(QMainWindow):
                                ("gps_lat", "gps_lon", "gps_sats", "gps_fix",
                                 "gps_hacc", "gps_vacc", "gps_sacc", "gps_cacc",
                                 "gps_vel", "gps_heading", "gps_altitude",
-                                "gps_type", "gps_update_rate",
+                                "gps_ubx_major", "gps_update_rate",
                                 "curr_wp", "wp_bearing",
                                 "distance_to_wp", "cross_track_error",
                                 "mag_var_wmm",
@@ -3128,7 +3210,7 @@ class MainWindow(QMainWindow):
                     for attr in ("gps_lat", "gps_lon", "gps_sats", "gps_fix",
                                  "gps_hacc", "gps_vacc", "gps_sacc", "gps_cacc",
                                  "gps_vel", "gps_heading", "gps_altitude",
-                                 "gps_type", "gps_update_rate",
+                                 "gps_ubx_major", "gps_update_rate",
                                  "curr_wp", "wp_bearing", "cross_track_error",
                                  "nav_state", "alarm_state",
                                  "mag_var_wmm",
@@ -3379,6 +3461,10 @@ class MainWindow(QMainWindow):
                     self.i2c_errors = parsed
                     if self.anomaly_box is not None:
                         self.anomaly_box.update_sio_counts(parsed)
+
+            case 81:
+                packet_logger.log_received(81, "GPSD", parsed)
+                self._merge_gps_detail(parsed)
 
             case 74:
                 packet_logger.log_received(74, "TESTRSP", parsed)
@@ -3671,9 +3757,30 @@ class MainWindow(QMainWindow):
                 continue
 
             is_active = bit < len(flag_bits) and flag_bits[bit]
-            
+
+            if flag_key == 'dive_mode':
+                dive_map = None
+                if self.param_window is not None:
+                    try:
+                        dive_map = int(self.param_window._get_param_value(ParamIndex.RX_AUX7_CH))
+                    except Exception:
+                        dive_map = None
+                discovered = getattr(self.flight_data, 'discovered_channels', 0) if self.flight_data else 0
+                rc_phys = getattr(self.flight_data, 'rc_physical', None) if self.flight_data else None
+                if not rc_phys:
+                    rc_phys = getattr(self.flight_data, 'rc_raw', []) if self.flight_data else []
+                active_high = (
+                    dive_map is not None
+                    and 0 <= dive_map < discovered
+                    and dive_map < len(rc_phys)
+                    and rc_phys[dive_map] > 1700
+                )
+                if active_high:
+                    color, text_color, font_weight = "#e74c3c", "white", "bold"
+                else:
+                    color, text_color, font_weight = "#ddd", "#666", "normal"
             # 3-state CRSF flags: always show when CRSF active, color by value
-            if flag_key in ('lq', 'rssi', 'snr') and crsf_active:
+            elif flag_key in ('lq', 'rssi', 'snr') and crsf_active:
                 if flag_key == 'lq':
                     val = self.link_stats.uplink_lq
                     if val >= 80:
@@ -3904,11 +4011,11 @@ class MainWindow(QMainWindow):
                 FlightState.eInFlight: "#c0c0c0",
                 FlightState.eIREmulateUNUSED: "#bc8f8f",
                 FlightState.ePreflight: "#ff0000",
-                FlightState.eReady: "#ffd700",
+                FlightState.ePreflightOK: "#ffd700",
                 FlightState.eThrottleOpenCheck: "#ff0000",
                 FlightState.eErectingGyros: "#ff0000",
                 FlightState.eMonitorInstruments: "#c0c0c0",
-                FlightState.eInitialisingGPS: "#87ceeb",
+                FlightState.eWaitGPSFix: "#87ceeb",
                 FlightState.eStepSerial: "#87ceeb",
                 FlightState.eStepTarget: "#87ceeb",
                 FlightState.eStepDrives: "#87ceeb",
@@ -3935,12 +4042,12 @@ class MainWindow(QMainWindow):
                 FlightState.eStepGPS: "#87ceeb",
                 FlightState.eStepIdentify: "#87ceeb",
                 FlightState.eLivePreflight: "#2e8b57",
-                FlightState.eLiveReady: "#2e8b57",
+                FlightState.eLivePreflightOK: "#2e8b57",
                 FlightState.eLiveStarting: "#2e8b57",
                 FlightState.eLiveErectingGyros: "#2e8b57",
                 FlightState.eLiveWarmup: "#2e8b57",
                 FlightState.eLiveMonitorInstruments: "#2e8b57",
-                FlightState.eLiveInitialisingGPS: "#2e8b57",
+                FlightState.eLiveWaitGPSFix: "#2e8b57",
                 FlightState.eLiveThrottleOpenCheck: "#2e8b57",
                 FlightState.eLiveLanded: "#2e8b57",
                 FlightState.eLiveLanding: "#2e8b57",

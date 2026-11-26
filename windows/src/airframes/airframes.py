@@ -127,7 +127,7 @@ def _resolve_owned_or_any(enum_cls: type, token: str):
     Bare ambiguity-prone tokens (e.g. `DEFAULT`) exist on more than one
     IntFlag, so the param's owning enum must take precedence, else
     `CONFIG2_BITS = DEFAULT` resolves as Config1Bits.DEFAULT (0x16) instead
-    of Config2Bits.DEFAULT (0x4B).
+    of Config2Bits.DEFAULT (0x49).
     """
     if enum_cls is not None:
         member = _resolve_enum_member(enum_cls, token)

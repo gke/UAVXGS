@@ -29,6 +29,16 @@ def extract_short(data: bytes, offset: int) -> int:
     return (data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8)
 
 
+def extract_i16(data: bytes, offset: int) -> int:
+    """Extract little-endian signed 16-bit value"""
+    if offset + 1 >= len(data):
+        return 0
+    v = (data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8)
+    if v >= 0x8000:
+        v -= 0x10000
+    return v
+
+
 def extract_long(data: bytes, offset: int) -> int:
     """Extract little-endian 32-bit value"""
     if offset + 3 >= len(data):
@@ -180,7 +190,7 @@ class FlightData:
     north_pos_e: float = 0.0
     east_pos_e: float = 0.0
     nav_state_timeout: float = 0.0
-    gps_type: int = 0
+    gps_ubx_major: int = 0
     gps_port_wired: bool = False
     gps_rx_present: bool = False
     gps_rx_bytes: int = 0
@@ -388,9 +398,12 @@ class GuidanceData:
 @dataclass
 class TuningData:
     """Tuning telemetry (Tag=57) - from telem.c SendTuningPacket()
-    Body: flags(1) + thr(1) + 3 axes×3×f32(36) + ident block 3×(4×f32+u32)(60) = 98
+    Body: flags(1) + thr(1) + 3 axes×3×f32(36) + ident block 3×(4×f32+u32)(60)
+          + summary version(1) + 60 words(240) = 339.
     Rates in rad/s; axis output in native mixer units.
-    Ident fields (Roll/Pitch/Yaw order): a, b (ARX params), sigA, sigB (variance), n (samples)."""
+    Ident fields (Roll/Pitch/Yaw order): a, b (ARX params), sigA, sigB (standard
+    errors), n (samples). Summary fields are bounded onboard accumulators; the
+    GCS does not derive gains."""
     flags: int = 0
     throttle_pct: float = 0.0
     rate_desired_roll: float = 0.0
@@ -418,6 +431,68 @@ class TuningData:
     ident_sig_b_yaw: float = 0.0
     ident_n_yaw: int = 0
     has_ident: bool = False
+    ident_summary_version: int = 0
+    has_summary: bool = False
+    innov_rms_roll: float = 0.0
+    innov_rms_pitch: float = 0.0
+    innov_rms_yaw: float = 0.0
+    innov_max_roll: float = 0.0
+    innov_max_pitch: float = 0.0
+    innov_max_yaw: float = 0.0
+    innov_lag1_roll: float = 0.0
+    innov_lag1_pitch: float = 0.0
+    innov_lag1_yaw: float = 0.0
+    rate_low_rms_roll: float = 0.0
+    rate_low_rms_pitch: float = 0.0
+    rate_low_rms_yaw: float = 0.0
+    rate_low_max_roll: float = 0.0
+    rate_low_max_pitch: float = 0.0
+    rate_low_max_yaw: float = 0.0
+    acc_conf_mean: float = 0.0
+    acc_conf_min: float = 0.0
+    acc_conf_max: float = 0.0
+    acc_mag_mean: float = 0.0
+    acc_mag_min: float = 0.0
+    acc_mag_max: float = 0.0
+    acc_mag_dev_rms: float = 0.0
+    acc_conf_n: int = 0
+    acc_conf_low_count: int = 0
+    acc_conf_mid_count: int = 0
+    acc_conf_high_count: int = 0
+    acc_dir_low_count: int = 0
+    acc_dir_mid_count: int = 0
+    acc_dir_high_count: int = 0
+    int_e_rms_roll: float = 0.0
+    int_e_rms_pitch: float = 0.0
+    int_e_rms_yaw: float = 0.0
+    int_e_max_roll: float = 0.0
+    int_e_max_pitch: float = 0.0
+    int_e_max_yaw: float = 0.0
+    d_int_e_rms_roll: float = 0.0
+    d_int_e_rms_pitch: float = 0.0
+    d_int_e_rms_yaw: float = 0.0
+    d_total_rms_roll: float = 0.0
+    d_total_rms_pitch: float = 0.0
+    d_total_rms_yaw: float = 0.0
+    int_e_limit_hits_roll: int = 0
+    int_e_limit_hits_pitch: int = 0
+    int_e_limit_hits_yaw: int = 0
+    int_e_resets_roll: int = 0
+    int_e_resets_pitch: int = 0
+    int_e_resets_yaw: int = 0
+    mag_innov_rms: float = 0.0
+    mag_innov_max: float = 0.0
+    mag_valid_count: int = 0
+    mag_yaw_disagree_count: int = 0
+    baro_innov_rms: float = 0.0
+    baro_innov_max: float = 0.0
+    baro_innov_lag1: float = 0.0
+    kf_baro_var_mean: float = 0.0
+    kf_baro_var_max: float = 0.0
+    roc_rms: float = 0.0
+    alt_hold_comp_rms: float = 0.0
+    alt_hold_comp_max: float = 0.0
+    baro_n: int = 0
 
     @property
     def armed(self) -> bool:
@@ -472,6 +547,84 @@ class WindData:
     wind_e: float = 0.0
     wind_d: float = 0.0
     confidence: float = 0.0
+
+
+@dataclass
+class GPSConstellationData:
+    gnss_id: int = 0
+    sats: int = 0
+    used: int = 0
+    cnr_sum: int = 0
+
+
+@dataclass
+class GPSUbxMessageData:
+    msg_class: int = 0
+    msg_id: int = 0
+    count: int = 0
+
+
+@dataclass
+class GPSSatData:
+    gnss_id: int = 0
+    sv_id: int = 0
+    elev: int = 0
+    azim: int = 0
+    cno: int = 0
+    used: bool = False
+
+
+@dataclass
+class GPSSignalData:
+    gnss_id: int = 0
+    sig_id: int = 0
+    sats: int = 0
+    cno: int = 0
+
+
+@dataclass
+class GPSDetailData:
+    """Accumulated pages of Tag 81 — FC gps.c SendGPSDetailPacket().
+
+    Page 0 carries the counts/constellation summary/UBX message IDs; pages
+    1..5 carry 12 satellite records each; the last page carries signals.
+    Satellites are keyed by absolute index so out-of-order replay still lands
+    in the right sky-plot slot.
+    """
+    page: int = 0
+    sat_count: int = 0
+    used_sats: int = 0
+    constellation_count: int = 0
+    ubx_msg_count: int = 0
+    signal_count: int = 0
+    constellations: List[GPSConstellationData] = field(default_factory=list)
+    ubx_messages: List[GPSUbxMessageData] = field(default_factory=list)
+    satellites: Dict[int, GPSSatData] = field(default_factory=dict)
+    signals: List[GPSSignalData] = field(default_factory=list)
+
+
+@dataclass
+class DiagAxisSample:
+    axis: int
+    desired_rate: float = 0.0
+    rate: float = 0.0
+    desired_angle: float = 0.0
+    angle: float = 0.0
+    angle_integral: float = 0.0
+
+
+@dataclass
+class DiagAxisData:
+    time_ms: int = 0
+    axis_sel: int = 0
+    state: int = 0
+    flags: int = 0
+    samples: List[DiagAxisSample] = field(default_factory=list)
+    pwm: List[float] = field(default_factory=list)
+    desired_throttle: float = 0.0
+    alt_comp: float = 0.0
+    tilt_ff: float = 0.0
+    acc_confidence: float = 0.0
 
 
 def parse_flight_packet(data: bytes, voltage_trim: float = 1.0) -> Optional[FlightData]:
@@ -654,7 +807,7 @@ def parse_nav_packet(data: bytes) -> Optional[FlightData]:
 
     dT_s = extract_real32(data, 60)
     f.gps_update_rate = 1.0 / dT_s if dT_s > 0 else 0.0
-    f.gps_type = extract_byte(data, 68)
+    f.gps_ubx_major = extract_byte(data, 68)
     f.gps_port_wired = bool(extract_byte(data, 69))
 
     # Correction terms arrive in radians; the yaw P error is published in
@@ -1147,6 +1300,7 @@ def parse_tuning_packet(data: bytes) -> Optional[TuningData]:
     """Parse UAVXTuningPacket (Tag=57) - from telem.c SendTuningPacket()
     Body: flags(1) + thrByte(1) + 3 axes x (desired, actual, out) f32 = 38
           + ident block 3 axes x (a,b,sigA,sigB f32 + n u32) = 60  [v2]
+          + summary version(1) + 60 words(240)  [v4].
     Rates in rad/s; axis output in native mixer units."""
     if len(data) < 38:
         return None
@@ -1182,6 +1336,61 @@ def parse_tuning_packet(data: bytes) -> Optional[TuningData]:
         t.ident_sig_a_yaw = extract_real32(data, off);     off += 4
         t.ident_sig_b_yaw = extract_real32(data, off);     off += 4
         t.ident_n_yaw = extract_int32(data, off);           off += 4
+
+    if len(data) >= off + 1 + 60 * 4:
+        version = data[off]
+        off += 1
+        if version == 4:
+            t.has_summary = True
+            t.ident_summary_version = version
+
+            for name in ("innov_rms", "innov_max", "innov_lag1",
+                         "rate_low_rms", "rate_low_max"):
+                for axis in ("roll", "pitch", "yaw"):
+                    setattr(t, "%s_%s" % (name, axis),
+                            extract_real32(data, off))
+                    off += 4
+
+            for name in ("acc_conf_mean", "acc_conf_min", "acc_conf_max",
+                         "acc_mag_mean", "acc_mag_min", "acc_mag_max",
+                         "acc_mag_dev_rms"):
+                setattr(t, name, extract_real32(data, off))
+                off += 4
+
+            for name in ("acc_conf_n", "acc_conf_low_count",
+                         "acc_conf_mid_count", "acc_conf_high_count",
+                         "acc_dir_low_count", "acc_dir_mid_count",
+                         "acc_dir_high_count"):
+                setattr(t, name, extract_int32(data, off))
+                off += 4
+
+            for name in ("int_e_rms", "int_e_max", "d_int_e_rms",
+                         "d_total_rms"):
+                for axis in ("roll", "pitch", "yaw"):
+                    setattr(t, "%s_%s" % (name, axis),
+                            extract_real32(data, off))
+                    off += 4
+
+            for name in ("int_e_limit_hits", "int_e_resets"):
+                for axis in ("roll", "pitch", "yaw"):
+                    setattr(t, "%s_%s" % (name, axis),
+                            extract_int32(data, off))
+                    off += 4
+
+            for name in ("mag_innov_rms", "mag_innov_max"):
+                setattr(t, name, extract_real32(data, off))
+                off += 4
+            for name in ("mag_valid_count", "mag_yaw_disagree_count"):
+                setattr(t, name, extract_int32(data, off))
+                off += 4
+
+            for name in ("baro_innov_rms", "baro_innov_max",
+                         "baro_innov_lag1", "kf_baro_var_mean",
+                         "kf_baro_var_max", "roc_rms",
+                         "alt_hold_comp_rms", "alt_hold_comp_max"):
+                setattr(t, name, extract_real32(data, off))
+                off += 4
+            t.baro_n = extract_int32(data, off)
 
     return t
 
@@ -1444,6 +1653,123 @@ def parse_control_packet(data: bytes) -> Optional[ControlData]:
     return c
 
 
+def parse_diag_axis_packet(data: bytes) -> Optional[DiagAxisData]:
+    """Parse UAVXDiagAxisPacket (Tag=82).
+
+    Layout (body, little-endian):
+      u32 ms, u8 axis_sel, u8 state, u16 flags,
+      N * (i16 desired_rate_mrad_s, i16 rate_mrad_s, i16 desired_angle_mrad,
+           i16 angle_mrad, i16 angle_int_mrad),
+      i16 pwm0..3 *1000, i16 desired_throttle*1000, i16 alt_comp*1000,
+      i16 tilt_ff*1000, i16 acc_conf*1000
+    N=1 for Roll/Pitch/Yaw, N=2 for Roll+Pitch.
+    """
+    if len(data) < 28:
+        return None
+    d = DiagAxisData()
+    d.time_ms = extract_int32(data, 0)
+    d.axis_sel = extract_byte(data, 4)
+    d.state = extract_byte(data, 5)
+    d.flags = extract_short(data, 6)
+    n_axes = 2 if d.axis_sel == 4 else 1
+    off = 8
+    axis_map = {1: 0, 2: 1, 3: 2}
+    axes = [axis_map.get(d.axis_sel, 1)]
+    if d.axis_sel == 4:
+        axes = [0, 1]
+    need = off + n_axes * 10 + 16
+    if len(data) < need:
+        return None
+    for i in range(n_axes):
+        a = axes[i] if i < len(axes) else 1
+        s = DiagAxisSample(axis=a)
+        s.desired_rate = extract_i16(data, off) / 1000.0
+        s.rate = extract_i16(data, off + 2) / 1000.0
+        s.desired_angle = extract_i16(data, off + 4) / 1000.0
+        s.angle = extract_i16(data, off + 6) / 1000.0
+        s.angle_integral = extract_i16(data, off + 8) / 1000.0
+        d.samples.append(s)
+        off += 10
+    for _ in range(4):
+        d.pwm.append(extract_i16(data, off) / 1000.0)
+        off += 2
+    d.desired_throttle = extract_i16(data, off) / 1000.0
+    d.alt_comp = extract_i16(data, off + 2) / 1000.0
+    d.tilt_ff = extract_i16(data, off + 4) / 1000.0
+    d.acc_confidence = extract_i16(data, off + 6) / 1000.0
+    return d
+
+
+def parse_gps_detail_packet(data: bytes) -> Optional[GPSDetailData]:
+    """Parse one page of UAVXGPSDetailPacket (Tag=81).
+
+    Body layout is defined by telem.c SendGPSDetailPacket():
+      page 0: page(1) + satCount/usedSats/constellationCount/ubxMsgCount/
+              signalCount (5) + 8 × (gnssId, sats, used, cnrSum u16) +
+              12 × (msgClass, msgId, count u16)
+      pages 1..5: page(1) + totalSatCount(1) + count(1) + 12 ×
+              (gnssId, svId, elev i8, azim i16, cno, used)
+      page 6: page(1) + signalCount(1) + 12 × (gnssId, sigId, sats, cno)
+    """
+    if not data:
+        return None
+
+    page = extract_byte(data, 0)
+    d = GPSDetailData(page=page)
+
+    if page == 0:
+        if len(data) < 6 + 8 * 5 + 12 * 4:
+            return None
+        d.sat_count = extract_byte(data, 1)
+        d.used_sats = extract_byte(data, 2)
+        d.constellation_count = extract_byte(data, 3)
+        d.ubx_msg_count = extract_byte(data, 4)
+        d.signal_count = extract_byte(data, 5)
+        off = 6
+        for _ in range(8):
+            d.constellations.append(GPSConstellationData(
+                extract_byte(data, off), extract_byte(data, off + 1),
+                extract_byte(data, off + 2), extract_short(data, off + 3)))
+            off += 5
+        for _ in range(12):
+            msg = GPSUbxMessageData(extract_byte(data, off),
+                                    extract_byte(data, off + 1),
+                                    extract_short(data, off + 2))
+            if msg.count:
+                d.ubx_messages.append(msg)
+            off += 4
+        d.constellations = d.constellations[:d.constellation_count]
+        return d
+
+    if 1 <= page <= 5:
+        if len(data) < 3 + 12 * 7:
+            return None
+        d.sat_count = extract_byte(data, 1)
+        count = extract_byte(data, 2)
+        first = (page - 1) * 12
+        for i in range(count):
+            off = 3 + i * 7
+            d.satellites[first + i] = GPSSatData(
+                extract_byte(data, off), extract_byte(data, off + 1),
+                extract_signed_byte(data, off + 2),
+                extract_signed_short(data, off + 3),
+                extract_byte(data, off + 5), bool(extract_byte(data, off + 6)))
+        return d
+
+    if page == 6:
+        if len(data) < 2 + 12 * 4:
+            return None
+        d.signal_count = extract_byte(data, 1)
+        for i in range(d.signal_count):
+            off = 2 + i * 4
+            d.signals.append(GPSSignalData(
+                extract_byte(data, off), extract_byte(data, off + 1),
+                extract_byte(data, off + 2), extract_byte(data, off + 3)))
+        return d
+
+    return None
+
+
 def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[object], int]:
     """
     Parse a packet based on its tag.
@@ -1532,5 +1858,9 @@ def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[objec
             return parse_test_response(body), tag
         case 76:
             return parse_i2c_errors(body), tag
+        case 81:
+            return parse_gps_detail_packet(body), tag
+        case 82:
+            return parse_diag_axis_packet(body), tag
         case _:
             return body, tag

@@ -23,7 +23,7 @@ class AnomalyBox(QGroupBox):
 
         lay = QGridLayout()
         lay.setHorizontalSpacing(4)
-        lay.setVerticalSpacing(3)
+        lay.setVerticalSpacing(1)
         lay.setColumnMinimumWidth(0, 55)
         lay.setColumnMinimumWidth(1, 50)
         lay.setColumnMinimumWidth(2, 50)
@@ -126,11 +126,10 @@ class AnomalyBox(QGroupBox):
             self.mag_fault.setText("-")
             self.mag_fault.setStyleSheet("font-weight: bold;")
         mag_fault = (not self._mag_absent) and (d.mag_errors or reason)
-        if d.imu_errors or d.baro_errors or mag_fault:
-            self.set_alert(True)
+        self.set_alert(bool(d.imu_errors or d.baro_errors or mag_fault))
 
     def set_alert(self, on: bool):
-        """Sticky orange border once any I2C fault has been seen."""
+        """Orange border while any I2C fault counter is nonzero."""
         if on == self._alert:
             return
         self._alert = on

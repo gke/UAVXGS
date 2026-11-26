@@ -7,6 +7,7 @@ Mission planning with map and telemetry integration
 import sys
 import os
 import json
+import math
 import struct
 import urllib.parse
 from datetime import datetime
@@ -23,6 +24,29 @@ from packet_parser import OriginData
 from models.waypoint import Waypoint, WP_ACTION_VALUES, WP_ACTIONS
 from core.console import console
 
+GNSS_NAMES = {
+    0: "GPS", 1: "SBAS", 2: "Galileo", 3: "BeiDou", 4: "IMES",
+    5: "QZSS", 6: "GLONASS", 7: "NavIC",
+}
+GNSS_COLORS = {
+    0: "#3b82f6", 1: "#94a3b8", 2: "#f59e0b", 3: "#ef4444",
+    4: "#a855f7", 5: "#14b8a6", 6: "#22c55e", 7: "#ec4899",
+}
+UBX_MESSAGE_NAMES = {
+    (0x01, 0x02): "NAV-POSLLH", (0x01, 0x03): "NAV-STATUS",
+    (0x01, 0x04): "NAV-DOP", (0x01, 0x06): "NAV-SOL",
+    (0x01, 0x07): "NAV-PVT", (0x01, 0x12): "NAV-VELNED",
+    (0x01, 0x21): "NAV-TIMEUTC", (0x01, 0x30): "NAV-SVINFO",
+    (0x01, 0x35): "NAV-SAT", (0x01, 0x43): "NAV-SIG",
+    (0x05, 0x00): "ACK-NAK", (0x05, 0x01): "ACK-ACK",
+    (0x0A, 0x04): "MON-VER", (0x0A, 0x09): "MON-HW",
+    (0x0D, 0x01): "TIM-TP",
+}
+LEGACY_UBX_MESSAGES = {
+    (0x01, 0x02), (0x01, 0x03), (0x01, 0x04), (0x01, 0x06),
+    (0x01, 0x12), (0x01, 0x21), (0x01, 0x30),
+}
+
 try:
     import folium
     from folium import plugins
@@ -38,6 +62,51 @@ except ImportError as e:
     console(f"WARNING: PyQtWebEngine not available: {e}")
     WEBENGINE_AVAILABLE = False
     QWebEngineView = None
+
+
+class SkyPlotWidget(QWidget):
+    """Qt-only polar sky plot: centre = zenith, rim = horizon."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.sats = []
+        self.setMinimumSize(180, 180)
+
+    def set_sats(self, sats):
+        self.sats = list(sats)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w / 2.0, h / 2.0
+        radius = min(w, h) / 2.0 - 20.0
+        p.setPen(QPen(QColor("#888888"), 1))
+        for frac in (0.33, 0.66, 1.0):
+            r = radius * frac
+            p.drawEllipse(QRectF(cx - r, cy - r, 2 * r, 2 * r))
+        p.drawLine(QPointF(cx - radius, cy), QPointF(cx + radius, cy))
+        p.drawLine(QPointF(cx, cy - radius), QPointF(cx, cy + radius))
+        p.drawText(QRectF(cx - 8, cy - radius - 17, 16, 16), Qt.AlignCenter, "N")
+        p.drawText(QRectF(cx + radius + 2, cy - 8, 16, 16), Qt.AlignCenter, "E")
+        p.drawText(QRectF(cx - 8, cy + radius + 2, 16, 16), Qt.AlignCenter, "S")
+        p.drawText(QRectF(cx - radius - 18, cy - 8, 16, 16), Qt.AlignCenter, "W")
+
+        for sat in self.sats:
+            elev = max(0, min(90, getattr(sat, 'elev', 0)))
+            azim = getattr(sat, 'azim', 0)
+            r = radius * (90 - elev) / 90.0
+            a = math.radians(azim)
+            x = cx + r * math.sin(a)
+            y = cy - r * math.cos(a)
+            color = QColor(GNSS_COLORS.get(getattr(sat, 'gnss_id', 0), "#64748b"))
+            p.setPen(QPen(color, 2))
+            p.setBrush(QBrush(color if getattr(sat, 'used', False) else Qt.white))
+            p.drawEllipse(QPointF(x, y), 5, 5)
+            p.setPen(QColor("#111111"))
+            p.drawText(QRectF(x - 14, y - 13, 28, 12), Qt.AlignCenter,
+                       str(getattr(sat, 'sv_id', 0)))
 
 
 class NavWindow(QMainWindow):
@@ -322,7 +391,7 @@ class NavWindow(QMainWindow):
 
         # --- Left panel: telemetry info boxes ---
         left_panel = QWidget()
-        left_panel.setMinimumWidth(220)
+        left_panel.setMinimumWidth(480)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(4)
         left_layout.setContentsMargins(2, 2, 2, 2)
@@ -426,6 +495,32 @@ class NavWindow(QMainWindow):
 
         left_layout.addWidget(alt_g)
         left_layout.addWidget(pos_g)
+
+        gnss_g = group_box("GNSS Detail")
+        gnss_row = QHBoxLayout(gnss_g)
+        gnss_row.setContentsMargins(2, 12, 2, 12)
+        self._gps_sky_plot = SkyPlotWidget()
+        gnss_row.addWidget(self._gps_sky_plot)
+
+        gnss_col = QVBoxLayout()
+        self._gps_sats_label = mk_lbl("Sats: --")
+        gnss_col.addWidget(self._gps_sats_label)
+
+        self._gps_const_table = QTableWidget(0, 4)
+        self._gps_const_table.setHorizontalHeaderLabels(
+            ["System", "Sats", "Used", "Mean C/N0"])
+        self._gps_const_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._gps_const_table.verticalHeader().setVisible(False)
+        self._gps_const_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._gps_const_table.setMaximumHeight(110)
+        gnss_col.addWidget(self._gps_const_table)
+
+        gnss_col.addWidget(mk_lbl("Active UBX sentences:", True))
+        self._gps_ubx_label = mk_lbl("--")
+        self._gps_ubx_label.setWordWrap(True)
+        gnss_col.addWidget(self._gps_ubx_label)
+        gnss_row.addLayout(gnss_col)
+        left_layout.addWidget(gnss_g)
         left_layout.addStretch()
 
         h_splitter.addWidget(left_panel)
@@ -761,6 +856,7 @@ class NavWindow(QMainWindow):
         self.update_map()
 
     def update_from_telemetry(self):
+        self._update_gps_detail()
         if self.parent() and hasattr(self.parent(), 'flight_data'):
             flight_data = self.parent().flight_data
             if flight_data:
@@ -846,6 +942,50 @@ class NavWindow(QMainWindow):
                             self._nav_dist_traveled.setText(f"{d:.0f}m")
                         else:
                             self._nav_dist_traveled.setText(f"{d/1000:.2f}km")
+
+    def _update_gps_detail(self):
+        parent = self.parent()
+        detail = getattr(parent, 'gps_detail', None) if parent else None
+        if detail is None:
+            return
+
+        used = detail.used_sats
+        total = detail.sat_count
+        self._gps_sats_label.setText(
+            f"Sats: {total} / used {used}" if total else "Sats: --")
+
+        self._gps_const_table.blockSignals(True)
+        self._gps_const_table.setRowCount(len(detail.constellations))
+        for row, con in enumerate(detail.constellations):
+            mean_cnr = con.cnr_sum / con.sats if con.sats else 0.0
+            values = (GNSS_NAMES.get(con.gnss_id, f"ID{con.gnss_id}"),
+                      str(con.sats), str(con.used), f"{mean_cnr:.1f}")
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self._gps_const_table.setItem(row, col, item)
+        self._gps_const_table.blockSignals(False)
+
+        names = []
+        for msg in detail.ubx_messages:
+            key = (msg.msg_class, msg.msg_id)
+            name = UBX_MESSAGE_NAMES.get(
+                key, f"{msg.msg_class:02x}/{msg.msg_id:02x}")
+            if key in LEGACY_UBX_MESSAGES:
+                name = f'<span style="color: #e74c3c;">{name}</span>'
+            names.append(name)
+        self._gps_ubx_label.setText(" ".join(names) if names else "--")
+        self._gps_sky_plot.set_sats(
+            [detail.satellites[k] for k in sorted(detail.satellites)])
+
+    def _request_gps_detail(self):
+        parent = self.parent()
+        if parent and getattr(parent, 'connected', False):
+            parent.send_request(PacketTag.GPS_DETAIL, 0, 0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(300, self._request_gps_detail)
 
     def _update_aircraft_on_map(self):
         if not self.aircraft_pos:

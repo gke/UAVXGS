@@ -12,7 +12,7 @@ _TAG_NAMES = {
     55: "UNUSED", 56: "UNUSED", 57: "TUNING", 58: "UNUSED", 59: "GUIDANCE",
     60: "UNUSED", 61: "UNUSED", 62: "CALIB", 63: "AFNAME",
     64: "WIND", 65: "UNUSED", 66: "SERIAL", 67: "EXEC",
-    68: "UNUSED", 69: "LINK",
+    68: "UNUSED", 69: "LINK", 81: "GPSD",
 }
 
 # Runtime diagnostic log bound. The per-packet log grows without limit, and a

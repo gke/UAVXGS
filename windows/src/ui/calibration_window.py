@@ -18,7 +18,7 @@ from PyQt5.QtGui import *
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol_constants import *
-from protocol_enums import PacketTag, MiscCommand
+from protocol_enums import PacketTag, MiscCommand, Config1Bits, ParamIndex
 from packet_parser import *
 from core.data_manager import data_manager
 from core.console import console
@@ -793,15 +793,22 @@ class CalibrationWindow(QMainWindow):
                   "magnetometer calibration retired for this session")
 
     def _mag_in_use(self) -> Optional[bool]:
-        """Whether the FC's MagInUse() holds, or None if presence is unknown.
+        """Whether the FC treats the mag as in use, or None if unknown.
 
-        MagInUse() is now exactly F.HaveMag: a fitted magnetometer is
-        always used, so presence and use are the same fact and there is no
-        permission bit left to consult. Returns None rather than a claim when the
-        caller has no flag report, so an arming consequence is never asserted
-        from an unknown.
+        Presence is F.HaveMag (bit 38). Config1 bit 2 (UseMag) gates whether
+        that fitted mag is actually used/fused/required.
         """
-        return self._mag_present
+        present = self._mag_present
+        if present is None:
+            return None
+        if not present:
+            return False
+        pw = getattr(self.parent_window, 'param_window', None) if self.parent_window else None
+        if pw is not None:
+            cfg = pw._config_values.get(int(ParamIndex.CONFIG1_BITS))
+            if cfg is not None:
+                return bool(int(cfg) & int(Config1Bits.eUseMag))
+        return True
 
     def _set_mag_state(self, present, calibrated, failed):
         """Apply the two-flag device model to the Magnetometer tab.
@@ -829,12 +836,14 @@ class CalibrationWindow(QMainWindow):
             self.mag_cal_status.setText("Mag: FAILED - recalibrate")
             self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #c0392b; color: white; font-weight: bold; border-radius: 4px;")
         elif not calibrated:
-            # A fitted magnetometer is always in use, so an uncalibrated one
-            # always blocks arming: CalibrationSufficient() is
-            # `MagInUse() && !MagCal.Calibrated` and MagInUse() is now presence.
-            text = "Mag: fitted, NOT calibrated - BLOCKS ARMING"
-            self.mag_cal_status.setText(text)
-            self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #f39c12; color: white; font-weight: bold; border-radius: 4px;")
+            in_use = self._mag_in_use()
+            if in_use is False:
+                self.mag_cal_status.setText("Mag: fitted, but Use Mag config is clear")
+                self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #7f8c8d; color: white; font-weight: bold; border-radius: 4px;")
+            else:
+                text = "Mag: fitted, NOT calibrated - BLOCKS ARMING"
+                self.mag_cal_status.setText(text)
+                self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #f39c12; color: white; font-weight: bold; border-radius: 4px;")
         self.mag_start_btn.setEnabled(True)
 
     def _send_misc_command(self, command: MiscCommand, param: int = 0):
