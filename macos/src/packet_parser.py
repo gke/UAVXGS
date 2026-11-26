@@ -395,11 +395,11 @@ class GuidanceData:
 
 
 @dataclass
-@dataclass
 class TuningData:
     """Tuning telemetry (Tag=57) - from telem.c SendTuningPacket()
     Body: flags(1) + thr(1) + 3 axes×3×f32(36) + ident block 3×(4×f32+u32)(60)
-          + summary version(1) + 60 words(240) = 339.
+          + summary version(1) + 60 words(240) [v4] + 45 authority words(180)
+          [v5] = 339 or 519.
     Rates in rad/s; axis output in native mixer units.
     Ident fields (Roll/Pitch/Yaw order): a, b (ARX params), sigA, sigB (standard
     errors), n (samples). Summary fields are bounded onboard accumulators; the
@@ -493,6 +493,25 @@ class TuningData:
     alt_hold_comp_rms: float = 0.0
     alt_hold_comp_max: float = 0.0
     baro_n: int = 0
+    has_authority: bool = False
+    auth_uu_roll: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 6)
+    auth_uz_roll: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 3)
+    auth_zz_roll: float = 0.0
+    auth_uu_pitch: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 6)
+    auth_uz_pitch: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 3)
+    auth_zz_pitch: float = 0.0
+    auth_uu_yaw: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 6)
+    auth_uz_yaw: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 3)
+    auth_zz_yaw: float = 0.0
+    auth_speed_mean: float = 0.0
+    auth_speed_min: float = 0.0
+    auth_speed_max: float = 0.0
+    auth_stick_rms: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 3)
+    auth_stick_max: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 3)
+    auth_current: Tuple[float, ...] = field(default_factory=lambda: (0.0,) * 3)
+    auth_n: int = 0
+    auth_sat_count: int = 0
+    auth_flags: int = 0
 
     @property
     def armed(self) -> bool:
@@ -1340,7 +1359,7 @@ def parse_tuning_packet(data: bytes) -> Optional[TuningData]:
     if len(data) >= off + 1 + 60 * 4:
         version = data[off]
         off += 1
-        if version == 4:
+        if version in (4, 5):
             t.has_summary = True
             t.ident_summary_version = version
 
@@ -1391,6 +1410,41 @@ def parse_tuning_packet(data: bytes) -> Optional[TuningData]:
                 setattr(t, name, extract_real32(data, off))
                 off += 4
             t.baro_n = extract_int32(data, off)
+            off += 4
+
+            if version == 5 and len(data) >= off + 45 * 4:
+                def read_floats(count):
+                    nonlocal off
+                    vals = tuple(extract_real32(data, off + 4 * i)
+                                 for i in range(count))
+                    off += 4 * count
+                    return vals
+
+                t.has_authority = True
+                t.auth_uu_roll = read_floats(6)
+                t.auth_uz_roll = read_floats(3)
+                t.auth_zz_roll = read_floats(1)[0]
+                t.auth_uu_pitch = read_floats(6)
+                t.auth_uz_pitch = read_floats(3)
+                t.auth_zz_pitch = read_floats(1)[0]
+                t.auth_uu_yaw = read_floats(6)
+                t.auth_uz_yaw = read_floats(3)
+                t.auth_zz_yaw = read_floats(1)[0]
+                speed_sum = read_floats(1)[0]
+                t.auth_speed_min = read_floats(1)[0]
+                t.auth_speed_max = read_floats(1)[0]
+                stick_s2 = read_floats(3)
+                t.auth_stick_max = read_floats(3)
+                t.auth_current = read_floats(3)
+                t.auth_n = extract_int32(data, off)
+                off += 4
+                t.auth_sat_count = extract_int32(data, off)
+                off += 4
+                t.auth_flags = extract_int32(data, off)
+                if t.auth_n > 0:
+                    t.auth_speed_mean = speed_sum / t.auth_n
+                    t.auth_stick_rms = tuple(
+                        (max(v, 0.0) / t.auth_n) ** 0.5 for v in stick_s2)
 
     return t
 

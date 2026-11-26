@@ -1,10 +1,10 @@
 # ui/identify_window.py - Identify summaries (tag 57)
 """
 Separate window showing the FC's identify data: the raw per-axis ARX rate
-estimates and the v4 bounded flight summaries for acceleration confidence,
-angle-I/rate-D, mag and baro/altitude-KF behaviour. The GCS reports only what
-the FC computed; it never derives plant gain, time constant, proposed Kp or a
-tuning recommendation.
+estimates, the bounded flight summaries for acceleration confidence,
+angle-I/rate-D, mag and baro/altitude-KF behaviour, and the v5 manual authority
+sums. The GCS reports only what the FC computed; it never derives plant gain,
+time constant, proposed Kp or a tuning recommendation.
 """
 
 import math
@@ -77,6 +77,17 @@ _SUMMARY_GROUPS = (
         ("Samples", "baro_n", False, "n"),
     )),
 )
+_AUTH_ROWS = (
+    ("Stick RMS", "auth_stick_rms", True, "f"),
+    ("Stick max", "auth_stick_max", True, "f"),
+    ("Current authority", "auth_current", True, "f"),
+    ("Samples", "auth_n", False, "n"),
+    ("Saturation count", "auth_sat_count", False, "n"),
+    ("Flags", "auth_flags", False, "n"),
+    ("Speed mean (m/s)", "auth_speed_mean", False, "f"),
+    ("Speed min (m/s)", "auth_speed_min", False, "f"),
+    ("Speed max (m/s)", "auth_speed_max", False, "f"),
+)
 _VALUE_STYLE = "font-weight: bold; font-size: 14px; color: %s;"
 _ST_UNKNOWN = _VALUE_STYLE % "#888888"
 _ST_TRACK = _VALUE_STYLE % "#a15500"
@@ -122,11 +133,13 @@ class IdentifyWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._rate_tab(), "Rate dynamics")
         tabs.addTab(self._summary_tab(), "Flight summaries")
+        tabs.addTab(self._authority_tab(), "Authority")
         lay.addWidget(tabs)
 
         self.resize(720, 560)
         self._clear_all()
         self._clear_summary()
+        self._clear_authority()
 
     def _rate_tab(self):
         tab = QWidget()
@@ -252,13 +265,120 @@ class IdentifyWindow(QMainWindow):
                     cell.setText("--")
                     cell.setStyleSheet(_SUM_UNKNOWN)
 
+    def _authority_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setSpacing(8)
+        lay.setContentsMargins(8, 8, 8, 8)
+
+        group = QGroupBox("Manual authority capture (FW ePIC)")
+        group.setStyleSheet(_GROUP_STYLE)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+        grid.addWidget(QLabel(""), 0, 0)
+        for c, ax in enumerate(_AXES, start=1):
+            hdr = QLabel("<b>%s</b>" % ax)
+            hdr.setStyleSheet("font-weight: bold; font-size: 12px;")
+            hdr.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+            grid.addWidget(hdr, 0, c)
+        for r, (label, key, per_axis, kind) in enumerate(_AUTH_ROWS, start=1):
+            lbl = QLabel("<b>%s</b>" % label)
+            lbl.setStyleSheet(_LBL_STYLE)
+            grid.addWidget(lbl, r, 0)
+            cells = []
+            cols = len(_AXES) if per_axis else 1
+            for c in range(cols):
+                cell = QLabel("--")
+                cell.setStyleSheet(_SUM_UNKNOWN)
+                cell.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+                grid.addWidget(cell, r, c + 1)
+                cells.append(cell)
+            setattr(self, "_auth_" + key, cells)
+        group.setLayout(grid)
+        lay.addWidget(group)
+
+        self.authority_status = QLabel(
+            "waiting for a v5 authority record on tag 57")
+        self.authority_status.setStyleSheet("color: #888; font-size: 12px;")
+        lay.addWidget(self.authority_status)
+
+        expl = QLabel(
+            "Bounded sums from manual FW flight: rate innovation after the "
+            "current closed-loop term, regressed on the post-authority "
+            "mixer commands Rl/Pl/Yl. Stick RMS is excitation provenance, "
+            "not the regression input. Ground solver estimates effectiveness "
+            "at the flown speed; no FC gains or .af values are written here."
+        )
+        expl.setWordWrap(True)
+        expl.setStyleSheet("color: #555; font-size: 12px;")
+        lay.addWidget(expl)
+        lay.addStretch()
+
+        scroll.setWidget(inner)
+        return scroll
+
+    def _clear_authority(self):
+        for _, key, _, _ in _AUTH_ROWS:
+            for cell in getattr(self, "_auth_" + key):
+                cell.setText("--")
+                cell.setStyleSheet(_SUM_UNKNOWN)
+        if hasattr(self, "authority_status"):
+            self.authority_status.setText(
+                "waiting for a v5 authority record on tag 57")
+            self.authority_status.setStyleSheet(
+                "color: #888; font-size: 12px;")
+
+    def _refresh_authority(self, tune):
+        if not getattr(tune, "has_authority", False):
+            self._clear_authority()
+            return
+        if getattr(tune, "auth_n", 0) <= 0:
+            self._clear_authority()
+            self.authority_status.setText(
+                "v5 authority block present; no manual FW samples yet")
+            self.authority_status.setStyleSheet(
+                "color: #888; font-size: 12px;")
+            return
+
+        for _, key, per_axis, kind in _AUTH_ROWS:
+            cells = getattr(self, "_auth_" + key)
+            for r, cell in enumerate(cells):
+                value = getattr(tune, key, None)
+                if per_axis and isinstance(value, (tuple, list)):
+                    value = value[r] if r < len(value) else None
+                elif per_axis:
+                    value = getattr(tune, key + "_" + _AXES[r].lower(), None)
+                text, known = _format_value(value, kind)
+                cell.setText(text)
+                cell.setStyleSheet(_SUM_KNOWN if known else _SUM_UNKNOWN)
+
+        flag_text = []
+        flags = int(getattr(tune, "auth_flags", 0))
+        if flags & 0x01:
+            flag_text.append("manual")
+        if flags & 0x02:
+            flag_text.append("AS")
+        if flags & 0x04:
+            flag_text.append("GPS")
+        suffix = ", ".join(flag_text) or "no source flags"
+        self.authority_status.setText(
+            "%d samples; %s; solve with identify_fit.py authority"
+            % (int(tune.auth_n), suffix))
+        self.authority_status.setStyleSheet(
+            "color: #000; font-weight: bold; font-size: 12px;")
+
     def _refresh(self, tune):
         try:
             if tune is None or not (
                     getattr(tune, "has_ident", False)
-                    or getattr(tune, "has_summary", False)):
+                    or getattr(tune, "has_summary", False)
+                    or getattr(tune, "has_authority", False)):
                 self._clear_all()
                 self._clear_summary()
+                self._clear_authority()
                 self.status.setText("waiting for the FC identify block on tag 57")
                 self.status.setStyleSheet("color: #888; font-size: 12px;")
                 self.summary_status.setText(
@@ -273,6 +393,7 @@ class IdentifyWindow(QMainWindow):
                 self.status.setText("waiting for the FC identify block on tag 57")
                 self.status.setStyleSheet("color: #888; font-size: 12px;")
             self._refresh_summary(tune)
+            self._refresh_authority(tune)
         except Exception as exc:
             self.status.setText("error: %s" % exc)
             self.status.setStyleSheet("color: red; font-size: 12px;")
